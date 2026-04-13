@@ -36,11 +36,8 @@ async def main() -> None:
     await db.init()
     log.info("database ready at %s", db_path)
 
-    # 3. Create config-patch client
-    config_client = ConfigPatchClient(
-        gateway_url=cfg.gateway_url,
-        auth_token=cfg.auth_token,
-    )
+    # 3. Create config-patch client (uses openclaw CLI subprocess)
+    config_client = ConfigPatchClient()
 
     # 4. Resolve paths
     agents_dir = os.path.expanduser(cfg.agents_dir)

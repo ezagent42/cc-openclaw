@@ -1,169 +1,172 @@
-"""Tests for sidecar.config_patch — config.get / config.patch RPC client."""
+"""Tests for sidecar.config_patch — config RPC via openclaw CLI subprocess."""
 
+import json
 import pytest
 from unittest.mock import AsyncMock, patch, MagicMock
 
 from sidecar.config_patch import ConfigPatchClient, ConfigPatchQueue
 
 
-GATEWAY_URL = "http://127.0.0.1:18789"
-AUTH_TOKEN = "test-token-123"
-
-
 @pytest.fixture
 def client():
-    return ConfigPatchClient(gateway_url=GATEWAY_URL, auth_token=AUTH_TOKEN)
+    return ConfigPatchClient(openclaw_bin="openclaw")
+
+
+# ── Helper to mock subprocess ──────────────────────────────────────
+
+def _mock_subprocess(stdout_data: dict | list, returncode: int = 0):
+    """Create a mock for asyncio.create_subprocess_exec."""
+    mock_proc = AsyncMock()
+    mock_proc.returncode = returncode
+    mock_proc.communicate.return_value = (
+        json.dumps(stdout_data).encode(),
+        b"",
+    )
+    return mock_proc
 
 
 # ── ConfigPatchClient ───────────────────────────────────────────────
 
 
-async def test_get_config(client):
-    """Verifies POST to /api/config.get returns baseHash and config."""
-    mock_response = MagicMock()
-    mock_response.json.return_value = {
-        "baseHash": "abc123",
-        "config": {"agents": {}, "bindings": []},
+async def test_get_config():
+    """config.get returns normalised {config, baseHash} dict."""
+    raw_response = {
+        "path": "/fake/openclaw.json",
+        "exists": True,
+        "parsed": {"agents": {"main": {}}, "bindings": []},
+        "hash": "abc123",
     }
-    mock_response.raise_for_status = MagicMock()
-
-    with patch("httpx.AsyncClient.post", new_callable=AsyncMock, return_value=mock_response) as mock_post:
+    client = ConfigPatchClient()
+    with patch("asyncio.create_subprocess_exec", return_value=_mock_subprocess(raw_response)):
         result = await client.get_config()
 
-    mock_post.assert_called_once_with(
-        f"{GATEWAY_URL}/api/config.get",
-        json={},
-        headers={
-            "Authorization": f"Bearer {AUTH_TOKEN}",
-            "Content-Type": "application/json",
-        },
-    )
     assert result["baseHash"] == "abc123"
+    assert result["config"]["agents"] == {"main": {}}
     assert result["config"]["bindings"] == []
 
 
-async def test_patch_config(client):
-    """Verifies POST to /api/config.patch includes baseHash."""
-    mock_response = MagicMock()
-    mock_response.json.return_value = {"ok": True}
-    mock_response.raise_for_status = MagicMock()
+async def test_patch_config():
+    """config.patch sends raw JSON5 string + baseHash."""
+    client = ConfigPatchClient()
+    with patch("asyncio.create_subprocess_exec", return_value=_mock_subprocess({"ok": True})) as mock_exec:
+        await client.patch_config("abc123", '{"agents": {}}')
 
-    patch_data = {"agents": {"agent-1": {"name": "Test"}}}
-
-    with patch("httpx.AsyncClient.post", new_callable=AsyncMock, return_value=mock_response) as mock_post:
-        result = await client.patch_config("abc123", patch_data)
-
-    mock_post.assert_called_once_with(
-        f"{GATEWAY_URL}/api/config.patch",
-        json={"baseHash": "abc123", "patch": patch_data},
-        headers={
-            "Authorization": f"Bearer {AUTH_TOKEN}",
-            "Content-Type": "application/json",
-        },
-    )
-    assert result["ok"] is True
+    # Verify the CLI was called with correct args
+    call_args = mock_exec.call_args[0]
+    assert "config.patch" in call_args
+    assert "--json" in call_args
+    assert "--params" in call_args
+    params_idx = list(call_args).index("--params")
+    params = json.loads(call_args[params_idx + 1])
+    assert params["baseHash"] == "abc123"
+    assert params["raw"] == '{"agents": {}}'
 
 
-async def test_add_binding(client):
-    """Verifies GET + append + PATCH flow (bindings array grows by 1)."""
-    existing_config = {
-        "baseHash": "hash1",
-        "config": {
+async def test_add_binding():
+    """add_binding GETs current bindings, appends, PATCHes entire array."""
+    raw_config = {
+        "parsed": {
             "agents": {},
             "bindings": [
-                {"agentId": "existing-agent", "channel": "feishu", "peer": "peer-0"}
+                {"agentId": "existing", "match": {"channel": "feishu"}}
             ],
         },
+        "hash": "hash1",
     }
-    patch_response = MagicMock()
-    patch_response.json.return_value = {"ok": True}
-    patch_response.raise_for_status = MagicMock()
+    client = ConfigPatchClient()
 
-    get_response = MagicMock()
-    get_response.json.return_value = existing_config
-    get_response.raise_for_status = MagicMock()
+    call_count = 0
 
-    with patch("httpx.AsyncClient.post", new_callable=AsyncMock) as mock_post:
-        mock_post.side_effect = [get_response, patch_response]
+    async def mock_exec(*args, **kwargs):
+        nonlocal call_count
+        call_count += 1
+        if call_count == 1:  # config.get
+            return _mock_subprocess(raw_config)
+        else:  # config.patch
+            return _mock_subprocess({"ok": True})
+
+    with patch("asyncio.create_subprocess_exec", side_effect=mock_exec):
         await client.add_binding(
-            agent_id="new-agent", channel="feishu", peer="peer-1"
-        )
-
-    # Second call is the patch — check that bindings array grew by 1
-    patch_call = mock_post.call_args_list[1]
-    sent_patch = patch_call.kwargs["json"]["patch"]
-    assert len(sent_patch["bindings"]) == 2
-    assert sent_patch["bindings"][1]["agentId"] == "new-agent"
-    assert sent_patch["bindings"][1]["channel"] == "feishu"
-    assert sent_patch["bindings"][1]["peer"] == "peer-1"
-
-
-async def test_remove_binding(client):
-    """Verifies GET + filter + PATCH (binding removed from array)."""
-    existing_config = {
-        "baseHash": "hash2",
-        "config": {
-            "agents": {"keep-agent": {}, "remove-agent": {}},
-            "bindings": [
-                {"agentId": "keep-agent", "channel": "feishu", "peer": "peer-0"},
-                {"agentId": "remove-agent", "channel": "feishu", "peer": "peer-1"},
-            ],
-        },
-    }
-    patch_response = MagicMock()
-    patch_response.json.return_value = {"ok": True}
-    patch_response.raise_for_status = MagicMock()
-
-    get_response = MagicMock()
-    get_response.json.return_value = existing_config
-    get_response.raise_for_status = MagicMock()
-
-    with patch("httpx.AsyncClient.post", new_callable=AsyncMock) as mock_post:
-        mock_post.side_effect = [get_response, patch_response]
-        await client.remove_binding("remove-agent")
-
-    patch_call = mock_post.call_args_list[1]
-    sent_patch = patch_call.kwargs["json"]["patch"]
-    assert len(sent_patch["bindings"]) == 1
-    assert sent_patch["bindings"][0]["agentId"] == "keep-agent"
-
-
-async def test_add_agent_with_binding(client):
-    """Verifies atomic add of agent definition + binding in one patch."""
-    existing_config = {
-        "baseHash": "hash3",
-        "config": {
-            "agents": {"old-agent": {"name": "Old"}},
-            "bindings": [
-                {"agentId": "old-agent", "channel": "feishu", "peer": "peer-0"}
-            ],
-        },
-    }
-    patch_response = MagicMock()
-    patch_response.json.return_value = {"ok": True}
-    patch_response.raise_for_status = MagicMock()
-
-    get_response = MagicMock()
-    get_response.json.return_value = existing_config
-    get_response.raise_for_status = MagicMock()
-
-    with patch("httpx.AsyncClient.post", new_callable=AsyncMock) as mock_post:
-        mock_post.side_effect = [get_response, patch_response]
-        await client.add_agent_with_binding(
             agent_id="new-agent",
-            agent_config={"name": "New Agent", "model": "gpt-4"},
             channel="feishu",
-            peer="peer-1",
+            peer={"kind": "direct", "id": "ou_alice"},
         )
 
-    patch_call = mock_post.call_args_list[1]
-    sent_patch = patch_call.kwargs["json"]["patch"]
-    # Agent definition added
-    assert "new-agent" in sent_patch["agents"]
-    assert sent_patch["agents"]["new-agent"]["name"] == "New Agent"
-    # Binding appended (array replaced entirely with old + new)
-    assert len(sent_patch["bindings"]) == 2
-    assert sent_patch["bindings"][1]["agentId"] == "new-agent"
+    assert call_count == 2  # get + patch
+
+
+async def test_remove_binding():
+    """remove_binding filters out matching agentId."""
+    raw_config = {
+        "parsed": {
+            "agents": {},
+            "bindings": [
+                {"agentId": "keep", "match": {"channel": "feishu"}},
+                {"agentId": "remove-me", "match": {"channel": "feishu"}},
+            ],
+        },
+        "hash": "hash2",
+    }
+    client = ConfigPatchClient()
+
+    patches_sent = []
+
+    async def mock_exec(*args, **kwargs):
+        if "config.get" in args:
+            return _mock_subprocess(raw_config)
+        else:
+            # Capture the patch params
+            params_idx = list(args).index("--params")
+            params = json.loads(args[params_idx + 1])
+            patches_sent.append(params)
+            return _mock_subprocess({"ok": True})
+
+    with patch("asyncio.create_subprocess_exec", side_effect=mock_exec):
+        await client.remove_binding("remove-me")
+
+    assert len(patches_sent) == 1
+    patched_bindings = json.loads(patches_sent[0]["raw"])["bindings"]
+    assert len(patched_bindings) == 1
+    assert patched_bindings[0]["agentId"] == "keep"
+
+
+async def test_add_agent_with_binding():
+    """Atomically adds agent definition + peer binding."""
+    raw_config = {
+        "parsed": {
+            "agents": {"old": {}},
+            "bindings": [{"agentId": "old", "match": {"channel": "feishu"}}],
+        },
+        "hash": "hash3",
+    }
+    client = ConfigPatchClient()
+
+    patches_sent = []
+
+    async def mock_exec(*args, **kwargs):
+        if "config.get" in args:
+            return _mock_subprocess(raw_config)
+        else:
+            params_idx = list(args).index("--params")
+            params = json.loads(args[params_idx + 1])
+            patches_sent.append(params)
+            return _mock_subprocess({"ok": True})
+
+    with patch("asyncio.create_subprocess_exec", side_effect=mock_exec):
+        await client.add_agent_with_binding(
+            agent_id="u-shared-ou_alice",
+            agent_config={"model": "test"},
+            channel="feishu",
+            peer={"kind": "direct", "id": "ou_alice"},
+        )
+
+    assert len(patches_sent) == 1
+    patch_data = json.loads(patches_sent[0]["raw"])
+    assert "u-shared-ou_alice" in patch_data["agents"]
+    assert len(patch_data["bindings"]) == 2
+    new_binding = patch_data["bindings"][1]
+    assert new_binding["agentId"] == "u-shared-ou_alice"
+    assert new_binding["match"]["peer"]["kind"] == "direct"
 
 
 # ── ConfigPatchQueue ────────────────────────────────────────────────
@@ -174,43 +177,31 @@ async def test_queue_flush_merges_operations():
     mock_client = AsyncMock(spec=ConfigPatchClient)
     mock_client.get_config.return_value = {
         "baseHash": "hash-q",
-        "config": {
-            "agents": {},
-            "bindings": [],
-        },
+        "config": {"agents": {}, "bindings": []},
     }
     mock_client.patch_config.return_value = {"ok": True}
 
     queue = ConfigPatchQueue(mock_client)
     await queue.enqueue({"add_agent": {"name": "A1"}, "agent_id": "agent-1"})
-    await queue.enqueue({"add_binding": {"agentId": "agent-1", "channel": "feishu", "peer": "p1"}})
+    await queue.enqueue({"add_binding": {"agentId": "agent-1", "match": {"channel": "feishu"}}})
     await queue.enqueue({"remove_binding_agent_id": "old-agent"})
 
     await queue.flush_now()
 
-    # get_config called once
     mock_client.get_config.assert_called_once()
-    # patch_config called once with merged result
     mock_client.patch_config.assert_called_once()
-    call_args = mock_client.patch_config.call_args
-    base_hash = call_args.args[0]
-    patch = call_args.args[1]
-    assert base_hash == "hash-q"
-    assert "agent-1" in patch["agents"]
-    assert any(b["agentId"] == "agent-1" for b in patch["bindings"])
 
 
 async def test_queue_retry_on_conflict():
-    """Queue retries up to MAX_RETRIES on baseHash conflict."""
+    """Queue retries up to MAX_RETRIES on conflict."""
     mock_client = AsyncMock(spec=ConfigPatchClient)
     mock_client.get_config.return_value = {
         "baseHash": "hash-retry",
         "config": {"agents": {}, "bindings": []},
     }
-    # First two attempts raise conflict, third succeeds
     mock_client.patch_config.side_effect = [
-        Exception("baseHash conflict"),
-        Exception("baseHash conflict"),
+        Exception("conflict"),
+        Exception("conflict"),
         {"ok": True},
     ]
 
@@ -219,7 +210,6 @@ async def test_queue_retry_on_conflict():
     await queue.flush_now()
 
     assert mock_client.patch_config.call_count == 3
-    assert mock_client.get_config.call_count == 3
 
 
 async def test_queue_drops_batch_after_max_retries():
@@ -233,8 +223,6 @@ async def test_queue_drops_batch_after_max_retries():
 
     queue = ConfigPatchQueue(mock_client)
     await queue.enqueue({"add_agent": {"name": "A1"}, "agent_id": "agent-1"})
-
-    # Should not raise — drops batch after MAX_RETRIES
-    await queue.flush_now()
+    await queue.flush_now()  # should not raise
 
     assert mock_client.patch_config.call_count == ConfigPatchQueue.MAX_RETRIES

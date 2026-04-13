@@ -1,52 +1,75 @@
-"""config.get / config.patch RPC client for OpenClaw Gateway."""
+"""config.get / config.patch RPC client for OpenClaw Gateway.
+
+Uses the `openclaw gateway call` CLI as a subprocess, since the RPC is
+WebSocket-only (not HTTP).  This avoids reimplementing the WS framing and
+auth protocol and stays compatible across Gateway upgrades.
+"""
 
 from __future__ import annotations
 
 import asyncio
 import copy
+import json
 import logging
 from typing import Any
-
-import httpx
 
 log = logging.getLogger(__name__)
 
 
 class ConfigPatchClient:
-    """Low-level client for OpenClaw config.get / config.patch RPC."""
+    """Low-level client wrapping `openclaw gateway call` for config RPC."""
 
-    def __init__(self, *, gateway_url: str, auth_token: str) -> None:
-        self._gateway_url = gateway_url.rstrip("/")
-        self._auth_token = auth_token
+    def __init__(self, *, openclaw_bin: str = "openclaw") -> None:
+        self._bin = openclaw_bin
 
-    @property
-    def _headers(self) -> dict[str, str]:
-        return {
-            "Authorization": f"Bearer {self._auth_token}",
-            "Content-Type": "application/json",
-        }
+    async def _call(self, method: str, params: dict | None = None) -> dict:
+        """Call a Gateway RPC method via the CLI."""
+        cmd = [self._bin, "gateway", "call", method, "--json"]
+        if params:
+            cmd += ["--params", json.dumps(params)]
+
+        proc = await asyncio.create_subprocess_exec(
+            *cmd,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        stdout, stderr = await proc.communicate()
+
+        if proc.returncode != 0:
+            err = stderr.decode().strip()
+            raise RuntimeError(f"openclaw gateway call {method} failed (rc={proc.returncode}): {err}")
+
+        # stdout may contain warning lines before the JSON; find the first { or [
+        text = stdout.decode()
+        for i, ch in enumerate(text):
+            if ch in ('{', '['):
+                return json.loads(text[i:])
+
+        raise RuntimeError(f"No JSON found in openclaw gateway call {method} output")
 
     async def get_config(self) -> dict:
-        """POST /api/config.get -> {baseHash, config}"""
-        async with httpx.AsyncClient() as http:
-            resp = await http.post(
-                f"{self._gateway_url}/api/config.get",
-                json={},
-                headers=self._headers,
-            )
-            resp.raise_for_status()
-            return resp.json()
+        """config.get → {parsed: {...config...}, hash: "..."}
 
-    async def patch_config(self, base_hash: str, patch: dict) -> dict:
-        """POST /api/config.patch with {baseHash, patch}"""
-        async with httpx.AsyncClient() as http:
-            resp = await http.post(
-                f"{self._gateway_url}/api/config.patch",
-                json={"baseHash": base_hash, "patch": patch},
-                headers=self._headers,
-            )
-            resp.raise_for_status()
-            return resp.json()
+        Returns a normalised dict with keys:
+          - "config": the parsed config object
+          - "baseHash": the config hash (for use with config.patch)
+        """
+        raw = await self._call("config.get")
+        return {
+            "config": raw.get("parsed", {}),
+            "baseHash": raw.get("hash", ""),
+        }
+
+    async def patch_config(self, base_hash: str, raw_json5: str) -> dict:
+        """config.patch with a JSON5 raw string + baseHash."""
+        return await self._call("config.patch", {
+            "raw": raw_json5,
+            "baseHash": base_hash,
+        })
+
+    # ------------------------------------------------------------------
+    # High-level helpers
+    # ------------------------------------------------------------------
 
     async def add_agent_with_binding(
         self,
@@ -54,60 +77,66 @@ class ConfigPatchClient:
         agent_id: str,
         agent_config: dict,
         channel: str,
-        peer: str,
-    ) -> dict:
-        """Atomically add agent definition + binding in one patch.
+        peer: dict,
+    ) -> None:
+        """Atomically add agent definition + peer binding.
 
-        Arrays are full-replace in JSON merge patch, so we GET current
-        bindings first, append the new one, and PATCH the entire array.
+        Because bindings is an array (full-replace in merge-patch), we must
+        GET the current array, append, and PATCH the whole thing.
         """
-        current = await self.get_config()
-        base_hash = current["baseHash"]
-        config = current["config"]
+        data = await self.get_config()
+        base_hash = data["baseHash"]
+        config = data["config"]
 
         agents = copy.deepcopy(config.get("agents", {}))
         agents[agent_id] = agent_config
 
         bindings = list(config.get("bindings", []))
-        bindings.append({"agentId": agent_id, "channel": channel, "peer": peer})
+        bindings.append({
+            "agentId": agent_id,
+            "match": {"channel": channel, "peer": peer},
+        })
 
-        patch = {"agents": agents, "bindings": bindings}
-        return await self.patch_config(base_hash, patch)
+        patch = json.dumps({"agents": agents, "bindings": bindings})
+        await self.patch_config(base_hash, patch)
 
     async def add_binding(
         self,
         *,
         agent_id: str,
         channel: str,
-        peer: str | None = None,
+        peer: dict | None = None,
         account_id: str | None = None,
-    ) -> dict:
-        """Append a binding. GET current bindings, append, PATCH entire array."""
-        current = await self.get_config()
-        base_hash = current["baseHash"]
-        config = current["config"]
+    ) -> None:
+        """Append a single binding."""
+        data = await self.get_config()
+        base_hash = data["baseHash"]
+        config = data["config"]
 
         bindings = list(config.get("bindings", []))
-        new_binding: dict[str, Any] = {"agentId": agent_id, "channel": channel}
+        match: dict[str, Any] = {"channel": channel}
         if peer is not None:
-            new_binding["peer"] = peer
+            match["peer"] = peer
         if account_id is not None:
-            new_binding["accountId"] = account_id
-        bindings.append(new_binding)
+            match["accountId"] = account_id
+        bindings.append({"agentId": agent_id, "match": match})
 
-        return await self.patch_config(base_hash, {"bindings": bindings})
+        patch = json.dumps({"bindings": bindings})
+        await self.patch_config(base_hash, patch)
 
-    async def remove_binding(self, agent_id: str) -> dict:
-        """Remove all bindings matching agent_id. GET + filter + PATCH."""
-        current = await self.get_config()
-        base_hash = current["baseHash"]
-        config = current["config"]
+    async def remove_binding(self, agent_id: str) -> None:
+        """Remove all bindings matching agent_id."""
+        data = await self.get_config()
+        base_hash = data["baseHash"]
+        config = data["config"]
 
         bindings = [
-            b for b in config.get("bindings", []) if b.get("agentId") != agent_id
+            b for b in config.get("bindings", [])
+            if b.get("agentId") != agent_id
         ]
 
-        return await self.patch_config(base_hash, {"bindings": bindings})
+        patch = json.dumps({"bindings": bindings})
+        await self.patch_config(base_hash, patch)
 
 
 class ConfigPatchQueue:
@@ -136,17 +165,12 @@ class ConfigPatchQueue:
         await self._flush()
 
     async def _delayed_flush(self) -> None:
-        """Wait MERGE_WINDOW then flush."""
         await asyncio.sleep(self.MERGE_WINDOW)
         self._flush_task = None
         await self._flush()
 
     async def _flush(self) -> None:
-        """Merge all pending ops, GET config, apply, PATCH.
-
-        Retry up to MAX_RETRIES on baseHash conflict.
-        After MAX_RETRIES, log error and drop batch.
-        """
+        """Merge all pending ops, GET config, apply, PATCH."""
         if not self._pending:
             return
 
@@ -155,9 +179,9 @@ class ConfigPatchQueue:
 
         for attempt in range(self.MAX_RETRIES):
             try:
-                current = await self._client.get_config()
-                base_hash = current["baseHash"]
-                config = current["config"]
+                data = await self._client.get_config()
+                base_hash = data["baseHash"]
+                config = data["config"]
 
                 agents = copy.deepcopy(config.get("agents", {}))
                 bindings = list(config.get("bindings", []))
@@ -173,16 +197,13 @@ class ConfigPatchQueue:
                             b for b in bindings if b.get("agentId") != rid
                         ]
 
-                patch = {"agents": agents, "bindings": bindings}
+                patch = json.dumps({"agents": agents, "bindings": bindings})
                 await self._client.patch_config(base_hash, patch)
-                return  # success
+                log.info("config.patch flushed: %d ops merged", len(ops))
+                return
             except Exception:
                 if attempt < self.MAX_RETRIES - 1:
-                    log.warning(
-                        "config.patch attempt %d failed, retrying", attempt + 1
-                    )
+                    log.warning("config.patch attempt %d failed, retrying", attempt + 1)
+                    await asyncio.sleep(1)
                 else:
-                    log.error(
-                        "config.patch failed after %d retries, dropping batch",
-                        self.MAX_RETRIES,
-                    )
+                    log.error("config.patch failed after %d retries, dropping batch", self.MAX_RETRIES)

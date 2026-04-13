@@ -1,0 +1,7 @@
+{
+  "enableAllProjectMcpServers": true,
+  "channelsEnabled": true,
+  "enabledPlugins": {
+    "agent-setup@agent-setup": true
+  }
+}

@@ -1,0 +1,7 @@
+.feishu-credentials.json
+.channel-server.pid
+.autoservice/
+__pycache__/
+*.pyc
+.venv/
+uv.lock

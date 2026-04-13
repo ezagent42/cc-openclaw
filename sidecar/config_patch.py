@@ -78,6 +78,7 @@ class ConfigPatchClient:
         agent_config: dict,
         channel: str,
         peer: dict,
+        account_id: str | None = None,
     ) -> None:
         """Atomically add agent definition + peer binding.
 
@@ -102,9 +103,12 @@ class ConfigPatchClient:
         insert_idx = len(bindings)
         if bindings and not bindings[-1].get("match", {}).get("peer"):
             insert_idx = len(bindings) - 1
+        match: dict[str, Any] = {"channel": channel, "peer": peer}
+        if account_id:
+            match["accountId"] = account_id
         bindings.insert(insert_idx, {
             "agentId": agent_id,
-            "match": {"channel": channel, "peer": peer},
+            "match": match,
         })
 
         patch = json.dumps({"agents": agents_section, "bindings": bindings})

@@ -93,6 +93,7 @@ class Provisioner:
             agent_config=agent_config,
             channel="feishu",
             peer={"kind": "direct", "id": open_id},
+            account_id=self.account_id,
         )
 
         # Register in database
@@ -143,6 +144,7 @@ class Provisioner:
             agent_id=agent_id,
             channel="feishu",
             peer={"kind": "direct", "id": open_id},
+            account_id=self.account_id,
         )
         await self.db.update_agent_status(agent_id, "active")
         await self.db.write_audit(
@@ -206,6 +208,7 @@ class Provisioner:
             agent_config=agent_config,
             channel="feishu",
             peer={"kind": "group", "id": chat_id},
+            account_id=self.account_id,
         )
 
         # Register in database

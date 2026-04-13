@@ -1,6 +1,6 @@
 {
   "mcpServers": {
-    "autoservice-channel": {
+    "openclaw-channel": {
       "command": "uv",
       "args": ["run", "python3", "feishu/channel.py"]
     }

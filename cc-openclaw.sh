@@ -153,7 +153,7 @@ fi
 INTERACTIVE_FLAGS="--permission-mode bypassPermissions"
 
 # Load Feishu channel as development channel (MCP server name from .mcp.json)
-INTERACTIVE_FLAGS="$INTERACTIVE_FLAGS --dangerously-load-development-channels server:autoservice-channel"
+INTERACTIVE_FLAGS="$INTERACTIVE_FLAGS --dangerously-load-development-channels server:openclaw-channel"
 
 if [ -f "$SCRIPT_DIR/.claude/mcp.json" ]; then
     INTERACTIVE_FLAGS="$INTERACTIVE_FLAGS --mcp-config .claude/mcp.json"

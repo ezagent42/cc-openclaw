@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-autoservice-channel: Claude Code Channel MCP Server
+openclaw-channel: Claude Code Channel MCP Server
 Connects to channel-server.py via WebSocket, bridges messages to Claude Code via MCP stdio.
 
 Architecture:
@@ -35,7 +35,7 @@ IDENTITY_PATH = PROJECT_ROOT / ".openclaw" / "identity.yaml"
 LOG_FILE.parent.mkdir(parents=True, exist_ok=True)
 logging.basicConfig(
     level=logging.DEBUG,
-    format="[autoservice-channel] %(asctime)s %(levelname)s %(message)s",
+    format="[openclaw-channel] %(asctime)s %(levelname)s %(message)s",
     handlers=[
         logging.FileHandler(str(LOG_FILE), mode="a", encoding="utf-8"),
         logging.StreamHandler(sys.stderr),
@@ -44,7 +44,7 @@ logging.basicConfig(
 # File gets DEBUG, stderr gets INFO
 logging.getLogger().handlers[0].setLevel(logging.DEBUG)
 logging.getLogger().handlers[1].setLevel(logging.INFO)
-log = logging.getLogger("autoservice-channel")
+log = logging.getLogger("openclaw-channel")
 log.info(f"=== Channel started PID={os.getpid()} ===")
 
 
@@ -228,7 +228,7 @@ def create_server() -> Server:
         _instructions_mtime = INSTRUCTIONS_PATH.stat().st_mtime
     if IDENTITY_PATH.exists():
         _identity_mtime = IDENTITY_PATH.stat().st_mtime
-    return Server("autoservice-channel", instructions=text)
+    return Server("openclaw-channel", instructions=text)
 
 
 def register_tools(server: Server):
@@ -330,7 +330,7 @@ async def main():
     register_tools(server)
 
     init_opts = InitializationOptions(
-        server_name="autoservice-channel",
+        server_name="openclaw-channel",
         server_version="1.0.0",
         capabilities=server.get_capabilities(
             notification_options=NotificationOptions(),

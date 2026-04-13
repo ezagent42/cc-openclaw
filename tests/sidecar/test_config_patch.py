@@ -134,7 +134,7 @@ async def test_add_agent_with_binding():
     """Atomically adds agent definition + peer binding."""
     raw_config = {
         "parsed": {
-            "agents": {"old": {}},
+            "agents": {"list": [{"id": "old"}]},
             "bindings": [{"agentId": "old", "match": {"channel": "feishu"}}],
         },
         "hash": "hash3",
@@ -162,11 +162,17 @@ async def test_add_agent_with_binding():
 
     assert len(patches_sent) == 1
     patch_data = json.loads(patches_sent[0]["raw"])
-    assert "u-shared-ou_alice" in patch_data["agents"]
+    # agents.list should have 2 entries (old + new)
+    agents_list = patch_data["agents"]["list"]
+    assert len(agents_list) == 2
+    assert agents_list[1]["id"] == "u-shared-ou_alice"
+    # bindings should have 2 entries; new binding inserted before fallback catch-all
     assert len(patch_data["bindings"]) == 2
-    new_binding = patch_data["bindings"][1]
+    new_binding = patch_data["bindings"][0]  # inserted before catch-all
     assert new_binding["agentId"] == "u-shared-ou_alice"
     assert new_binding["match"]["peer"]["kind"] == "direct"
+    # catch-all remains last
+    assert patch_data["bindings"][1]["agentId"] == "old"
 
 
 # ── ConfigPatchQueue ────────────────────────────────────────────────

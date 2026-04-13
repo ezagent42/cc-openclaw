@@ -81,23 +81,33 @@ class ConfigPatchClient:
     ) -> None:
         """Atomically add agent definition + peer binding.
 
-        Because bindings is an array (full-replace in merge-patch), we must
-        GET the current array, append, and PATCH the whole thing.
+        OpenClaw agents are in agents.list (array), not a top-level dict.
+        Bindings are also an array. Both use full-replace in merge-patch,
+        so we GET current arrays, append, and PATCH the whole thing.
         """
         data = await self.get_config()
         base_hash = data["baseHash"]
         config = data["config"]
 
-        agents = copy.deepcopy(config.get("agents", {}))
-        agents[agent_id] = agent_config
+        agents_section = copy.deepcopy(config.get("agents", {}))
+        agents_list = list(agents_section.get("list", []))
+        # Build agent entry in OpenClaw format
+        new_agent = {"id": agent_id, "name": agent_id}
+        new_agent.update(agent_config)
+        agents_list.append(new_agent)
+        agents_section["list"] = agents_list
 
         bindings = list(config.get("bindings", []))
-        bindings.append({
+        # Insert before the last entry if it's the fallback catch-all
+        insert_idx = len(bindings)
+        if bindings and not bindings[-1].get("match", {}).get("peer"):
+            insert_idx = len(bindings) - 1
+        bindings.insert(insert_idx, {
             "agentId": agent_id,
             "match": {"channel": channel, "peer": peer},
         })
 
-        patch = json.dumps({"agents": agents, "bindings": bindings})
+        patch = json.dumps({"agents": agents_section, "bindings": bindings})
         await self.patch_config(base_hash, patch)
 
     async def add_binding(

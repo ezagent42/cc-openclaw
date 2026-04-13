@@ -1,0 +1,22 @@
+feishu:
+  app_id: "cli_xxx"
+  app_secret: "${FEISHU_APP_SECRET}"
+  user_group_chat_id: "oc_user_xxx"
+  admin_group_chat_id: "oc_admin_xxx"
+
+openclaw:
+  gateway_url: "http://127.0.0.1:18789"
+  auth_token: "${OPENCLAW_AUTH_TOKEN}"
+  default_model: "openrouter/google/gemini-3.1-flash-lite-preview"
+  account_id: "shared"
+
+sidecar:
+  api_port: 18791
+  db_path: "~/.openclaw/sidecar.sqlite"
+  reconcile_interval_minutes: 10
+  deny_rate_limit_minutes: 10
+  agents_dir: "~/.openclaw/agents"
+  archived_dir: "~/.openclaw/archived"
+
+templates:
+  user_agent_dir: "./sidecar/templates/"

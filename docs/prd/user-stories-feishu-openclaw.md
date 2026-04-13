@@ -162,8 +162,8 @@
 
 #### Use Case:
 - **As a** 关心系统成本的管理员
-- **I want to** 确保未授权用户发来的消息被 Sidecar 直接拒绝，不进入 OpenClaw 不消耗任何 token
-- **so that** 恶意或误发的消息不会产生 LLM 费用，也不会污染 OpenClaw 的 sessions 数据
+- **I want to** 确保未授权用户发来的消息不消耗任何 LLM token（消息经过 fallback agent 但不调用 LLM）
+- **so that** 恶意或误发的消息不会产生 LLM 费用
 
 #### Acceptance Criteria:
 
@@ -190,9 +190,9 @@
 - **Given:** Dan 不在任何授权群里
 - **and Given:** deny_rate_limit 表中没有 `ou_dan` 的记录 (第一次被拒)
 - **When:** Dan 在 1 分钟内向 bot 连续发送 5 条消息
-- **Then:** 所有 5 条消息都路由到 fallback agent；fallback 每次调 Sidecar API `deny-check`；只有第一条消息 Sidecar 返回 `should_reply: true`，fallback 回复"没有权限"；后 4 条消息 Sidecar 返回 `should_reply: false`（10 分钟频控窗口内），fallback 静默不回复；deny_rate_limit 表中记录 `ou_dan` 的最近一次拒绝时间
+- **Then:** 所有 5 条消息都路由到 fallback agent；fallback 每次调 Sidecar API `resolve-sender`；只有第一条消息 Sidecar 返回 `{ action: "deny" }`，fallback 回复"没有权限"；后 4 条消息 Sidecar 返回 `{ action: "deny_silent" }`（10 分钟频控窗口内），fallback 静默不回复；deny_rate_limit 表中记录 `ou_dan` 的最近一次拒绝时间
 - **and When:** Dan 在第一次被拒后 11 分钟再次发消息 (超过 10 分钟窗口)
-- **Then:** Sidecar deny-check 返回 `should_reply: true`，fallback 再次回复"没有权限"，更新 deny_rate_limit 记录
+- **Then:** Sidecar resolve-sender 返回 `{ action: "deny" }`，fallback 再次回复"没有权限"，更新 deny_rate_limit 记录
 
 ---
 
@@ -254,6 +254,25 @@
 - **When:** Sidecar 崩溃，launchd 在数秒内将其重启
 - **Then:** 启动时 Sidecar 重新加载 SQLite 中的权限表和注册表；立即执行一次全量对账修正崩溃期间可能丢失的事件；重新建立飞书 WebSocket 事件监听；重新启动管理 API server
 - **关键 (v0.4):** Sidecar 崩溃期间 **已有用户的对话完全不受影响**，因为 peer binding 已持久化在 openclaw.json 中，OpenClaw Gateway 独立处理消息。受影响的仅是：新用户无法 provision、权限变更暂停、fallback agent 无法调通 Sidecar API（会返回连接错误，fallback 应有降级处理）
+
+---
+
+### User Story B-013
+
+- **Summary:** OpenClaw Gateway 重启后所有动态注入的 agent 正常工作
+
+#### Use Case:
+- **As a** 管理员
+- **I want to** OpenClaw Gateway 重启后，所有通过 config.patch 动态注入的 agent 和 binding 能正常加载
+- **so that** Gateway 维护升级不会导致用户丢失服务
+
+#### Acceptance Criteria:
+
+- **Scenario:** Gateway 进程重启后的状态恢复
+- **Given:** 系统中有 N 个通过 Sidecar config.patch 动态注入的 user agent 和 group agent
+- **and Given:** 所有 agent 定义和 peer binding 已持久化在 openclaw.json 中
+- **When:** OpenClaw Gateway 进程被 launchd 重启（例如版本升级）
+- **Then:** Gateway 重新加载 openclaw.json，所有动态注入的 agent 和 binding 正常生效；所有已有用户的 DM 消息继续正确路由到各自的 agent；无需 Sidecar 干预
 
 ---
 
@@ -340,7 +359,7 @@
 
 - **Scenario:** 多用户并发使用 + 隔离验证
 - **Given:** Alice 和 Bob 都已经有了各自的 DM agent
-- **and Given:** `session.dmScope` 设为 `per-channel-peer`
+- **and Given:** `session.dmScope` 设为 `per-account-channel-peer`
 - **and Given:** 每个 agent 有独立 workspace 和 sessions 目录
 - **and Given:** Alice 跟自己的 agent 说过 "我下个月要离职创业"
 - **When:** Bob 跟自己的 agent 问 "你知道 Alice 最近有什么想法吗"
@@ -557,6 +576,7 @@ Phase 2: MVP 必须 (Week 3-4, 让系统能跑起来)
 ├─ B-010: 审计日志查询
 ├─ B-011: 定期对账自愈
 ├─ B-012: Sidecar 崩溃恢复
+├─ B-013: Gateway 重启后动态 agent 正常工作
 ├─ A-003: 跨对话记忆
 ├─ A-005: 被踢重入无损恢复 (用户视角)
 ├─ A-007: /reset 命令
@@ -588,5 +608,5 @@ Phase 3: 加固 (Week 5-6, 让运维放心)
 - **C-004 (群历史)**：取决于 OpenClaw 群消息的 historyLimit 配置上限，可能需要降级
 
 **跨视角 stories (未单独写出但在这里记录)**：
-- **系统重启恢复**：B-012 覆盖了 Sidecar 崩溃，但没有 story 覆盖 OpenClaw 本身崩溃。需要一个 B-013: "OpenClaw Gateway 崩溃后重启能加载动态注入的所有 agent"
+- **系统重启恢复**：B-012 覆盖 Sidecar 崩溃，B-013 覆盖 OpenClaw Gateway 重启
 - **多飞书 app 同名用户**：Alice 在 App A 和 App B 都有 agent，能不能保证完全独立？需要一个 B-014 或 A-009 覆盖这个场景

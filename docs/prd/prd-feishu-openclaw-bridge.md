@@ -232,8 +232,8 @@ flowchart TB
 4. audit_log: permission_granted
 5. Alice 首次 DM bot："你好"
 6. OpenClaw 收到消息，无 `ou_alice` 的 peer binding → 路由到 fallback agent
-7. Fallback agent 调 Sidecar API: `GET /api/v1/check-permission?open_id=ou_alice`
-8. Sidecar 返回: `{ authorized: true, agent_exists: false }`
+7. Fallback agent 调 Sidecar API: `POST /api/v1/resolve-sender` (open_id=ou_alice)
+8. Sidecar 返回: `{ action: "provision" }`
 9. Fallback agent 调 Sidecar API: `POST /api/v1/provision?open_id=ou_alice`
 10. Sidecar provisioner:
     a. 复制 `templates/user-agent/` → `~/.openclaw/agents/u-{accountId}-ou_alice/`
@@ -269,7 +269,7 @@ flowchart TB
 3. Sidecar 更新权限表：`ou_alice` 恢复为 authorized
 4. Sidecar **不**立即恢复 binding (保持懒触发语义)
 5. Alice 发消息 → 无 peer binding → 落到 fallback
-6. Fallback 调 Sidecar API: check-permission → `{ authorized: true, agent_exists: true, status: "suspended" }`
+6. Fallback 调 Sidecar API: `POST /api/v1/resolve-sender` → `{ action: "restore" }`
 7. Fallback 调 Sidecar API: `POST /api/v1/restore?open_id=ou_alice`
 8. Sidecar 进入 **restore** 路径：只调 `config.patch` 恢复 peer binding，不复制模板、不渲染 USER.md
 9. 注册表 UPDATE: status=active, restored_at=now
@@ -281,7 +281,7 @@ flowchart TB
 
 1. 未在用户群的 Dan 发消息
 2. OpenClaw 无 `ou_dan` 的 peer binding → 路由到 fallback
-3. Fallback 调 Sidecar API: `GET /api/v1/deny-check?open_id=ou_dan`
+3. Fallback 调 Sidecar API: `POST /api/v1/resolve-sender` → 返回 deny 或 deny_silent
 4. Sidecar 检查 deny_rate_limit 表：
    - 10 分钟内未拒绝过 → 返回 `{ should_reply: true, message: "您没有权限使用本助手，如需使用请联系管理员" }` + 记录时间戳
    - 10 分钟内已拒绝过 → 返回 `{ should_reply: false }`
@@ -498,6 +498,8 @@ stateDiagram-v2
 4. fallback agent 的配置方式：`default: true` 还是其他机制
 5. bindings 数组 config.patch 的原子性：并发 patch 时的 baseHash 冲突处理
 6. 飞书群成员变化事件的准确事件名称和 payload 格式
+7. OpenClaw Gateway 重启后是否正确加载 config.patch 动态注入的所有 agent 和 binding
+8. Fallback agent 是否可以不调用 LLM 而仅执行确定性 tool 逻辑（如不支持，需评估最廉价模型方案）
 
 ### 待决定
 
@@ -601,6 +603,7 @@ stateDiagram-v2
 - 启动 Sidecar，导入现有用户 open_id 到权限表
 - 为现有用户添加 peer binding（与旧 accountId binding 并存）
 - 验证：通过共享 App DM，消息是否正确路由
+- **注意**: 飞书 open_id 是 per-app 的。旧 App 下的 open_id 与共享 App 下的 open_id 不同，需通过 union_id 建立映射
 
 **Step 2: 逐用户切换**
 - 每个用户确认共享 App 路由正常后：停用旧 App、移除旧 binding

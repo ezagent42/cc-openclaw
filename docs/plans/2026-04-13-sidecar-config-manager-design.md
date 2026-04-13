@@ -41,6 +41,13 @@ Sidecar (独立进程):
 - `config.patch` RPC 可用，限速 3次/60秒，bindings 数组整体替换
 - hot reload (hybrid 模式) 对 agent/binding 变更即时生效
 
+### 待 PoC 验证
+
+- OpenClaw 是否支持 agent 的 tool-only / scripted 模式（不调用 LLM）。如不支持，fallback agent 可使用最廉价模型 + 严格 SOUL.md 约束，或改为 Sidecar 内置的轻量 HTTP handler
+- peer binding `{ kind: "direct", id: "ou_xxx" }` 的实际路由行为
+- config.patch bindings 数组并发修改的 baseHash 冲突处理
+- 飞书群成员变化事件的准确名称和 payload 格式
+
 ---
 
 ## 2. SQLite Schema
@@ -59,7 +66,7 @@ CREATE TABLE agent_registry (
     open_id        TEXT,              -- DM agent 的用户 (群 agent 为 NULL)
     chat_id        TEXT,              -- 群 agent 的 chat_id (DM agent 为 NULL)
     agent_type     TEXT NOT NULL,     -- 'user' | 'group'
-    status         TEXT NOT NULL DEFAULT 'active',  -- active | suspended | archived
+    status         TEXT NOT NULL DEFAULT 'active',  -- active | provisioning | suspended | archived
     workspace_path TEXT NOT NULL,
     created_at     TEXT NOT NULL,
     suspended_at   TEXT,
@@ -81,6 +88,14 @@ CREATE TABLE deny_rate_limit (
     last_denied_at  TEXT NOT NULL,
     deny_count      INTEGER DEFAULT 1
 );
+
+-- 飞书事件幂等去重
+CREATE TABLE event_dedup (
+    event_id    TEXT PRIMARY KEY,
+    received_at TEXT NOT NULL,
+    processed   BOOLEAN DEFAULT TRUE
+);
+-- 定期清理 7 天前的记录
 ```
 
 ---
@@ -104,12 +119,11 @@ sidecar/
 │                           #   限速队列 (3次/60秒, 5秒窗口合并)
 │                           #   bindings 数组 GET+append+PATCH
 ├── api.py                  # 管理 API (HTTP server, 127.0.0.1:18791)
-│                           #   GET  /api/v1/check-permission
+│                           #   POST /api/v1/resolve-sender  (合并: 权限检查+频控+状态查询 → 单一决策)
 │                           #   GET  /api/v1/agents
 │                           #   GET  /api/v1/audit-log
 │                           #   POST /api/v1/provision
 │                           #   POST /api/v1/restore
-│                           #   POST /api/v1/deny-check
 │                           #   POST /api/v1/admin/reset-agent
 ├── reconciler.py           # 定期对账 (10 分钟间隔)
 └── templates/
@@ -144,6 +158,7 @@ class ConfigPatchQueue:
         # 3. POST config.patch (baseHash + merged)
         # 4. 轮询 config.get 确认生效
         # 5. baseHash 冲突 → 重新获取后重试
+        # 6. 最多重试 3 次, 失败后记录错误日志并跳过本批次
 ```
 
 ### bindings 数组处理
@@ -160,16 +175,16 @@ class ConfigPatchQueue:
 ```json5
 {
   "agents": {
-    "u-cli_xxx-ou_alice": {
-      "agentDir": "~/.openclaw/agents/u-cli_xxx-ou_alice/agent",
-      "workspace": "~/.openclaw/agents/u-cli_xxx-ou_alice/workspace",
+    "u-shared-ou_alice": {
+      "agentDir": "~/.openclaw/agents/u-shared-ou_alice/agent",
+      "workspace": "~/.openclaw/agents/u-shared-ou_alice/workspace",
       "model": "openrouter/google/gemini-3.1-flash-lite-preview"
     }
   },
   "bindings": [
     // ... 现有 bindings ...
     {
-      "agentId": "u-cli_xxx-ou_alice",
+      "agentId": "u-shared-ou_alice",
       "match": { "channel": "feishu", "peer": { "kind": "direct", "id": "ou_alice" } }
     }
   ]
@@ -197,7 +212,7 @@ class ConfigPatchQueue:
 ```
 飞书群成员移除事件 → Sidecar feishu_events.py
   → permission.py: UPDATE is_user_member=FALSE
-  → provisioner.py: config.patch 移除 peer binding
+  → provisioner.py: config.patch 移除 peer binding (保留 agent 定义以加速 restore; archive 时才移除 agent 定义)
   → agent_registry: status=suspended
   → audit_log: suspend
 ```
@@ -230,11 +245,15 @@ class ConfigPatchQueue:
 
 ```
 收到消息 →
-  1. 调 check-permission(sender open_id)
-  2. if authorized + no agent → 调 provision → 回复"准备中"
-  3. if authorized + suspended → 调 restore → 回复"已恢复"
-  4. if not authorized → 调 deny-check → 根据频控决定回复或静默
-  5. if Sidecar API 不可达 → 回复"系统维护中，请稍后重试"
+  1. 调 resolve-sender(sender open_id) → 返回单一决策:
+     { action: "provision" | "restore" | "deny" | "deny_silent" | "retry_later" | "error",
+       message?: "...", agent_id?: "..." }
+  2. action=provision → 调 POST /api/v1/provision → 回复"准备中"
+  3. action=restore → 调 POST /api/v1/restore → 回复"已恢复"
+  4. action=deny → 回复拒绝文案
+  5. action=deny_silent → 不回复 (频控窗口内)
+  6. action=retry_later → 回复"助手正在准备中，请稍后再试" (provisioning 状态)
+  7. action=error → 回复"系统维护中，请稍后重试" (Sidecar API 不可达)
 ```
 
 **SOUL.md** 需要明确指示 agent 不调用 LLM，仅执行上述确定性逻辑。
@@ -264,7 +283,7 @@ class ConfigPatchQueue:
 
 启动时也执行一次全量对账。
 
-对账**不主动 provision/restore agent**，只修正权限表和 binding。Agent 创建/恢复仍然是懒触发。
+对账**不主动 provision 新 agent 或 restore suspended agent**（仍然是懒触发），但会修正 active agent 的缺失 binding（config 漂移修复）和移除应 suspended 的 binding。
 
 ---
 
@@ -276,6 +295,7 @@ class ConfigPatchQueue:
 - 启动 Sidecar，导入现有用户 open_id
 - 为现有用户添加 peer binding（与旧 binding 并存）
 - 验证共享 App 路由
+- **重要**: 飞书 open_id 是 per-app 的，旧 App 的 open_id 与共享 App 不同。需通过 union_id 或 user_id 建立用户映射。迁移脚本需先用旧 App 的 open_id 查询 union_id，再用共享 App 查询新 open_id
 
 ### Step 2: 逐用户切换
 - 确认共享 App 路由正常 → 停用旧 App → 移除旧 binding
@@ -305,7 +325,7 @@ SQLite: `~/.openclaw/sidecar.sqlite`
 ```yaml
 # sidecar-config.yaml
 feishu:
-  app_id: "cli_xxx"
+  app_id: "shared"
   app_secret: "${FEISHU_APP_SECRET}"
   user_group_chat_id: "oc_user_xxx"
   admin_group_chat_id: "oc_admin_xxx"

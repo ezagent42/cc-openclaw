@@ -2,15 +2,23 @@
 
 from __future__ import annotations
 
+from typing import TYPE_CHECKING
+
 from aiohttp import web
 
 from sidecar.db import Database
 from sidecar.provisioner import Provisioner
 
+if TYPE_CHECKING:
+    from sidecar.feishu_events import FeishuEventHandler
+
 DENY_MESSAGE = "您没有权限使用本助手，如需使用请联系管理员"
 
 _db_key = web.AppKey("db", Database)
 _provisioner_key = web.AppKey("provisioner", Provisioner)
+_event_handler_key: web.AppKey["FeishuEventHandler | None"] = web.AppKey(
+    "event_handler",
+)
 
 
 def _is_authorized(perm: dict | None) -> bool:
@@ -92,11 +100,71 @@ async def _admin_reset_agent(request: web.Request) -> web.Response:
     return web.json_response({"ok": True})
 
 
-def create_app(*, db: Database, provisioner: Provisioner) -> web.Application:
+# ── Feishu event forwarding endpoints ─────────────────────────────
+
+
+async def _event_member_added(request: web.Request) -> web.Response:
+    handler = request.app[_event_handler_key]
+    if handler is None:
+        return web.json_response({"error": "event handler not configured"}, status=503)
+    body = await request.json()
+    await handler.handle_member_added(
+        event_id=body["event_id"],
+        chat_id=body["chat_id"],
+        open_id=body["open_id"],
+        name=body.get("name"),
+    )
+    return web.json_response({"ok": True})
+
+
+async def _event_member_removed(request: web.Request) -> web.Response:
+    handler = request.app[_event_handler_key]
+    if handler is None:
+        return web.json_response({"error": "event handler not configured"}, status=503)
+    body = await request.json()
+    await handler.handle_member_removed(
+        event_id=body["event_id"],
+        chat_id=body["chat_id"],
+        open_id=body["open_id"],
+    )
+    return web.json_response({"ok": True})
+
+
+async def _event_bot_added(request: web.Request) -> web.Response:
+    handler = request.app[_event_handler_key]
+    if handler is None:
+        return web.json_response({"error": "event handler not configured"}, status=503)
+    body = await request.json()
+    await handler.handle_bot_added(
+        event_id=body["event_id"],
+        chat_id=body["chat_id"],
+    )
+    return web.json_response({"ok": True})
+
+
+async def _event_group_disbanded(request: web.Request) -> web.Response:
+    handler = request.app[_event_handler_key]
+    if handler is None:
+        return web.json_response({"error": "event handler not configured"}, status=503)
+    body = await request.json()
+    await handler.handle_group_disbanded(
+        event_id=body["event_id"],
+        chat_id=body["chat_id"],
+    )
+    return web.json_response({"ok": True})
+
+
+def create_app(
+    *,
+    db: Database,
+    provisioner: Provisioner,
+    event_handler: "FeishuEventHandler | None" = None,
+) -> web.Application:
     """Create aiohttp app with all routes registered."""
     app = web.Application()
     app[_db_key] = db
     app[_provisioner_key] = provisioner
+    app[_event_handler_key] = event_handler
 
     app.router.add_post("/api/v1/resolve-sender", _resolve_sender)
     app.router.add_post("/api/v1/provision", _provision)
@@ -104,5 +172,11 @@ def create_app(*, db: Database, provisioner: Provisioner) -> web.Application:
     app.router.add_get("/api/v1/agents", _list_agents)
     app.router.add_get("/api/v1/audit-log", _audit_log)
     app.router.add_post("/api/v1/admin/reset-agent", _admin_reset_agent)
+
+    # Feishu event forwarding (from channel_server)
+    app.router.add_post("/api/v1/event/member-added", _event_member_added)
+    app.router.add_post("/api/v1/event/member-removed", _event_member_removed)
+    app.router.add_post("/api/v1/event/bot-added", _event_bot_added)
+    app.router.add_post("/api/v1/event/group-disbanded", _event_group_disbanded)
 
     return app

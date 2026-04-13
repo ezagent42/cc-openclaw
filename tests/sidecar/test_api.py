@@ -27,8 +27,22 @@ def mock_provisioner():
 
 
 @pytest.fixture
+def mock_event_handler():
+    return AsyncMock()
+
+
+@pytest.fixture
 async def client(mock_db, mock_provisioner):
     app = create_app(db=mock_db, provisioner=mock_provisioner)
+    async with TestClient(TestServer(app)) as c:
+        yield c
+
+
+@pytest.fixture
+async def client_with_events(mock_db, mock_provisioner, mock_event_handler):
+    app = create_app(
+        db=mock_db, provisioner=mock_provisioner, event_handler=mock_event_handler,
+    )
     async with TestClient(TestServer(app)) as c:
         yield c
 
@@ -231,3 +245,73 @@ async def test_admin_reset(client, mock_provisioner):
     body = await resp.json()
     assert body["ok"] is True
     mock_provisioner.reset_user.assert_awaited_once_with("ou_xxx", actor="ou_admin")
+
+
+# ── event forwarding endpoints ─────────────────────────────────────
+
+
+async def test_event_member_added(client_with_events, mock_event_handler):
+    """POST /event/member-added forwards to handler."""
+    resp = await client_with_events.post(
+        "/api/v1/event/member-added",
+        json={"event_id": "e1", "chat_id": "c1", "open_id": "ou_1", "name": "Alice"},
+    )
+    assert resp.status == 200
+    body = await resp.json()
+    assert body["ok"] is True
+    mock_event_handler.handle_member_added.assert_awaited_once_with(
+        event_id="e1", chat_id="c1", open_id="ou_1", name="Alice",
+    )
+
+
+async def test_event_member_removed(client_with_events, mock_event_handler):
+    """POST /event/member-removed forwards to handler."""
+    resp = await client_with_events.post(
+        "/api/v1/event/member-removed",
+        json={"event_id": "e2", "chat_id": "c1", "open_id": "ou_1"},
+    )
+    assert resp.status == 200
+    body = await resp.json()
+    assert body["ok"] is True
+    mock_event_handler.handle_member_removed.assert_awaited_once_with(
+        event_id="e2", chat_id="c1", open_id="ou_1",
+    )
+
+
+async def test_event_bot_added(client_with_events, mock_event_handler):
+    """POST /event/bot-added forwards to handler."""
+    resp = await client_with_events.post(
+        "/api/v1/event/bot-added",
+        json={"event_id": "e3", "chat_id": "c2"},
+    )
+    assert resp.status == 200
+    body = await resp.json()
+    assert body["ok"] is True
+    mock_event_handler.handle_bot_added.assert_awaited_once_with(
+        event_id="e3", chat_id="c2",
+    )
+
+
+async def test_event_group_disbanded(client_with_events, mock_event_handler):
+    """POST /event/group-disbanded forwards to handler."""
+    resp = await client_with_events.post(
+        "/api/v1/event/group-disbanded",
+        json={"event_id": "e4", "chat_id": "c3"},
+    )
+    assert resp.status == 200
+    body = await resp.json()
+    assert body["ok"] is True
+    mock_event_handler.handle_group_disbanded.assert_awaited_once_with(
+        event_id="e4", chat_id="c3",
+    )
+
+
+async def test_event_endpoint_returns_503_without_handler(client):
+    """Event endpoints return 503 when no event_handler is configured."""
+    resp = await client.post(
+        "/api/v1/event/member-added",
+        json={"event_id": "e1", "chat_id": "c1", "open_id": "ou_1"},
+    )
+    assert resp.status == 503
+    body = await resp.json()
+    assert "error" in body

@@ -58,11 +58,15 @@ class ChannelServer:
         port: int = 0,
         feishu_enabled: bool = True,
         admin_chat_id: str | None = None,
+        sidecar_url: str | None = None,
     ) -> None:
         self.host = host
         self.port = port
         self.feishu_enabled = feishu_enabled
         self.admin_chat_id = admin_chat_id
+        self.sidecar_url = sidecar_url or os.environ.get(
+            "SIDECAR_URL", "http://127.0.0.1:18791"
+        )
         self.pidfile = PROJECT_ROOT / ".channel-server.pid"
 
         # Route tables
@@ -600,10 +604,85 @@ class ChannelServer:
                     {"_admin_notify": f"New chat: {chat_id} from {display_name}"},
                 )
 
+        # --- Group membership event callbacks (forward to Sidecar API) ---
+        sidecar_url = self.sidecar_url
+
+        def _forward_to_sidecar(endpoint: str, payload: dict) -> None:
+            """POST an event payload to the Sidecar API (sync, runs in WS thread)."""
+            try:
+                import httpx
+                httpx.post(
+                    f"{sidecar_url}/api/v1/event/{endpoint}",
+                    json=payload,
+                    timeout=5.0,
+                )
+            except Exception as exc:
+                log.error("Failed to forward %s event to sidecar: %s", endpoint, exc)
+
+        def on_member_added(data) -> None:
+            event = data.event
+            if event is None:
+                return
+            event_id = (data.header.event_id if data.header else None) or ""
+            chat_id = event.chat_id or ""
+            for user in event.users or []:
+                open_id = (user.user_id.open_id if user.user_id else None) or ""
+                name = user.name or ""
+                if not open_id:
+                    continue
+                _forward_to_sidecar("member-added", {
+                    "event_id": event_id,
+                    "chat_id": chat_id,
+                    "open_id": open_id,
+                    "name": name,
+                })
+
+        def on_member_deleted(data) -> None:
+            event = data.event
+            if event is None:
+                return
+            event_id = (data.header.event_id if data.header else None) or ""
+            chat_id = event.chat_id or ""
+            for user in event.users or []:
+                open_id = (user.user_id.open_id if user.user_id else None) or ""
+                if not open_id:
+                    continue
+                _forward_to_sidecar("member-removed", {
+                    "event_id": event_id,
+                    "chat_id": chat_id,
+                    "open_id": open_id,
+                })
+
+        def on_bot_added(data) -> None:
+            event = data.event
+            if event is None:
+                return
+            event_id = (data.header.event_id if data.header else None) or ""
+            chat_id = event.chat_id or ""
+            _forward_to_sidecar("bot-added", {
+                "event_id": event_id,
+                "chat_id": chat_id,
+            })
+
+        def on_group_disbanded(data) -> None:
+            event = data.event
+            if event is None:
+                return
+            event_id = (data.header.event_id if data.header else None) or ""
+            chat_id = event.chat_id or ""
+            _forward_to_sidecar("group-disbanded", {
+                "event_id": event_id,
+                "chat_id": chat_id,
+            })
+
         # --- Start Feishu WebSocket in daemon thread ---
         handler = (
             lark.EventDispatcherHandler.builder("", "")
             .register_p2_im_message_receive_v1(on_message)
+            .register_p2_im_chat_member_user_added_v1(on_member_added)
+            .register_p2_im_chat_member_user_deleted_v1(on_member_deleted)
+            .register_p2_im_chat_member_bot_added_v1(on_bot_added)
+            .register_p2_im_chat_disbanded_v1(on_group_disbanded)
             .build()
         )
         ws_client = lark.ws.Client(

@@ -13,7 +13,7 @@ from sidecar.api import create_app
 from sidecar.config import SidecarConfig
 from sidecar.config_patch import ConfigPatchClient
 from sidecar.db import Database
-from sidecar.feishu_events import FeishuEventHandler, FeishuEventListener
+from sidecar.feishu_events import FeishuEventHandler
 from sidecar.provisioner import Provisioner
 from sidecar.reconciler import LarkFeishuGroupAPI, Reconciler
 
@@ -69,16 +69,9 @@ async def main() -> None:
         default_model=cfg.default_model,
     )
 
-    # 6. Create and start HTTP server
-    app = create_app(db=db, provisioner=provisioner)
-    runner = web.AppRunner(app)
-    await runner.setup()
-    site = web.TCPSite(runner, "127.0.0.1", cfg.api_port)
-    await site.start()
-    log.info("sidecar ready on http://127.0.0.1:%d", cfg.api_port)
-
-    # 7. Feishu event listener (real WebSocket long connection)
+    # 6. Feishu event handler (events arrive via HTTP from channel_server)
     feishu_enabled = bool(cfg.feishu_app_id and cfg.feishu_app_secret)
+    event_handler: FeishuEventHandler | None = None
 
     if feishu_enabled:
         event_handler = FeishuEventHandler(
@@ -88,14 +81,15 @@ async def main() -> None:
             admin_group_chat_id=cfg.admin_group_chat_id,
         )
 
-        listener = FeishuEventListener(
-            app_id=cfg.feishu_app_id,
-            app_secret=cfg.feishu_app_secret,
-            handler=event_handler,
-        )
-        listener.start(loop=asyncio.get_event_loop())
-        log.info("Feishu event listener started")
+    # 7. Create and start HTTP server
+    app = create_app(db=db, provisioner=provisioner, event_handler=event_handler)
+    runner = web.AppRunner(app)
+    await runner.setup()
+    site = web.TCPSite(runner, "127.0.0.1", cfg.api_port)
+    await site.start()
+    log.info("sidecar ready on http://127.0.0.1:%d", cfg.api_port)
 
+    if feishu_enabled:
         # 8. Reconciler with real Feishu API
         feishu_api = LarkFeishuGroupAPI(cfg.feishu_app_id, cfg.feishu_app_secret)
         reconciler = Reconciler(

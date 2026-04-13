@@ -137,8 +137,7 @@ async def inject_message(write_stream, msg: dict):
         "message_id": msg.get("message_id", ""),
         "user": msg.get("user", "unknown"),
         "user_id": msg.get("user_id", ""),
-        "runtime_mode": msg.get("runtime_mode", "production"),
-        "business_mode": msg.get("business_mode", "sales"),
+        "runtime_mode": msg.get("runtime_mode", "discussion"),
         "source": msg.get("source", "feishu"),
         "ts": msg.get("ts", datetime.now(tz=timezone.utc).isoformat()),
     }
@@ -188,7 +187,7 @@ def _load_identity() -> str:
         lines.append(f"You are **{data.get('name', 'AI Bot')}** — {data.get('description', '')}.")
         modes = data.get("modes", {})
         for mode_key, mode_name in modes.items():
-            lines.append(f"- In {mode_key} mode (`business_mode: {mode_key}`): introduce yourself as **{mode_name}**")
+            lines.append(f"- In {mode_key} mode (`runtime_mode: {mode_key}`): introduce yourself as **{mode_name}**")
         for rule in data.get("rules", []):
             lines.append(f"- {rule}")
         return "\n".join(lines) + "\n\n"
@@ -317,13 +316,13 @@ async def main():
         sys.exit(1)
     server_url = f"ws://localhost:{port}"
 
-    chat_id_str = os.environ.get("AUTOSERVICE_CHAT_ID", "*")
+    chat_id_str = os.environ.get("OPENCLAW_CHAT_ID", "*")
     chat_ids = [chat_id_str]
 
     _channel_client = ChannelClient(
         server_url=server_url,
         chat_ids=chat_ids,
-        runtime_mode=os.environ.get("AUTOSERVICE_RUNTIME_MODE", "discussion"),
+        runtime_mode=os.environ.get("OPENCLAW_RUNTIME_MODE", "discussion"),
     )
 
     server = create_server()

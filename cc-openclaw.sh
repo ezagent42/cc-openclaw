@@ -333,10 +333,10 @@ echo ""
 # Parse chat_id argument (first non-internal, non-mode arg)
 # Usage: ./autoservice.sh oc_xxx  or  ./autoservice.sh  (defaults to wildcard)
 if [ "$1" != "--_internal" ] && [ -n "$1" ] && [[ "$1" != [123] ]]; then
-    export AUTOSERVICE_CHAT_ID="$1"
+    export OPENCLAW_CHAT_ID="$1"
     shift
 else
-    export AUTOSERVICE_CHAT_ID="${AUTOSERVICE_CHAT_ID:-*}"
+    export OPENCLAW_CHAT_ID="${OPENCLAW_CHAT_ID:-*}"
 fi
 
 # Parse internal arguments (passed from outer invocation)

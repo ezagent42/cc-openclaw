@@ -18,6 +18,75 @@ class FeishuGroupAPI:
         raise NotImplementedError
 
 
+class LarkFeishuGroupAPI(FeishuGroupAPI):
+    """Real Feishu API implementation using lark-oapi SDK."""
+
+    def __init__(self, app_id: str, app_secret: str) -> None:
+        import lark_oapi as lark
+
+        self._client = (
+            lark.Client.builder()
+            .app_id(app_id)
+            .app_secret(app_secret)
+            .log_level(lark.LogLevel.ERROR)
+            .build()
+        )
+
+    async def get_group_members(self, chat_id: str) -> list[dict]:
+        """GET /open-apis/im/v1/chats/{chat_id}/members with pagination.
+
+        Returns [{open_id, name}, ...] for every member in the chat.
+        """
+        from lark_oapi.api.im.v1 import GetChatMembersRequest
+
+        members: list[dict] = []
+        page_token: str | None = None
+
+        while True:
+            builder = (
+                GetChatMembersRequest.builder()
+                .chat_id(chat_id)
+                .member_id_type("open_id")
+                .page_size(100)
+            )
+            if page_token:
+                builder = builder.page_token(page_token)
+
+            request = builder.build()
+
+            # The SDK client methods are synchronous — safe to call from
+            # an async context because they just do HTTP.  We run them in
+            # the default executor to avoid blocking the event loop.
+            import asyncio
+
+            loop = asyncio.get_event_loop()
+            response = await loop.run_in_executor(
+                None, self._client.im.v1.chat_members.get, request,
+            )
+
+            if not response.success():
+                log.error(
+                    "Failed to list members for %s: code=%s msg=%s",
+                    chat_id,
+                    response.code,
+                    response.msg,
+                )
+                break
+
+            for item in response.data.items or []:
+                members.append({
+                    "open_id": item.member_id or "",
+                    "name": item.name or "",
+                })
+
+            if response.data.has_more and response.data.page_token:
+                page_token = response.data.page_token
+            else:
+                break
+
+        return members
+
+
 class Reconciler:
     """Periodic full-sync between Feishu group membership and the permission table."""
 

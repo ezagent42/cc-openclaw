@@ -13,9 +13,21 @@ from sidecar.api import create_app
 from sidecar.config import SidecarConfig
 from sidecar.config_patch import ConfigPatchClient
 from sidecar.db import Database
+from sidecar.feishu_events import FeishuEventHandler, FeishuEventListener
 from sidecar.provisioner import Provisioner
+from sidecar.reconciler import LarkFeishuGroupAPI, Reconciler
 
 log = logging.getLogger("sidecar")
+
+
+async def reconciler_loop(reconciler: Reconciler, interval_minutes: int) -> None:
+    """Run reconciliation periodically in the background."""
+    while True:
+        await asyncio.sleep(interval_minutes * 60)
+        try:
+            await reconciler.reconcile()
+        except Exception:
+            log.exception("reconciliation failed")
 
 
 async def main() -> None:
@@ -65,7 +77,57 @@ async def main() -> None:
     await site.start()
     log.info("sidecar ready on http://127.0.0.1:%d", cfg.api_port)
 
-    # 7. Run forever (Feishu listener + reconciler are Phase 2)
+    # 7. Feishu event listener (real WebSocket long connection)
+    feishu_enabled = bool(cfg.feishu_app_id and cfg.feishu_app_secret)
+
+    if feishu_enabled:
+        event_handler = FeishuEventHandler(
+            db=db,
+            provisioner=provisioner,
+            user_group_chat_id=cfg.user_group_chat_id,
+            admin_group_chat_id=cfg.admin_group_chat_id,
+        )
+
+        listener = FeishuEventListener(
+            app_id=cfg.feishu_app_id,
+            app_secret=cfg.feishu_app_secret,
+            handler=event_handler,
+        )
+        listener.start(loop=asyncio.get_event_loop())
+        log.info("Feishu event listener started")
+
+        # 8. Reconciler with real Feishu API
+        feishu_api = LarkFeishuGroupAPI(cfg.feishu_app_id, cfg.feishu_app_secret)
+        reconciler = Reconciler(
+            db=db,
+            provisioner=provisioner,
+            feishu_api=feishu_api,
+            user_group_chat_id=cfg.user_group_chat_id,
+            admin_group_chat_id=cfg.admin_group_chat_id,
+        )
+
+        # Run initial reconciliation
+        try:
+            await reconciler.reconcile()
+            log.info("Initial reconciliation complete")
+        except Exception:
+            log.exception("Initial reconciliation failed — will retry on schedule")
+
+        # Start periodic reconciler loop
+        asyncio.create_task(
+            reconciler_loop(reconciler, cfg.reconcile_interval_minutes),
+            name="reconciler-loop",
+        )
+        log.info(
+            "Reconciler loop started (every %d minutes)",
+            cfg.reconcile_interval_minutes,
+        )
+    else:
+        log.warning(
+            "Feishu credentials not configured — event listener and reconciler disabled"
+        )
+
+    # 9. Run forever
     await asyncio.Event().wait()
 
 

@@ -1,0 +1,12 @@
+{
+  "name": "openclaw-sidecar",
+  "version": "0.1.0",
+  "description": "Sidecar routing plugin — intercepts unrouted messages and calls Sidecar API for provision/restore/deny",
+  "main": "./index.js",
+  "type": "module",
+  "openclaw": {
+    "id": "openclaw-sidecar",
+    "name": "Sidecar Routing",
+    "description": "Routes unmatched messages via Sidecar API"
+  }
+}

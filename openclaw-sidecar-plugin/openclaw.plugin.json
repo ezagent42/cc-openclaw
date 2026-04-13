@@ -1,0 +1,19 @@
+{
+  "id": "openclaw-sidecar",
+  "configSchema": {
+    "type": "object",
+    "additionalProperties": false,
+    "properties": {
+      "sidecarUrl": {
+        "type": "string",
+        "description": "Sidecar API base URL",
+        "default": "http://127.0.0.1:18791"
+      },
+      "accountId": {
+        "type": "string",
+        "description": "Feishu account ID to intercept (only messages from this account)",
+        "default": "shared"
+      }
+    }
+  }
+}

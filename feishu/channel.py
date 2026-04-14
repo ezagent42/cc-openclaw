@@ -120,6 +120,18 @@ class ChannelClient:
             msg = json.loads(raw)
             if msg.get("type") == "message":
                 await self._message_queue.put(msg)
+            elif msg.get("type") == "forwarded_message":
+                from_id = msg.get("from", "unknown")
+                text = msg.get("text", "")
+                await self._message_queue.put({
+                    "type": "message",
+                    "text": f"[来自 {from_id}] {text}",
+                    "user": from_id,
+                    "user_id": from_id,
+                    "chat_id": "internal",
+                    "source": "forward",
+                    "ts": datetime.now(tz=timezone.utc).isoformat(),
+                })
             elif msg.get("type") == "ping":
                 await ws.send(json.dumps({"type": "pong"}))
             elif msg.get("type") == "error":
@@ -141,6 +153,19 @@ class ChannelClient:
         if self.ws:
             await self.ws.send(json.dumps({
                 "type": "send_file", "chat_id": chat_id, "file_path": file_path,
+            }))
+
+    async def send_forward(self, target_instance, text):
+        if self.ws:
+            await self.ws.send(json.dumps({
+                "type": "forward", "target_instance": target_instance, "text": text,
+            }))
+
+    async def send_summary(self, text):
+        """Forward summary to monitor session."""
+        if self.ws:
+            await self.ws.send(json.dumps({
+                "type": "forward", "target_instance": "monitor", "text": text,
             }))
 
     async def send_ux_event(self, chat_id, event, data=None):
@@ -310,6 +335,29 @@ def register_tools(server: Server):
                     "required": ["chat_id", "file_path"],
                 },
             ),
+            Tool(
+                name="forward",
+                description="Forward a message to another CC session by instance name",
+                inputSchema={
+                    "type": "object",
+                    "properties": {
+                        "target_instance": {"type": "string", "description": "Target instance name"},
+                        "text": {"type": "string", "description": "Message text to forward"},
+                    },
+                    "required": ["target_instance", "text"],
+                },
+            ),
+            Tool(
+                name="send_summary",
+                description="Send a task completion summary to the monitor session (管理群)",
+                inputSchema={
+                    "type": "object",
+                    "properties": {
+                        "summary": {"type": "string", "description": "Task completion summary text"},
+                    },
+                    "required": ["summary"],
+                },
+            ),
         ]
 
     @server.call_tool()
@@ -320,6 +368,10 @@ def register_tools(server: Server):
             return _handle_react(arguments)
         elif name == "send_file":
             return _handle_send_file(arguments)
+        elif name == "forward":
+            return _handle_forward_tool(arguments)
+        elif name == "send_summary":
+            return _handle_send_summary_tool(arguments)
         raise ValueError(f"Unknown tool: {name}")
 
 
@@ -358,6 +410,25 @@ def _handle_send_file(args: dict) -> list[TextContent]:
         log.info(f"Send file to {chat_id}: {file_path}")
         return [TextContent(type="text", text=f"File sent to {chat_id}: {os.path.basename(file_path)}")]
     return [TextContent(type="text", text="Error: not connected to channel-server")]
+
+
+def _handle_forward_tool(args: dict) -> list[TextContent]:
+    target = args["target_instance"]
+    text = args["text"]
+    if _channel_client and _channel_client.ws and _event_loop:
+        asyncio.run_coroutine_threadsafe(
+            _channel_client.send_forward(target, text), _event_loop)
+        return [TextContent(type="text", text=f"Forwarded to {target}")]
+    return [TextContent(type="text", text="Error: not connected")]
+
+
+def _handle_send_summary_tool(args: dict) -> list[TextContent]:
+    summary = args["summary"]
+    if _channel_client and _channel_client.ws and _event_loop:
+        asyncio.run_coroutine_threadsafe(
+            _channel_client.send_summary(summary), _event_loop)
+        return [TextContent(type="text", text=f"Summary sent to monitor")]
+    return [TextContent(type="text", text="Error: not connected")]
 
 
 # -- Main ---------------------------------------------------------------------

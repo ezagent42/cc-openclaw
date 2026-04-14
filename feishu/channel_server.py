@@ -10,6 +10,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+from logging.handlers import RotatingFileHandler
 import os
 import signal
 import sys
@@ -78,6 +79,9 @@ class ChannelServer:
 
         # ws -> Instance reverse lookup (for disconnect cleanup)
         self._ws_to_instance: dict[ServerConnection, Instance] = {}
+
+        # instance_id -> Instance lookup (for inter-instance forwarding)
+        self.instances_by_id: dict[str, Instance] = {}
 
         self._stop_event = asyncio.Event()
         self._server: websockets.asyncio.server.Server | None = None
@@ -862,6 +866,8 @@ class ChannelServer:
                     await self._handle_react(ws, msg)
                 elif msg_type == "send_file":
                     await self._handle_send_file(ws, msg)
+                elif msg_type == "forward":
+                    await self._handle_forward(ws, msg)
                 elif msg_type == "message":
                     await self._handle_inbound_message(ws, msg)
                 elif msg_type == "pong":
@@ -904,6 +910,7 @@ class ChannelServer:
             runtime_mode=runtime_mode,
         )
         self._ws_to_instance[ws] = inst
+        self.instances_by_id[inst.instance_id] = inst
 
         for cid in chat_ids:
             if cid == "*":
@@ -919,6 +926,8 @@ class ChannelServer:
         inst = self._ws_to_instance.pop(ws, None)
         if inst is None:
             return
+
+        self.instances_by_id.pop(inst.instance_id, None)
 
         for cid in inst.chat_ids:
             if cid == "*":
@@ -938,40 +947,29 @@ class ChannelServer:
     # ------------------------------------------------------------------
 
     async def route_message(self, chat_id: str, message: dict) -> None:
-        """Route a message to the appropriate instance(s)."""
-        routed_instance: Instance | None = None
+        """Route a message to the appropriate instance(s).
 
-        # 1. Exact match
+        Routing logic:
+        1. If an exact match exists → send ONLY to that instance (no wildcard).
+        2. Else if wildcard instances exist → elect first as handler, others observe.
+        3. Else → handle unrouted (admin member hint or drop).
+        """
+        # 1. Exact match — send only to dedicated instance
         if chat_id in self.exact_routes:
             routed_instance = self.exact_routes[chat_id]
             await self._send(routed_instance.ws, message)
+            return
 
-        # 2. Wildcard -- always receives a copy.
-        #    When no dedicated instance exists, elect the first wildcard as
-        #    handler so exactly ONE instance processes the message; the rest
-        #    receive it with a routed_to hint (observation mode).
-        elected: Instance | None = None
-        if routed_instance is None and self.wildcard_instances:
+        # 2. Wildcard instances — elect first as handler, others observe
+        if self.wildcard_instances:
             elected = self.wildcard_instances[0]
+            for inst in self.wildcard_instances:
+                if inst is elected:
+                    await self._send(inst.ws, message)
+                else:
+                    wc_msg = {**message, "routed_to": elected.instance_id}
+                    await self._send(inst.ws, wc_msg)
 
-        for inst in self.wildcard_instances:
-            # Skip if this wildcard instance is also the exact match
-            if routed_instance is not None and inst.ws is routed_instance.ws:
-                continue
-            # Determine whether this wildcard should observe only
-            if routed_instance is not None:
-                # Dedicated instance owns the message — wildcard observes
-                wc_msg = {**message, "routed_to": routed_instance.instance_id}
-            elif inst is elected:
-                # No dedicated route — this wildcard is elected as handler
-                wc_msg = message
-            else:
-                # No dedicated route — other wildcards observe
-                wc_msg = {**message, "routed_to": elected.instance_id}
-            await self._send(inst.ws, wc_msg)
-
-        # 3. Log actionable info when no dedicated instance exists
-        if routed_instance is None and self.wildcard_instances:
             user = message.get("user", "unknown")
             source = message.get("source", "?")
             log.info(
@@ -979,17 +977,19 @@ class ChannelServer:
                 "   To start dedicated instance:  ./cc-openclaw.sh %s",
                 source, user, chat_id,
             )
-        elif routed_instance is None and not self.wildcard_instances:
-            user = message.get("user", "")
-            open_id = message.get("user_id", "")
-            if open_id and hasattr(self, '_admin_group_members') and open_id in self._admin_group_members:
-                log.info("Unrouted DM from admin member %s — session not started", user)
-                msg_chat_id = message.get("chat_id", "")
-                if msg_chat_id:
-                    text = "您的管理 session 尚未启动，请联系总管理员开启。"
-                    await self._reply_feishu(msg_chat_id, text)
-            else:
-                log.warning("No route for chat_id=%s, message dropped", message.get("chat_id", "?"))
+            return
+
+        # 3. No route at all
+        user = message.get("user", "")
+        open_id = message.get("user_id", "")
+        if open_id and hasattr(self, '_admin_group_members') and open_id in self._admin_group_members:
+            log.info("Unrouted DM from admin member %s — session not started", user)
+            msg_chat_id = message.get("chat_id", "")
+            if msg_chat_id:
+                text = "您的管理 session 尚未启动，请联系总管理员开启。"
+                await self._reply_feishu(msg_chat_id, text)
+        else:
+            log.warning("No route for chat_id=%s, message dropped", message.get("chat_id", "?"))
 
     # ------------------------------------------------------------------
     # Message handlers
@@ -1099,6 +1099,27 @@ class ChannelServer:
 
         except Exception as e:
             log.warning("_send_file error: %s", e)
+
+    async def _handle_forward(self, ws: ServerConnection, msg: dict) -> None:
+        """Forward a message from one instance to another by instance_id."""
+        target_id = msg.get("target_instance", "")
+        text = msg.get("text", "")
+        sender = self._ws_to_instance.get(ws)
+        sender_id = sender.instance_id if sender else "unknown"
+
+        target = self.instances_by_id.get(target_id)
+        if not target:
+            await self._send(ws, {"type": "forward_error", "error": f"Instance '{target_id}' is not connected"})
+            log.warning("Forward failed: target '%s' not connected (from %s)", target_id, sender_id)
+            return
+
+        await self._send(target.ws, {
+            "type": "forwarded_message",
+            "from": sender_id,
+            "text": text,
+        })
+        await self._send(ws, {"type": "forward_ack", "ok": True})
+        log.info("Forwarded message from %s → %s: %s", sender_id, target_id, text[:60])
 
     async def _handle_inbound_message(self, ws: ServerConnection, msg: dict) -> None:
         """Handle an inbound message from another source."""
@@ -1245,6 +1266,17 @@ async def _async_main() -> None:
     # Keep terminal output at INFO, file at DEBUG
     logging.getLogger().handlers[0].setLevel(logging.DEBUG)   # file
     logging.getLogger().handlers[1].setLevel(logging.INFO)    # terminal
+
+    # Add rotating file handler for message log
+    msg_log_path = PROJECT_ROOT / ".workspace" / "channel-server-messages.log"
+    msg_log_path.parent.mkdir(parents=True, exist_ok=True)
+    file_handler = RotatingFileHandler(
+        str(msg_log_path),
+        maxBytes=5 * 1024 * 1024,  # 5MB per file
+        backupCount=5,              # keep 5 rotated files
+    )
+    file_handler.setFormatter(logging.Formatter("%(asctime)s %(name)s %(levelname)s %(message)s"))
+    logging.getLogger("channel-server").addHandler(file_handler)
 
     admin_chat_id = os.environ.get("ADMIN_CHAT_ID")
     feishu_enabled = os.environ.get("FEISHU_ENABLED", "true").lower() in ("true", "1", "yes")

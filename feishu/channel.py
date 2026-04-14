@@ -55,12 +55,13 @@ class ChannelClient:
     """WebSocket client that connects to channel-server.py."""
 
     def __init__(self, server_url="ws://localhost:9999", chat_ids=None,
-                 instance_id="", runtime_mode="discussion",
+                 instance_id="", tag_name="", runtime_mode="discussion",
                  pidfile_path=None):
         self.server_url = server_url
         self._pidfile_path = pidfile_path
         self.chat_ids = chat_ids or ["*"]
         self.instance_id = instance_id or f"channel-{os.getpid()}"
+        self.tag_name = tag_name
         self.runtime_mode = runtime_mode
         self.ws = None
         self._message_queue: asyncio.Queue = asyncio.Queue()
@@ -102,13 +103,16 @@ class ChannelClient:
                 await asyncio.sleep(3)
 
     async def _register(self, ws):
-        await ws.send(json.dumps({
+        payload = {
             "type": "register",
             "role": "developer" if "*" in self.chat_ids else "production",
             "chat_ids": self.chat_ids,
             "instance_id": self.instance_id,
             "runtime_mode": self.runtime_mode,
-        }))
+        }
+        if self.tag_name:
+            payload["tag_name"] = self.tag_name
+        await ws.send(json.dumps(payload))
         resp = json.loads(await ws.recv())
         if resp.get("type") == "error":
             log.error(f"Registration failed: {resp}")
@@ -451,17 +455,24 @@ async def main():
         sys.exit(1)
     server_url = f"ws://localhost:{port}"
 
-    chat_id_str = os.environ.get("OPENCLAW_CHAT_ID", "*")
+    chat_id_str = os.environ.get("OC_CHAT_ID", "*")
     chat_ids = [chat_id_str]
 
-    # Use OPENCLAW_USER as instance_id for session identification in replies
-    instance_id = os.environ.get("OPENCLAW_USER", f"channel-{os.getpid()}")
+    # Construct instance_id as {user}.{session}
+    oc_user = os.environ.get("OC_USER", "")
+    oc_session = os.environ.get("OC_SESSION", "root")
+    oc_tag = os.environ.get("OC_TAG", "")
+    if oc_user:
+        instance_id = f"{oc_user}.{oc_session}"
+    else:
+        instance_id = f"channel-{os.getpid()}"
 
     _channel_client = ChannelClient(
         server_url=server_url,
         chat_ids=chat_ids,
         instance_id=instance_id,
-        runtime_mode=os.environ.get("OPENCLAW_RUNTIME_MODE", "discussion"),
+        tag_name=oc_tag or "",
+        runtime_mode=os.environ.get("OC_RUNTIME_MODE", "discussion"),
         pidfile_path=str(pidfile),
     )
 

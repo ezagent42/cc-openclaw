@@ -136,15 +136,19 @@ render_claude_md() {
 # --- CLI argument parsing ---
 CLI_ACTION=""
 CLI_TARGET=""
+CLI_SESSION="root"
+CLI_TAG=""
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
-        --user)   CLI_ACTION="user";   CLI_TARGET="$2"; shift 2 ;;
-        --group)  CLI_ACTION="group";  shift ;;
-        --list)   CLI_ACTION="list";   shift ;;
-        --status) CLI_ACTION="status"; shift ;;
-        --stop)   CLI_ACTION="stop";   CLI_TARGET="$2"; shift 2 ;;
-        --help|-h) CLI_ACTION="help";  shift ;;
+        --user)    CLI_ACTION="user";   CLI_TARGET="$2"; shift 2 ;;
+        --group)   CLI_ACTION="group";  shift ;;
+        --session) CLI_SESSION="$2";    shift 2 ;;
+        --tag)     CLI_TAG="$2";        shift 2 ;;
+        --list)    CLI_ACTION="list";   shift ;;
+        --status)  CLI_ACTION="status"; shift ;;
+        --stop)    CLI_ACTION="stop";   CLI_TARGET="$2"; shift 2 ;;
+        --help|-h) CLI_ACTION="help";   shift ;;
         *) break ;;  # Unknown args pass through to existing logic
     esac
 done
@@ -160,19 +164,24 @@ Multi-user CC session manager.
 Options:
   --user <name>       Start a CC session for the specified user (from roles/roles.yaml)
   --group             Start the admin group monitor session
+  --session <name>    Session name (default: root). Used with --user or --group.
+  --tag <name>        Custom display tag for session replies (optional)
   --list              List all configured users and roles
   --status            Show running CC sessions
-  --stop <name>       Stop a user's CC session
+  --stop <name>       Stop a user's CC session (use user.session format)
   --help              Show this help
 
   (no arguments)      Interactive mode selection (existing behavior)
 
 Examples:
-  cc-openclaw.sh --user <username>    Start a user's session
-  cc-openclaw.sh --group              Start admin group monitor
-  cc-openclaw.sh --list               List configured users
-  cc-openclaw.sh --status             Show active sessions
-  cc-openclaw.sh --stop <username>    Stop a session
+  cc-openclaw.sh --user linyilun                        Start root session
+  cc-openclaw.sh --user linyilun --session dev          Start named session
+  cc-openclaw.sh --user linyilun --session dev --tag allenwoods  Custom tag
+  cc-openclaw.sh --group                                Start group monitor
+  cc-openclaw.sh --group --session ops                  Named group session
+  cc-openclaw.sh --list                                 List configured users
+  cc-openclaw.sh --status                               Show active sessions
+  cc-openclaw.sh --stop linyilun.dev                    Stop a session
 HELP
     exit 0
 fi
@@ -227,8 +236,12 @@ if [ "$CLI_ACTION" = "user" ]; then
     fi
     eval "$ROLE_INFO"
 
-    echo "🦞 Starting CC session: $DISPLAY_NAME ($CLI_TARGET)"
+    WINDOW_NAME="${CLI_TARGET}.${CLI_SESSION}"
+
+    echo "🦞 Starting CC session: $DISPLAY_NAME ($WINDOW_NAME)"
     echo "   Role: $ROLE"
+    echo "   Session: $CLI_SESSION"
+    [ -n "$CLI_TAG" ] && echo "   Tag: $CLI_TAG"
 
     CHAT_ID=$(get_chat_id_for_user "$OPEN_ID")
     if [ -z "$CHAT_ID" ]; then
@@ -252,9 +265,9 @@ if [ "$CLI_ACTION" = "user" ]; then
     tmux has-session -t "$SESSION_NAME" 2>/dev/null || tmux new-session -d -s "$SESSION_NAME"
 
     # Check if already running
-    if tmux list-windows -t "$SESSION_NAME" -F "#{window_name}" 2>/dev/null | grep -q "^${CLI_TARGET}$"; then
-        echo "⚠️  Session '$CLI_TARGET' already running. Attaching..."
-        tmux select-window -t "$SESSION_NAME:$CLI_TARGET"
+    if tmux list-windows -t "$SESSION_NAME" -F "#{window_name}" 2>/dev/null | grep -q "^${WINDOW_NAME}$"; then
+        echo "⚠️  Session '$WINDOW_NAME' already running. Attaching..."
+        tmux select-window -t "$SESSION_NAME:$WINDOW_NAME"
         tmux attach-session -t "$SESSION_NAME"
         exit 0
     fi
@@ -273,17 +286,18 @@ if [ "$CLI_ACTION" = "user" ]; then
     # Build claude command with env vars (source local.sh inside tmux for proxy/env)
     SETTINGS_FILE="roles/$ROLE/settings.json"
     CLAUDE_CMD="cd $SCRIPT_DIR && [ -f cc-openclaw.local.sh ] && source cc-openclaw.local.sh;"
-    CLAUDE_CMD="$CLAUDE_CMD OPENCLAW_CHAT_ID=$CHAT_ID OPENCLAW_USER=$CLI_TARGET OPENCLAW_ROLE=$ROLE"
+    CLAUDE_CMD="$CLAUDE_CMD OC_CHAT_ID=$CHAT_ID OC_USER=$CLI_TARGET OC_ROLE=$ROLE OC_SESSION=$CLI_SESSION"
+    [ -n "$CLI_TAG" ] && CLAUDE_CMD="$CLAUDE_CMD OC_TAG=$CLI_TAG"
     CLAUDE_CMD="$CLAUDE_CMD claude --permission-mode bypassPermissions"
     CLAUDE_CMD="$CLAUDE_CMD --dangerously-load-development-channels server:openclaw-channel"
     CLAUDE_CMD="$CLAUDE_CMD --mcp-config .mcp.json"
     [ -f "$SCRIPT_DIR/$SETTINGS_FILE" ] && CLAUDE_CMD="$CLAUDE_CMD --settings $SETTINGS_FILE"
 
-    tmux new-window -t "$SESSION_NAME" -n "$CLI_TARGET" "$CLAUDE_CMD" \; \
+    tmux new-window -t "$SESSION_NAME" -n "$WINDOW_NAME" "$CLAUDE_CMD" \; \
         run-shell "sleep 3" \; \
         send-keys Enter
 
-    echo "✓ Session started: $CLI_TARGET (tmux window)"
+    echo "✓ Session started: $WINDOW_NAME (tmux window)"
     echo "   Attach: tmux attach -t $SESSION_NAME"
     exit 0
 fi
@@ -299,10 +313,13 @@ if [ "$CLI_ACTION" = "group" ]; then
     ROLE="$GROUP_ROLE"
     CHAT_ID="$GROUP_CHAT_ID"
     DISPLAY_NAME="$GROUP_DISPLAY_NAME"
+    WINDOW_NAME="${CLI_TARGET}.${CLI_SESSION}"
 
-    echo "🦞 Starting group monitor session"
+    echo "🦞 Starting group session: $WINDOW_NAME"
     echo "   Role: $ROLE"
+    echo "   Session: $CLI_SESSION"
     echo "   Group: $GROUP_DISPLAY_NAME ($CHAT_ID)"
+    [ -n "$CLI_TAG" ] && echo "   Tag: $CLI_TAG"
 
     mkdir -p "$SCRIPT_DIR/.workspace/$CLI_TARGET"
 
@@ -313,8 +330,8 @@ if [ "$CLI_ACTION" = "group" ]; then
 
     tmux has-session -t "$SESSION_NAME" 2>/dev/null || tmux new-session -d -s "$SESSION_NAME"
 
-    if tmux list-windows -t "$SESSION_NAME" -F "#{window_name}" 2>/dev/null | grep -q "^${CLI_TARGET}$"; then
-        echo "⚠️  Monitor session already running."
+    if tmux list-windows -t "$SESSION_NAME" -F "#{window_name}" 2>/dev/null | grep -q "^${WINDOW_NAME}$"; then
+        echo "⚠️  Session '$WINDOW_NAME' already running."
         exit 0
     fi
 
@@ -329,17 +346,18 @@ if [ "$CLI_ACTION" = "group" ]; then
 
     SETTINGS_FILE="roles/$ROLE/settings.json"
     CLAUDE_CMD="cd $SCRIPT_DIR && [ -f cc-openclaw.local.sh ] && source cc-openclaw.local.sh;"
-    CLAUDE_CMD="$CLAUDE_CMD OPENCLAW_CHAT_ID=$CHAT_ID OPENCLAW_USER=$CLI_TARGET OPENCLAW_ROLE=$ROLE"
+    CLAUDE_CMD="$CLAUDE_CMD OC_CHAT_ID=$CHAT_ID OC_USER=$CLI_TARGET OC_ROLE=$ROLE OC_SESSION=$CLI_SESSION"
+    [ -n "$CLI_TAG" ] && CLAUDE_CMD="$CLAUDE_CMD OC_TAG=$CLI_TAG"
     CLAUDE_CMD="$CLAUDE_CMD claude --permission-mode bypassPermissions"
     CLAUDE_CMD="$CLAUDE_CMD --dangerously-load-development-channels server:openclaw-channel"
     CLAUDE_CMD="$CLAUDE_CMD --mcp-config .mcp.json"
     [ -f "$SCRIPT_DIR/$SETTINGS_FILE" ] && CLAUDE_CMD="$CLAUDE_CMD --settings $SETTINGS_FILE"
 
-    tmux new-window -t "$SESSION_NAME" -n "$CLI_TARGET" "$CLAUDE_CMD" \; \
+    tmux new-window -t "$SESSION_NAME" -n "$WINDOW_NAME" "$CLAUDE_CMD" \; \
         run-shell "sleep 3" \; \
         send-keys Enter
 
-    echo "✓ Monitor session started (tmux window: $CLI_TARGET)"
+    echo "✓ Group session started (tmux window: $WINDOW_NAME)"
     exit 0
 fi
 
@@ -635,10 +653,10 @@ echo ""
 # Parse chat_id argument (first non-internal, non-mode arg)
 # Usage: ./autoservice.sh oc_xxx  or  ./autoservice.sh  (defaults to wildcard)
 if [ "$1" != "--_internal" ] && [ -n "$1" ] && [[ "$1" != [123] ]]; then
-    export OPENCLAW_CHAT_ID="$1"
+    export OC_CHAT_ID="$1"
     shift
 else
-    export OPENCLAW_CHAT_ID="${OPENCLAW_CHAT_ID:-*}"
+    export OC_CHAT_ID="${OC_CHAT_ID:-*}"
 fi
 
 # Parse internal arguments (passed from outer invocation)

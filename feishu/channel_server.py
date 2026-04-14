@@ -78,11 +78,18 @@ class ChannelServer:
         self.exact_routes: dict[str, Instance] = {}      # chat_id -> Instance
         self.wildcard_instances: list[Instance] = []      # role=developer, chat_ids=["*"]
 
+        # Thread-based routing (multi-session per chat)
+        self.thread_routes: dict[str, Instance] = {}     # thread_anchor_msg_id -> Instance
+        self.session_threads: dict[str, str] = {}        # instance_id -> thread_anchor_msg_id
+
         # ws -> Instance reverse lookup (for disconnect cleanup)
         self._ws_to_instance: dict[ServerConnection, Instance] = {}
 
         # instance_id -> Instance lookup (for inter-instance forwarding)
         self.instances_by_id: dict[str, Instance] = {}
+
+        # Thread anchor persistence
+        self._thread_anchors = self._load_thread_anchors()
 
         self._stop_event = asyncio.Event()
         self._server: websockets.asyncio.server.Server | None = None
@@ -115,6 +122,74 @@ class ChannelServer:
             self._chat_id_map[open_id] = chat_id
             self._save_chat_id_map()
             log.info("Recorded chat_id mapping: %s → %s", open_id[:16], chat_id)
+
+    # ------------------------------------------------------------------
+    # Thread anchor persistence
+    # ------------------------------------------------------------------
+
+    THREAD_ANCHORS_PATH = Path(__file__).resolve().parent.parent / ".workspace" / "thread_anchors.json"
+
+    def _load_thread_anchors(self) -> dict:
+        """Read thread anchors from disk. Returns {} if file doesn't exist."""
+        try:
+            if self.THREAD_ANCHORS_PATH.exists():
+                return json.loads(self.THREAD_ANCHORS_PATH.read_text())
+        except Exception as e:
+            log.warning("Failed to load thread anchors: %s", e)
+        return {}
+
+    def _save_thread_anchors(self) -> None:
+        """Write thread anchors to disk."""
+        try:
+            self.THREAD_ANCHORS_PATH.parent.mkdir(parents=True, exist_ok=True)
+            self.THREAD_ANCHORS_PATH.write_text(
+                json.dumps(self._thread_anchors, indent=2, ensure_ascii=False)
+            )
+        except Exception as e:
+            log.warning("Failed to save thread anchors: %s", e)
+
+    def _create_thread_anchor(self, instance_id: str, chat_id: str, tag: str) -> str | None:
+        """Send a thread anchor message to Feishu and persist it. Returns msg_id or None."""
+        if not self._feishu_client:
+            return None
+        try:
+            from lark_oapi.api.im.v1 import CreateMessageRequest, CreateMessageRequestBody
+            body = (
+                CreateMessageRequestBody.builder()
+                .receive_id(chat_id)
+                .msg_type("text")
+                .content(json.dumps({"text": f"🟢 Session [{tag}] started — reply in this thread"}))
+                .build()
+            )
+            req = CreateMessageRequest.builder().receive_id_type("chat_id").request_body(body).build()
+            resp = self._feishu_client.im.v1.message.create(req)
+            if resp.success() and resp.data and resp.data.message_id:
+                anchor_msg_id = resp.data.message_id
+                self._recent_sent.add(anchor_msg_id)
+                self._thread_anchors[instance_id] = {
+                    "msg_id": anchor_msg_id,
+                    "chat_id": chat_id,
+                    "tag": tag,
+                    "created_at": datetime.now(timezone.utc).isoformat(),
+                }
+                self._save_thread_anchors()
+                log.info("Created thread anchor for %s: %s", instance_id, anchor_msg_id)
+                return anchor_msg_id
+            else:
+                log.warning("Failed to create thread anchor: %s", resp.msg if resp else "no response")
+        except Exception as e:
+            log.warning("Error creating thread anchor: %s", e)
+        return None
+
+    def _remove_thread_anchor(self, instance_id: str) -> None:
+        """Remove a thread anchor from persistence and route tables."""
+        anchor = self._thread_anchors.pop(instance_id, None)
+        if anchor:
+            msg_id = anchor.get("msg_id", "")
+            self.thread_routes.pop(msg_id, None)
+            self.session_threads.pop(instance_id, None)
+            self._save_thread_anchors()
+            log.info("Removed thread anchor for %s", instance_id)
 
     # ------------------------------------------------------------------
     # Public lifecycle
@@ -432,27 +507,46 @@ class ChannelServer:
 
     # -- Feishu reply helper --------------------------------------------
 
-    async def _reply_feishu(self, chat_id: str, text: str) -> None:
-        """Send a text message to a Feishu chat. Best-effort."""
+    async def _reply_feishu(self, chat_id: str, text: str, *, thread_anchor_msg_id: str | None = None) -> None:
+        """Send a text message to a Feishu chat. Best-effort.
+
+        If thread_anchor_msg_id is provided, replies in that message's thread.
+        """
         if self._feishu_client is None:
             log.debug("_reply_feishu: no feishu client")
             return
 
         def _do_send():
             try:
-                from lark_oapi.api.im.v1 import CreateMessageRequest, CreateMessageRequestBody
-                body = (
-                    CreateMessageRequestBody.builder()
-                    .receive_id(chat_id)
-                    .msg_type("text")
-                    .content(json.dumps({"text": text}))
-                    .build()
-                )
-                req = CreateMessageRequest.builder().receive_id_type("chat_id").request_body(body).build()
-                resp = self._feishu_client.im.v1.message.create(req)
+                if thread_anchor_msg_id:
+                    # Reply in thread using ReplyMessage API
+                    from lark_oapi.api.im.v1 import ReplyMessageRequest, ReplyMessageRequestBody
+                    body = (
+                        ReplyMessageRequestBody.builder()
+                        .msg_type("text")
+                        .content(json.dumps({"text": text}))
+                        .reply_in_thread(True)
+                        .build()
+                    )
+                    req = ReplyMessageRequest.builder().message_id(thread_anchor_msg_id).request_body(body).build()
+                    resp = self._feishu_client.im.v1.message.reply(req)
+                else:
+                    # Direct message to chat
+                    from lark_oapi.api.im.v1 import CreateMessageRequest, CreateMessageRequestBody
+                    body = (
+                        CreateMessageRequestBody.builder()
+                        .receive_id(chat_id)
+                        .msg_type("text")
+                        .content(json.dumps({"text": text}))
+                        .build()
+                    )
+                    req = CreateMessageRequest.builder().receive_id_type("chat_id").request_body(body).build()
+                    resp = self._feishu_client.im.v1.message.create(req)
                 if resp.success() and resp.data and resp.data.message_id:
                     self._recent_sent.add(resp.data.message_id)
                     self._msg_counter["sent"] += 1
+                elif not resp.success():
+                    log.warning("_reply_feishu failed: code=%s msg=%s", resp.code, resp.msg)
             except Exception as e:
                 log.warning("_reply_feishu error: %s", e)
 
@@ -618,6 +712,11 @@ class ChannelServer:
                 return
 
             current_mode = self._chat_modes.get(chat_id, "discussion")
+
+            # Extract thread info for thread-based routing
+            root_id = getattr(message, "root_id", None) or ""
+            parent_id = getattr(message, "parent_id", None) or ""
+
             msg = {
                 "type": "message",
                 "text": text,
@@ -629,6 +728,10 @@ class ChannelServer:
                 "runtime_mode": current_mode,
                 "ts": ts,
             }
+            if root_id:
+                msg["root_id"] = root_id
+            if parent_id:
+                msg["parent_id"] = parent_id
             if file_path:
                 msg["file_path"] = file_path
             # Track last message_id per chat for ACK reaction removal on reply
@@ -929,6 +1032,25 @@ class ChannelServer:
             else:
                 self.exact_routes[cid] = inst
 
+        # Thread anchor: restore from persistence or create new
+        if instance_id in self._thread_anchors:
+            # Restore existing thread anchor from persistence
+            anchor = self._thread_anchors[instance_id]
+            anchor_msg_id = anchor["msg_id"]
+            self.thread_routes[anchor_msg_id] = inst
+            self.session_threads[instance_id] = anchor_msg_id
+            log.info("Restored thread anchor for %s: %s", instance_id, anchor_msg_id)
+        elif "." in instance_id and not instance_id.startswith("channel-"):
+            # Create new thread anchor for named sessions
+            tag = tag_name or instance_id.split(".", 1)[1]
+            # Use first non-wildcard chat_id for anchor
+            anchor_chat_id = next((c for c in chat_ids if c != "*"), None)
+            if anchor_chat_id:
+                anchor_msg_id = self._create_thread_anchor(instance_id, anchor_chat_id, tag)
+                if anchor_msg_id:
+                    self.thread_routes[anchor_msg_id] = inst
+                    self.session_threads[instance_id] = anchor_msg_id
+
         await self._send(ws, {"type": "registered", "chat_ids": chat_ids})
         log.info("Registered instance %s (tag=%s) role=%s chat_ids=%s", instance_id, tag_name or "-", role, chat_ids)
         await self._notify_admin(f"Instance connected: {instance_id} (tag={tag_name or '-'}) chat_ids={chat_ids}")
@@ -945,6 +1067,11 @@ class ChannelServer:
             alias = inst.instance_id.split(".", 1)[0]
             if self.instances_by_id.get(alias) is inst:
                 self.instances_by_id.pop(alias, None)
+
+        # Clean up thread routes (keep anchor in persistence for reconnect)
+        anchor_msg_id = self.session_threads.pop(inst.instance_id, None)
+        if anchor_msg_id:
+            self.thread_routes.pop(anchor_msg_id, None)
 
         for cid in inst.chat_ids:
             if cid == "*":
@@ -967,10 +1094,19 @@ class ChannelServer:
         """Route a message to the appropriate instance(s).
 
         Routing logic:
+        0. If message is in a reply thread → check thread_routes first.
         1. If an exact match exists → send ONLY to that instance (no wildcard).
         2. Else if wildcard instances exist → elect first as handler, others observe.
         3. Else → handle unrouted (admin member hint or drop).
         """
+        # 0. Thread route — check if message belongs to a session thread
+        root_id = message.get("root_id", "")
+        if root_id and root_id in self.thread_routes:
+            routed_instance = self.thread_routes[root_id]
+            await self._send(routed_instance.ws, message)
+            log.info("Thread-routed msg to %s (thread=%s)", routed_instance.instance_id, root_id[:16])
+            return
+
         # 1. Exact match — send only to dedicated instance
         if chat_id in self.exact_routes:
             routed_instance = self.exact_routes[chat_id]
@@ -1031,8 +1167,13 @@ class ChannelServer:
                     tag = inst.instance_id
                 text = f"[{tag}] {text}"
 
-            log.info("Reply to Feishu chat_id=%s text=%s", chat_id, text[:60])
-            await self._reply_feishu(chat_id, text)
+            # Check if this instance has a thread anchor — reply in thread
+            thread_anchor_msg_id = None
+            if inst:
+                thread_anchor_msg_id = self.session_threads.get(inst.instance_id)
+
+            log.info("Reply to Feishu chat_id=%s thread=%s text=%s", chat_id, thread_anchor_msg_id or "-", text[:60])
+            await self._reply_feishu(chat_id, text, thread_anchor_msg_id=thread_anchor_msg_id)
             # Remove ACK reaction now that we've replied
             last_msg = self._last_msg_id.get(chat_id, "")
             if last_msg and last_msg in self._ack_reactions:

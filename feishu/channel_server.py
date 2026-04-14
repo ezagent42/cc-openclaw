@@ -42,6 +42,7 @@ class Instance:
     role: str                          # "developer" | "agent"
     chat_ids: list[str]
     runtime_mode: str = "discussion"   # "discussion" | "admin"
+    tag_name: str | None = None        # custom display tag (overrides session name in replies)
     connected_at: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
 
 
@@ -888,6 +889,7 @@ class ChannelServer:
         instance_id: str = msg.get("instance_id", "unknown")
         role: str = msg.get("role", "agent")
         runtime_mode: str = msg.get("runtime_mode", "discussion")
+        tag_name: str | None = msg.get("tag_name") or None
 
         # Check for conflicts on exact chat_ids
         for cid in chat_ids:
@@ -908,9 +910,18 @@ class ChannelServer:
             role=role,
             chat_ids=chat_ids,
             runtime_mode=runtime_mode,
+            tag_name=tag_name,
         )
         self._ws_to_instance[ws] = inst
         self.instances_by_id[inst.instance_id] = inst
+
+        # Register alias: "user" → "user.root" for forward compatibility
+        if "." in instance_id:
+            parts = instance_id.split(".", 1)
+            alias = parts[0]  # e.g. "linyilun" from "linyilun.root"
+            session = parts[1]
+            if session == "root" and alias not in self.instances_by_id:
+                self.instances_by_id[alias] = inst
 
         for cid in chat_ids:
             if cid == "*":
@@ -919,8 +930,8 @@ class ChannelServer:
                 self.exact_routes[cid] = inst
 
         await self._send(ws, {"type": "registered", "chat_ids": chat_ids})
-        log.info("Registered instance %s role=%s chat_ids=%s", instance_id, role, chat_ids)
-        await self._notify_admin(f"Instance connected: {instance_id} chat_ids={chat_ids}")
+        log.info("Registered instance %s (tag=%s) role=%s chat_ids=%s", instance_id, tag_name or "-", role, chat_ids)
+        await self._notify_admin(f"Instance connected: {instance_id} (tag={tag_name or '-'}) chat_ids={chat_ids}")
 
     def _unregister(self, ws: ServerConnection) -> None:
         inst = self._ws_to_instance.pop(ws, None)
@@ -928,6 +939,12 @@ class ChannelServer:
             return
 
         self.instances_by_id.pop(inst.instance_id, None)
+
+        # Clean up alias (e.g. "linyilun" alias for "linyilun.root")
+        if "." in inst.instance_id:
+            alias = inst.instance_id.split(".", 1)[0]
+            if self.instances_by_id.get(alias) is inst:
+                self.instances_by_id.pop(alias, None)
 
         for cid in inst.chat_ids:
             if cid == "*":
@@ -1002,10 +1019,17 @@ class ChannelServer:
         if chat_id.startswith("oc_"):
             text = msg.get("text", "")
 
-            # Prepend session name for multi-session clarity
+            # Prepend session tag for multi-session clarity
             inst = self._ws_to_instance.get(ws)
             if inst and inst.instance_id and not inst.instance_id.startswith("channel-"):
-                text = f"[{inst.instance_id}] {text}"
+                # Use tag_name if set, else session part of instance_id (after "."), else full id
+                if inst.tag_name:
+                    tag = inst.tag_name
+                elif "." in inst.instance_id:
+                    tag = inst.instance_id.split(".", 1)[1]
+                else:
+                    tag = inst.instance_id
+                text = f"[{tag}] {text}"
 
             log.info("Reply to Feishu chat_id=%s text=%s", chat_id, text[:60])
             await self._reply_feishu(chat_id, text)

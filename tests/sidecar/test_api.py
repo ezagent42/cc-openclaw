@@ -32,6 +32,11 @@ def mock_event_handler():
 
 
 @pytest.fixture
+def mock_broadcaster():
+    return AsyncMock()
+
+
+@pytest.fixture
 async def client(mock_db, mock_provisioner):
     app = create_app(db=mock_db, provisioner=mock_provisioner)
     async with TestClient(TestServer(app)) as c:
@@ -42,6 +47,15 @@ async def client(mock_db, mock_provisioner):
 async def client_with_events(mock_db, mock_provisioner, mock_event_handler):
     app = create_app(
         db=mock_db, provisioner=mock_provisioner, event_handler=mock_event_handler,
+    )
+    async with TestClient(TestServer(app)) as c:
+        yield c
+
+
+@pytest.fixture
+async def client_with_broadcast(mock_db, mock_provisioner, mock_broadcaster):
+    app = create_app(
+        db=mock_db, provisioner=mock_provisioner, broadcaster=mock_broadcaster,
     )
     async with TestClient(TestServer(app)) as c:
         yield c
@@ -315,3 +329,111 @@ async def test_event_endpoint_returns_503_without_handler(client):
     assert resp.status == 503
     body = await resp.json()
     assert "error" in body
+
+
+# ── admin broadcast ────────────────────────────────────────────────
+
+
+async def test_broadcast_sends_to_active_users(
+    client_with_broadcast, mock_db, mock_broadcaster,
+):
+    """POST /admin/broadcast sends DMs to all active user agents."""
+    mock_db.get_permission.return_value = {
+        "open_id": "ou_admin",
+        "display_name": "Admin",
+        "is_user_member": True,
+        "is_admin": True,
+    }
+    mock_db.list_agents.return_value = [
+        {"agent_id": "u-1", "agent_type": "user", "open_id": "ou_a", "status": "active"},
+        {"agent_id": "u-2", "agent_type": "user", "open_id": "ou_b", "status": "active"},
+        {"agent_id": "g-1", "agent_type": "group", "open_id": None, "status": "active"},
+    ]
+
+    resp = await client_with_broadcast.post(
+        "/api/v1/admin/broadcast",
+        json={"message": "System maintenance tonight", "actor": "ou_admin"},
+    )
+    assert resp.status == 200
+    body = await resp.json()
+    assert body["ok"] is True
+    assert set(body["sent"]) == {"ou_a", "ou_b"}
+    assert body["failed"] == []
+    assert mock_broadcaster.send_dm.await_count == 2
+    mock_db.write_audit.assert_awaited_once()
+
+
+async def test_broadcast_rejects_non_admin(client_with_broadcast, mock_db):
+    """POST /admin/broadcast returns 403 for non-admin actors."""
+    mock_db.get_permission.return_value = {
+        "open_id": "ou_user",
+        "display_name": "User",
+        "is_user_member": True,
+        "is_admin": False,
+    }
+
+    resp = await client_with_broadcast.post(
+        "/api/v1/admin/broadcast",
+        json={"message": "hello", "actor": "ou_user"},
+    )
+    assert resp.status == 403
+    body = await resp.json()
+    assert "error" in body
+
+
+async def test_broadcast_rejects_unknown_actor(client_with_broadcast, mock_db):
+    """POST /admin/broadcast returns 403 when actor not in permission table."""
+    mock_db.get_permission.return_value = None
+
+    resp = await client_with_broadcast.post(
+        "/api/v1/admin/broadcast",
+        json={"message": "hello", "actor": "ou_unknown"},
+    )
+    assert resp.status == 403
+
+
+async def test_broadcast_returns_503_without_broadcaster(client, mock_db):
+    """POST /admin/broadcast returns 503 when broadcaster not configured."""
+    mock_db.get_permission.return_value = {
+        "open_id": "ou_admin",
+        "display_name": "Admin",
+        "is_user_member": True,
+        "is_admin": True,
+    }
+
+    resp = await client.post(
+        "/api/v1/admin/broadcast",
+        json={"message": "hello", "actor": "ou_admin"},
+    )
+    assert resp.status == 503
+    body = await resp.json()
+    assert "error" in body
+
+
+async def test_broadcast_partial_failure(
+    client_with_broadcast, mock_db, mock_broadcaster,
+):
+    """POST /admin/broadcast reports partial failures."""
+    mock_db.get_permission.return_value = {
+        "open_id": "ou_admin",
+        "display_name": "Admin",
+        "is_user_member": True,
+        "is_admin": True,
+    }
+    mock_db.list_agents.return_value = [
+        {"agent_id": "u-1", "agent_type": "user", "open_id": "ou_a", "status": "active"},
+        {"agent_id": "u-2", "agent_type": "user", "open_id": "ou_b", "status": "active"},
+    ]
+    # First call succeeds, second fails
+    mock_broadcaster.send_dm.side_effect = [None, RuntimeError("API error")]
+
+    resp = await client_with_broadcast.post(
+        "/api/v1/admin/broadcast",
+        json={"message": "test", "actor": "ou_admin"},
+    )
+    assert resp.status == 200
+    body = await resp.json()
+    assert body["ok"] is True
+    assert body["sent"] == ["ou_a"]
+    assert len(body["failed"]) == 1
+    assert body["failed"][0]["open_id"] == "ou_b"

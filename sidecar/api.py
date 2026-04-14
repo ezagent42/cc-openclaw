@@ -10,6 +10,7 @@ from sidecar.db import Database
 from sidecar.provisioner import Provisioner
 
 if TYPE_CHECKING:
+    from sidecar.broadcast import FeishuBroadcaster
     from sidecar.feishu_events import FeishuEventHandler
 
 DENY_MESSAGE = "您没有权限使用本助手，如需使用请联系管理员"
@@ -18,6 +19,9 @@ _db_key = web.AppKey("db", Database)
 _provisioner_key = web.AppKey("provisioner", Provisioner)
 _event_handler_key: web.AppKey["FeishuEventHandler | None"] = web.AppKey(
     "event_handler",
+)
+_broadcaster_key: web.AppKey["FeishuBroadcaster | None"] = web.AppKey(
+    "broadcaster",
 )
 
 
@@ -100,6 +104,54 @@ async def _admin_reset_agent(request: web.Request) -> web.Response:
     return web.json_response({"ok": True})
 
 
+# ── Admin broadcast ──────────────────────────────────────────────
+
+
+async def _admin_broadcast(request: web.Request) -> web.Response:
+    db = request.app[_db_key]
+    body = await request.json()
+    message_text: str = body["message"]
+    actor: str = body.get("actor", "admin")
+
+    # Verify actor is admin
+    perm = await db.get_permission(actor)
+    if not perm or not perm["is_admin"]:
+        return web.json_response(
+            {"error": "Not authorized \u2014 admin only"}, status=403
+        )
+
+    # Get all active user agents with an open_id
+    agents = await db.list_agents(status="active")
+    user_agents = [
+        a for a in agents if a["agent_type"] == "user" and a.get("open_id")
+    ]
+
+    broadcaster = request.app[_broadcaster_key]
+    if broadcaster is None:
+        return web.json_response(
+            {"error": "Broadcaster not configured"}, status=503
+        )
+
+    sent: list[str] = []
+    failed: list[dict] = []
+    for agent in user_agents:
+        try:
+            await broadcaster.send_dm(agent["open_id"], message_text)
+            sent.append(agent["open_id"])
+        except Exception as e:
+            failed.append({"open_id": agent["open_id"], "error": str(e)})
+
+    # Audit log
+    await db.write_audit(
+        "broadcast",
+        f"users:{len(sent)}",
+        actor,
+        f'{{"message":"{message_text[:100]}","sent":{len(sent)},"failed":{len(failed)}}}',
+    )
+
+    return web.json_response({"ok": True, "sent": sent, "failed": failed})
+
+
 # ── Feishu event forwarding endpoints ─────────────────────────────
 
 
@@ -159,12 +211,14 @@ def create_app(
     db: Database,
     provisioner: Provisioner,
     event_handler: "FeishuEventHandler | None" = None,
+    broadcaster: "FeishuBroadcaster | None" = None,
 ) -> web.Application:
     """Create aiohttp app with all routes registered."""
     app = web.Application()
     app[_db_key] = db
     app[_provisioner_key] = provisioner
     app[_event_handler_key] = event_handler
+    app[_broadcaster_key] = broadcaster
 
     app.router.add_post("/api/v1/resolve-sender", _resolve_sender)
     app.router.add_post("/api/v1/provision", _provision)
@@ -172,6 +226,7 @@ def create_app(
     app.router.add_get("/api/v1/agents", _list_agents)
     app.router.add_get("/api/v1/audit-log", _audit_log)
     app.router.add_post("/api/v1/admin/reset-agent", _admin_reset_agent)
+    app.router.add_post("/api/v1/admin/broadcast", _admin_broadcast)
 
     # Feishu event forwarding (from channel_server)
     app.router.add_post("/api/v1/event/member-added", _event_member_added)

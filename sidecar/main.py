@@ -69,20 +69,29 @@ async def main() -> None:
         default_model=cfg.default_model,
     )
 
-    # 6. Feishu event handler (events arrive via HTTP from channel_server)
+    # 6. Feishu event handler + broadcaster (events arrive via HTTP from channel_server)
     feishu_enabled = bool(cfg.feishu_app_id and cfg.feishu_app_secret)
     event_handler: FeishuEventHandler | None = None
+    broadcaster = None
 
     if feishu_enabled:
+        from sidecar.broadcast import FeishuBroadcaster
+
         event_handler = FeishuEventHandler(
             db=db,
             provisioner=provisioner,
             user_group_chat_id=cfg.user_group_chat_id,
             admin_group_chat_id=cfg.admin_group_chat_id,
         )
+        broadcaster = FeishuBroadcaster(cfg.feishu_app_id, cfg.feishu_app_secret)
 
     # 7. Create and start HTTP server
-    app = create_app(db=db, provisioner=provisioner, event_handler=event_handler)
+    app = create_app(
+        db=db,
+        provisioner=provisioner,
+        event_handler=event_handler,
+        broadcaster=broadcaster,
+    )
     runner = web.AppRunner(app)
     await runner.setup()
     site = web.TCPSite(runner, "127.0.0.1", cfg.api_port)

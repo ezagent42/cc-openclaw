@@ -1065,8 +1065,14 @@ class ChannelServer:
         elif "." in instance_id and not instance_id.startswith("channel-"):
             # Create new thread anchor for named sessions
             tag = tag_name or instance_id.split(".", 1)[1]
-            # Use first non-wildcard chat_id for anchor
+            # Use first non-wildcard chat_id for anchor; for child sessions with
+            # empty chat_ids, look up the root session's chat_id
             anchor_chat_id = next((c for c in chat_ids if c != "*"), None)
+            if not anchor_chat_id:
+                user = instance_id.split(".", 1)[0]
+                root_inst = self.instances_by_id.get(f"{user}.root") or self.instances_by_id.get(user)
+                if root_inst:
+                    anchor_chat_id = next((c for c in root_inst.chat_ids if c != "*"), None)
             if anchor_chat_id:
                 anchor_msg_id = self._create_thread_anchor(instance_id, anchor_chat_id, tag)
                 if anchor_msg_id:

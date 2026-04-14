@@ -551,7 +551,6 @@ async def main():
     server_url = f"ws://localhost:{port}"
 
     chat_id_str = os.environ.get("OC_CHAT_ID", "*")
-    chat_ids = [chat_id_str]
 
     # Construct instance_id as {user}.{session}
     oc_user = os.environ.get("OC_USER", "")
@@ -561,6 +560,14 @@ async def main():
         instance_id = f"{oc_user}.{oc_session}"
     else:
         instance_id = f"channel-{os.getpid()}"
+
+    # Child sessions (non-root) don't register exact chat_id routes —
+    # they are reached exclusively via thread routes. This avoids
+    # REGISTRATION_CONFLICT when multiple sessions share the same DM chat.
+    if oc_session == "root" or not oc_user:
+        chat_ids = [chat_id_str]
+    else:
+        chat_ids = []  # child session: no exact route, only thread-routed
 
     _channel_client = ChannelClient(
         server_url=server_url,

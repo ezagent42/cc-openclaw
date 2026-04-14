@@ -81,8 +81,18 @@ async def main() -> None:
             admin_group_chat_id=cfg.admin_group_chat_id,
         )
 
-    # 7. Create and start HTTP server
-    app = create_app(db=db, provisioner=provisioner, event_handler=event_handler)
+    # 7. Create Feishu API client (shared by HTTP API + Reconciler)
+    feishu_api: LarkFeishuGroupAPI | None = None
+    if feishu_enabled:
+        feishu_api = LarkFeishuGroupAPI(cfg.feishu_app_id, cfg.feishu_app_secret)
+
+    # 8. Create and start HTTP server
+    app = create_app(
+        db=db,
+        provisioner=provisioner,
+        event_handler=event_handler,
+        feishu_api=feishu_api,
+    )
     runner = web.AppRunner(app)
     await runner.setup()
     site = web.TCPSite(runner, "127.0.0.1", cfg.api_port)
@@ -90,8 +100,6 @@ async def main() -> None:
     log.info("sidecar ready on http://127.0.0.1:%d", cfg.api_port)
 
     if feishu_enabled:
-        # 8. Reconciler with real Feishu API
-        feishu_api = LarkFeishuGroupAPI(cfg.feishu_app_id, cfg.feishu_app_secret)
         reconciler = Reconciler(
             db=db,
             provisioner=provisioner,
@@ -121,7 +129,7 @@ async def main() -> None:
             "Feishu credentials not configured — event listener and reconciler disabled"
         )
 
-    # 9. Run forever
+    # 10. Run forever
     await asyncio.Event().wait()
 
 

@@ -8,6 +8,7 @@ from unittest.mock import AsyncMock
 from aiohttp.test_utils import AioHTTPTestCase, TestClient, TestServer
 
 from sidecar.api import create_app, DENY_MESSAGE
+from sidecar.reconciler import FeishuGroupAPI
 
 
 @pytest.fixture
@@ -33,6 +34,13 @@ def mock_event_handler():
 
 
 @pytest.fixture
+def mock_feishu_api():
+    api = AsyncMock(spec=FeishuGroupAPI)
+    api.get_group_members.return_value = []
+    return api
+
+
+@pytest.fixture
 async def client(mock_db, mock_provisioner):
     app = create_app(db=mock_db, provisioner=mock_provisioner)
     async with TestClient(TestServer(app)) as c:
@@ -43,6 +51,15 @@ async def client(mock_db, mock_provisioner):
 async def client_with_events(mock_db, mock_provisioner, mock_event_handler):
     app = create_app(
         db=mock_db, provisioner=mock_provisioner, event_handler=mock_event_handler,
+    )
+    async with TestClient(TestServer(app)) as c:
+        yield c
+
+
+@pytest.fixture
+async def client_with_feishu(mock_db, mock_provisioner, mock_feishu_api):
+    app = create_app(
+        db=mock_db, provisioner=mock_provisioner, feishu_api=mock_feishu_api,
     )
     async with TestClient(TestServer(app)) as c:
         yield c
@@ -359,3 +376,152 @@ async def test_event_endpoint_returns_503_without_handler(client):
     assert resp.status == 503
     body = await resp.json()
     assert "error" in body
+
+
+# ── batch provision ────────────────────────────────────────────────
+
+
+async def test_batch_provision_returns_503_without_feishu_api(client):
+    """POST /admin/batch-provision returns 503 when feishu_api is not configured."""
+    resp = await client.post(
+        "/api/v1/admin/batch-provision",
+        json={"chat_id": "oc_xxx"},
+    )
+    assert resp.status == 503
+    body = await resp.json()
+    assert "error" in body
+
+
+async def test_batch_provision_provisions_authorized_members(
+    client_with_feishu, mock_db, mock_provisioner, mock_feishu_api,
+):
+    """Authorized members without agents are provisioned."""
+    mock_feishu_api.get_group_members.return_value = [
+        {"open_id": "ou_alice", "name": "Alice"},
+        {"open_id": "ou_bob", "name": "Bob"},
+    ]
+    mock_db.get_permission.side_effect = lambda oid: {
+        "ou_alice": {
+            "open_id": "ou_alice", "display_name": "Alice",
+            "is_user_member": True, "is_admin": False,
+        },
+        "ou_bob": {
+            "open_id": "ou_bob", "display_name": "Bob",
+            "is_user_member": True, "is_admin": False,
+        },
+    }.get(oid)
+    mock_db.get_agent_by_open_id.return_value = None
+    mock_provisioner.provision_user.return_value = "u-acct-xxx"
+
+    resp = await client_with_feishu.post(
+        "/api/v1/admin/batch-provision",
+        json={"chat_id": "oc_group1"},
+    )
+    assert resp.status == 200
+    body = await resp.json()
+    assert body["ok"] is True
+    assert set(body["provisioned"]) == {"ou_alice", "ou_bob"}
+    assert body["skipped"] == []
+    assert body["errors"] == []
+    assert mock_provisioner.provision_user.await_count == 2
+
+
+async def test_batch_provision_skips_unauthorized(
+    client_with_feishu, mock_db, mock_provisioner, mock_feishu_api,
+):
+    """Unauthorized members are skipped."""
+    mock_feishu_api.get_group_members.return_value = [
+        {"open_id": "ou_alice", "name": "Alice"},
+    ]
+    mock_db.get_permission.return_value = None  # not authorized
+    mock_db.get_agent_by_open_id.return_value = None
+
+    resp = await client_with_feishu.post(
+        "/api/v1/admin/batch-provision",
+        json={"chat_id": "oc_group1"},
+    )
+    assert resp.status == 200
+    body = await resp.json()
+    assert body["provisioned"] == []
+    assert len(body["skipped"]) == 1
+    assert body["skipped"][0]["reason"] == "not_authorized"
+    mock_provisioner.provision_user.assert_not_awaited()
+
+
+async def test_batch_provision_skips_already_active(
+    client_with_feishu, mock_db, mock_provisioner, mock_feishu_api,
+):
+    """Members with active agents are skipped."""
+    mock_feishu_api.get_group_members.return_value = [
+        {"open_id": "ou_alice", "name": "Alice"},
+    ]
+    mock_db.get_permission.return_value = {
+        "open_id": "ou_alice", "display_name": "Alice",
+        "is_user_member": True, "is_admin": False,
+    }
+    mock_db.get_agent_by_open_id.return_value = {
+        "agent_id": "u-acct-ou_alice", "status": "active",
+    }
+
+    resp = await client_with_feishu.post(
+        "/api/v1/admin/batch-provision",
+        json={"chat_id": "oc_group1"},
+    )
+    assert resp.status == 200
+    body = await resp.json()
+    assert body["provisioned"] == []
+    assert len(body["skipped"]) == 1
+    assert body["skipped"][0]["reason"] == "already_active"
+
+
+async def test_batch_provision_restores_suspended(
+    client_with_feishu, mock_db, mock_provisioner, mock_feishu_api,
+):
+    """Members with suspended agents are restored, not re-provisioned."""
+    mock_feishu_api.get_group_members.return_value = [
+        {"open_id": "ou_alice", "name": "Alice"},
+    ]
+    mock_db.get_permission.return_value = {
+        "open_id": "ou_alice", "display_name": "Alice",
+        "is_user_member": True, "is_admin": False,
+    }
+    mock_db.get_agent_by_open_id.return_value = {
+        "agent_id": "u-acct-ou_alice", "status": "suspended",
+    }
+
+    resp = await client_with_feishu.post(
+        "/api/v1/admin/batch-provision",
+        json={"chat_id": "oc_group1"},
+    )
+    assert resp.status == 200
+    body = await resp.json()
+    assert body["provisioned"] == ["ou_alice"]
+    mock_provisioner.restore_user.assert_awaited_once_with("ou_alice")
+    mock_provisioner.provision_user.assert_not_awaited()
+
+
+async def test_batch_provision_captures_errors(
+    client_with_feishu, mock_db, mock_provisioner, mock_feishu_api,
+):
+    """Provisioning errors are captured in the errors list."""
+    mock_feishu_api.get_group_members.return_value = [
+        {"open_id": "ou_alice", "name": "Alice"},
+    ]
+    mock_db.get_permission.return_value = {
+        "open_id": "ou_alice", "display_name": "Alice",
+        "is_user_member": True, "is_admin": False,
+    }
+    mock_db.get_agent_by_open_id.return_value = None
+    mock_provisioner.provision_user.side_effect = RuntimeError("disk full")
+
+    resp = await client_with_feishu.post(
+        "/api/v1/admin/batch-provision",
+        json={"chat_id": "oc_group1"},
+    )
+    assert resp.status == 200
+    body = await resp.json()
+    assert body["ok"] is True
+    assert body["provisioned"] == []
+    assert len(body["errors"]) == 1
+    assert body["errors"][0]["open_id"] == "ou_alice"
+    assert "disk full" in body["errors"][0]["error"]

@@ -137,6 +137,12 @@ class ChannelClient:
                 "type": "react", "message_id": message_id, "emoji_type": emoji_type,
             }))
 
+    async def send_file(self, chat_id, file_path):
+        if self.ws:
+            await self.ws.send(json.dumps({
+                "type": "send_file", "chat_id": chat_id, "file_path": file_path,
+            }))
+
     async def send_ux_event(self, chat_id, event, data=None):
         if self.ws:
             await self.ws.send(json.dumps({
@@ -288,6 +294,22 @@ def register_tools(server: Server):
                     "required": ["message_id", "emoji_type"],
                 },
             ),
+            Tool(
+                name="send_file",
+                description=(
+                    "Send a file to a Feishu chat. Uploads the local file to Feishu "
+                    "and sends it as a file message. chat_id is from the inbound "
+                    "<channel> tag (oc_xxx format)."
+                ),
+                inputSchema={
+                    "type": "object",
+                    "properties": {
+                        "chat_id": {"type": "string", "description": "Feishu chat ID (oc_xxx)"},
+                        "file_path": {"type": "string", "description": "Absolute path to the local file to send"},
+                    },
+                    "required": ["chat_id", "file_path"],
+                },
+            ),
         ]
 
     @server.call_tool()
@@ -296,6 +318,8 @@ def register_tools(server: Server):
             return _handle_reply(arguments)
         elif name == "react":
             return _handle_react(arguments)
+        elif name == "send_file":
+            return _handle_send_file(arguments)
         raise ValueError(f"Unknown tool: {name}")
 
 
@@ -318,6 +342,21 @@ def _handle_react(args: dict) -> list[TextContent]:
             _event_loop,
         )
         return [TextContent(type="text", text=f"Reacted {args['emoji_type']}")]
+    return [TextContent(type="text", text="Error: not connected to channel-server")]
+
+
+def _handle_send_file(args: dict) -> list[TextContent]:
+    chat_id = args["chat_id"]
+    file_path = args["file_path"]
+    if not os.path.isfile(file_path):
+        return [TextContent(type="text", text=f"Error: file not found: {file_path}")]
+    if _channel_client and _channel_client.ws and _event_loop:
+        asyncio.run_coroutine_threadsafe(
+            _channel_client.send_file(chat_id, file_path),
+            _event_loop,
+        )
+        log.info(f"Send file to {chat_id}: {file_path}")
+        return [TextContent(type="text", text=f"File sent to {chat_id}: {os.path.basename(file_path)}")]
     return [TextContent(type="text", text="Error: not connected to channel-server")]
 
 

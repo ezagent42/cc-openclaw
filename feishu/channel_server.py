@@ -804,6 +804,8 @@ class ChannelServer:
                     await self._handle_reply(ws, msg)
                 elif msg_type == "react":
                     await self._handle_react(ws, msg)
+                elif msg_type == "send_file":
+                    await self._handle_send_file(ws, msg)
                 elif msg_type == "message":
                     await self._handle_inbound_message(ws, msg)
                 elif msg_type == "pong":
@@ -952,6 +954,82 @@ class ChannelServer:
             threading.Thread(
                 target=self._send_reaction, args=(message_id, emoji_type), daemon=True
             ).start()
+
+    async def _handle_send_file(self, ws: ServerConnection, msg: dict) -> None:
+        """Upload a local file to Feishu and send it as a file message."""
+        chat_id = msg.get("chat_id", "")
+        file_path = msg.get("file_path", "")
+        log.info("Send file chat_id=%s file_path=%s", chat_id, file_path)
+        if chat_id and file_path and self._feishu_client:
+            threading.Thread(
+                target=self._send_file, args=(chat_id, file_path), daemon=True
+            ).start()
+            await self._send(ws, {"type": "send_file_ack", "ok": True})
+        else:
+            await self._send(ws, {
+                "type": "send_file_ack", "ok": False,
+                "error": "Missing chat_id, file_path, or no Feishu client",
+            })
+
+    def _send_file(self, chat_id: str, file_path: str) -> None:
+        """Upload file to Feishu and send as file message. Blocking, meant for daemon thread."""
+        import lark_oapi as lark
+
+        try:
+            if not os.path.isfile(file_path):
+                log.warning("_send_file: file not found: %s", file_path)
+                return
+
+            file_name = os.path.basename(file_path)
+
+            # Step 1: Upload file to Feishu
+            with open(file_path, "rb") as f:
+                upload_req = (
+                    lark.BaseRequest.builder()
+                    .http_method(lark.HttpMethod.POST)
+                    .uri("/open-apis/im/v1/files")
+                    .token_types({lark.AccessTokenType.TENANT})
+                    .body({"file_type": "stream", "file_name": file_name})
+                    .files([lark.File.builder().field_name("file").file_name(file_name).file(f).build()])
+                    .build()
+                )
+                upload_resp = self._feishu_client.request(upload_req)
+
+            if not upload_resp.success():
+                log.warning("_send_file upload failed: code=%s msg=%s", upload_resp.code, upload_resp.msg)
+                return
+
+            data = json.loads(upload_resp.raw.content)
+            file_key = data.get("data", {}).get("file_key", "")
+            if not file_key:
+                log.warning("_send_file: no file_key in upload response")
+                return
+
+            log.info("_send_file: uploaded %s -> file_key=%s", file_name, file_key)
+
+            # Step 2: Send file message to chat
+            from lark_oapi.api.im.v1 import CreateMessageRequest, CreateMessageRequestBody
+
+            body = (
+                CreateMessageRequestBody.builder()
+                .receive_id(chat_id)
+                .msg_type("file")
+                .content(json.dumps({"file_key": file_key}))
+                .build()
+            )
+            send_req = CreateMessageRequest.builder().receive_id_type("chat_id").request_body(body).build()
+            send_resp = self._feishu_client.im.v1.message.create(send_req)
+
+            if send_resp.success():
+                log.info("_send_file: sent %s to %s", file_name, chat_id)
+                if send_resp.data and send_resp.data.message_id:
+                    self._recent_sent.add(send_resp.data.message_id)
+                    self._msg_counter["sent"] += 1
+            else:
+                log.warning("_send_file send failed: code=%s msg=%s", send_resp.code, send_resp.msg)
+
+        except Exception as e:
+            log.warning("_send_file error: %s", e)
 
     async def _handle_inbound_message(self, ws: ServerConnection, msg: dict) -> None:
         """Handle an inbound message from another source."""

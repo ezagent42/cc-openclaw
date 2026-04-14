@@ -86,12 +86,19 @@ async def main() -> None:
     if feishu_enabled:
         feishu_api = LarkFeishuGroupAPI(cfg.feishu_app_id, cfg.feishu_app_secret)
 
-    # 8. Create and start HTTP server
+    # 8. Create broadcaster (for admin DM notifications)
+    broadcaster = None
+    if feishu_enabled:
+        from sidecar.broadcast import FeishuBroadcaster
+        broadcaster = FeishuBroadcaster(cfg.feishu_app_id, cfg.feishu_app_secret)
+
+    # 9. Create and start HTTP server
     app = create_app(
         db=db,
         provisioner=provisioner,
         event_handler=event_handler,
         feishu_api=feishu_api,
+        broadcaster=broadcaster,
     )
     runner = web.AppRunner(app)
     await runner.setup()

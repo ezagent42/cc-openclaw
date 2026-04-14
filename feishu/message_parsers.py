@@ -135,24 +135,42 @@ def _parse_merge_forward(content: dict, message, server) -> tuple[str, str]:
 
 @register_parser("interactive")
 def _parse_interactive(content: dict, message, server) -> tuple[str, str]:
-    """Extract text from interactive card messages."""
+    """Extract text from interactive card messages.
+
+    Card content can be either:
+    - A dict with header/elements (standard card)
+    - A list of elements (simplified card or sub-message in merge_forward)
+    """
     parts = []
 
-    # Card title
-    header = content.get("header", {})
-    title = header.get("title", {})
-    if isinstance(title, dict):
-        parts.append(title.get("content", ""))
-    elif isinstance(title, str):
-        parts.append(title)
+    # Handle case where content is wrapped differently
+    if isinstance(content, list):
+        # Simplified format: content is directly a list of elements
+        elements = content
+    else:
+        # Standard card format
+        header = content.get("header", {})
+        if isinstance(header, dict):
+            title = header.get("title", {})
+            if isinstance(title, dict):
+                parts.append(title.get("content", ""))
+            elif isinstance(title, str):
+                parts.append(title)
+        elements = content.get("elements", [])
+        if not isinstance(elements, list):
+            elements = []
 
-    # Card elements — extract text content
-    for element in content.get("elements", []):
+    # Extract text from elements
+    for element in elements:
+        if not isinstance(element, dict):
+            continue
         tag = element.get("tag", "")
         if tag == "div":
             text_obj = element.get("text", {})
             if isinstance(text_obj, dict):
                 parts.append(text_obj.get("content", ""))
+            elif isinstance(text_obj, str):
+                parts.append(text_obj)
         elif tag == "markdown":
             parts.append(element.get("content", ""))
         elif tag == "note":
@@ -161,9 +179,15 @@ def _parse_interactive(content: dict, message, server) -> tuple[str, str]:
                     parts.append(el.get("content", ""))
         elif tag == "action":
             for action in element.get("actions", []):
+                if not isinstance(action, dict):
+                    continue
                 action_text = action.get("text", {})
                 if isinstance(action_text, dict):
                     parts.append(f"[按钮: {action_text.get('content', '')}]")
+                elif isinstance(action_text, str):
+                    parts.append(f"[按钮: {action_text}]")
+        elif tag == "hr":
+            parts.append("---")
 
     text = "\n".join(p for p in parts if p)
     return text or "[消息卡片]", ""

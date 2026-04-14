@@ -383,9 +383,13 @@ async def main():
     chat_id_str = os.environ.get("OPENCLAW_CHAT_ID", "*")
     chat_ids = [chat_id_str]
 
+    # Use OPENCLAW_USER as instance_id for session identification in replies
+    instance_id = os.environ.get("OPENCLAW_USER", f"channel-{os.getpid()}")
+
     _channel_client = ChannelClient(
         server_url=server_url,
         chat_ids=chat_ids,
+        instance_id=instance_id,
         runtime_mode=os.environ.get("OPENCLAW_RUNTIME_MODE", "discussion"),
         pidfile_path=str(pidfile),
     )

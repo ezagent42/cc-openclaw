@@ -1001,6 +1001,12 @@ class ChannelServer:
 
         if chat_id.startswith("oc_"):
             text = msg.get("text", "")
+
+            # Prepend session name for multi-session clarity
+            inst = self._ws_to_instance.get(ws)
+            if inst and inst.instance_id and not inst.instance_id.startswith("channel-"):
+                text = f"[{inst.instance_id}] {text}"
+
             log.info("Reply to Feishu chat_id=%s text=%s", chat_id, text[:60])
             await self._reply_feishu(chat_id, text)
             # Remove ACK reaction now that we've replied

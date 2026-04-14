@@ -109,8 +109,9 @@ def _parse_merge_forward(content: dict, message, server) -> tuple[str, str]:
                 continue  # skip the wrapper itself
 
             # Parse sub-message content
+            raw_content = item.body.content if item.body and item.body.content else ""
             try:
-                sub_content = json.loads(item.body.content) if item.body and item.body.content else {}
+                sub_content = json.loads(raw_content) if raw_content else {}
             except Exception:
                 sub_content = {}
 
@@ -161,33 +162,53 @@ def _parse_interactive(content: dict, message, server) -> tuple[str, str]:
             elements = []
 
     # Extract text from elements
-    for element in elements:
-        if not isinstance(element, dict):
-            continue
-        tag = element.get("tag", "")
-        if tag == "div":
-            text_obj = element.get("text", {})
-            if isinstance(text_obj, dict):
-                parts.append(text_obj.get("content", ""))
-            elif isinstance(text_obj, str):
-                parts.append(text_obj)
-        elif tag == "markdown":
-            parts.append(element.get("content", ""))
-        elif tag == "note":
-            for el in element.get("elements", []):
-                if isinstance(el, dict):
-                    parts.append(el.get("content", ""))
-        elif tag == "action":
-            for action in element.get("actions", []):
-                if not isinstance(action, dict):
-                    continue
-                action_text = action.get("text", {})
-                if isinstance(action_text, dict):
-                    parts.append(f"[按钮: {action_text.get('content', '')}]")
-                elif isinstance(action_text, str):
-                    parts.append(f"[按钮: {action_text}]")
-        elif tag == "hr":
-            parts.append("---")
+    # elements can be: [dict, dict, ...] or [[dict, dict], [dict, dict], ...] (nested)
+    def _extract_from_nodes(nodes: list):
+        """Recursively extract text from a list of element nodes."""
+        for node in nodes:
+            if isinstance(node, list):
+                # Nested array — recurse (common in merge_forward cards)
+                _extract_from_nodes(node)
+                continue
+            if not isinstance(node, dict):
+                continue
+            tag = node.get("tag", "")
+            if tag == "text":
+                text = node.get("text", "")
+                if text:
+                    parts.append(text)
+            elif tag == "div":
+                text_obj = node.get("text", {})
+                if isinstance(text_obj, dict):
+                    parts.append(text_obj.get("content", ""))
+                elif isinstance(text_obj, str):
+                    parts.append(text_obj)
+                # div may contain fields (sub-elements)
+                fields = node.get("fields", [])
+                if fields:
+                    _extract_from_nodes(fields)
+            elif tag == "markdown":
+                parts.append(node.get("content", ""))
+            elif tag == "note":
+                _extract_from_nodes(node.get("elements", []))
+            elif tag == "action":
+                for action in node.get("actions", []):
+                    if not isinstance(action, dict):
+                        continue
+                    action_text = action.get("text", {})
+                    if isinstance(action_text, dict):
+                        parts.append(f"[按钮: {action_text.get('content', '')}]")
+                    elif isinstance(action_text, str):
+                        parts.append(f"[按钮: {action_text}]")
+            elif tag == "hr":
+                parts.append("---")
+            elif tag == "a":
+                parts.append(node.get("text", "") or node.get("href", ""))
+            elif tag == "at":
+                parts.append(f"@{node.get('user_name', node.get('user_id', ''))}")
+            # img and other non-text tags are silently skipped
+
+    _extract_from_nodes(elements)
 
     text = "\n".join(p for p in parts if p)
     return text or "[消息卡片]", ""

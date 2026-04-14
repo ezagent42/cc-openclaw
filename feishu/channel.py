@@ -59,7 +59,7 @@ class ChannelClient:
                  pidfile_path=None):
         self.server_url = server_url
         self._pidfile_path = pidfile_path
-        self.chat_ids = chat_ids or ["*"]
+        self.chat_ids = chat_ids if chat_ids is not None else ["*"]
         self.instance_id = instance_id or f"channel-{os.getpid()}"
         self.tag_name = tag_name
         self.runtime_mode = runtime_mode
@@ -105,7 +105,7 @@ class ChannelClient:
     async def _register(self, ws):
         payload = {
             "type": "register",
-            "role": "developer" if "*" in self.chat_ids else "production",
+            "role": "developer" if ("*" in self.chat_ids or not self.chat_ids) else "production",
             "chat_ids": self.chat_ids,
             "instance_id": self.instance_id,
             "runtime_mode": self.runtime_mode,

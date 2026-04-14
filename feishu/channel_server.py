@@ -155,11 +155,19 @@ class ChannelServer:
             log.warning("Failed to save thread anchors: %s", e)
 
     def _create_thread_anchor(self, instance_id: str, chat_id: str, tag: str) -> str | None:
-        """Send a thread anchor message to Feishu and persist it. Returns msg_id or None."""
+        """Send a thread anchor message to Feishu, then reply to it to auto-create a topic.
+
+        Returns the anchor msg_id or None.
+        """
         if not self._feishu_client:
             return None
         try:
-            from lark_oapi.api.im.v1 import CreateMessageRequest, CreateMessageRequestBody
+            from lark_oapi.api.im.v1 import (
+                CreateMessageRequest, CreateMessageRequestBody,
+                ReplyMessageRequest, ReplyMessageRequestBody,
+            )
+
+            # Step 1: Send the anchor message
             body = (
                 CreateMessageRequestBody.builder()
                 .receive_id(chat_id)
@@ -169,20 +177,40 @@ class ChannelServer:
             )
             req = CreateMessageRequest.builder().receive_id_type("chat_id").request_body(body).build()
             resp = self._feishu_client.im.v1.message.create(req)
-            if resp.success() and resp.data and resp.data.message_id:
-                anchor_msg_id = resp.data.message_id
-                self._recent_sent.add(anchor_msg_id)
-                self._thread_anchors[instance_id] = {
-                    "msg_id": anchor_msg_id,
-                    "chat_id": chat_id,
-                    "tag": tag,
-                    "created_at": datetime.now(timezone.utc).isoformat(),
-                }
-                self._save_thread_anchors()
-                log.info("Created thread anchor for %s: %s", instance_id, anchor_msg_id)
-                return anchor_msg_id
-            else:
+            if not (resp.success() and resp.data and resp.data.message_id):
                 log.warning("Failed to create thread anchor: %s", resp.msg if resp else "no response")
+                return None
+
+            anchor_msg_id = resp.data.message_id
+            self._recent_sent.add(anchor_msg_id)
+
+            # Step 2: Reply in thread to auto-create the topic
+            reply_body = (
+                ReplyMessageRequestBody.builder()
+                .msg_type("text")
+                .content(json.dumps({"text": f"💬 [{tag}] 在此话题中对话"}))
+                .reply_in_thread(True)
+                .build()
+            )
+            reply_req = ReplyMessageRequest.builder().message_id(anchor_msg_id).request_body(reply_body).build()
+            reply_resp = self._feishu_client.im.v1.message.reply(reply_req)
+            if reply_resp.success() and reply_resp.data and reply_resp.data.message_id:
+                self._recent_sent.add(reply_resp.data.message_id)
+                log.info("Auto-created thread for anchor %s", anchor_msg_id)
+            else:
+                log.warning("Failed to auto-create thread: %s", reply_resp.msg if reply_resp else "no response")
+
+            # Step 3: Persist anchor
+            self._thread_anchors[instance_id] = {
+                "msg_id": anchor_msg_id,
+                "chat_id": chat_id,
+                "tag": tag,
+                "created_at": datetime.now(timezone.utc).isoformat(),
+            }
+            self._save_thread_anchors()
+            log.info("Created thread anchor for %s: %s", instance_id, anchor_msg_id)
+            return anchor_msg_id
+
         except Exception as e:
             log.warning("Error creating thread anchor: %s", e)
         return None

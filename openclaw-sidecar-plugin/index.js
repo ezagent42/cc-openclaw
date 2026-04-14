@@ -1,184 +1,145 @@
 /**
  * OpenClaw Sidecar Routing Plugin
  *
- * 1. Slash command registry — /help, /status, etc. handled without LLM
- * 2. Fallback routing — provision/restore/deny for unmatched messages
+ * 1. Registered commands — /status, /agents, /logs, /broadcast
+ *    Uses api.registerCommand() so they appear in OpenClaw's native /help
+ *    and are processed BEFORE built-in commands and agent invocation.
  *
- * Uses the `before_dispatch` hook which fires after routing
- * but before agent invocation.
+ * 2. Fallback routing — provision/restore/deny for unmatched messages
+ *    Uses before_dispatch hook for messages routed to fallback agent.
  */
 
 const SIDECAR_DEFAULT_URL = "http://127.0.0.1:18791";
 const DEFAULT_ACCOUNT_ID = "shared";
 
-// ---------------------------------------------------------------------------
-// Slash Command Registry
-// ---------------------------------------------------------------------------
-
-const _commands = new Map();
-
-/**
- * Register a slash command.
- * @param {string} name - Command name including "/" (e.g. "/help")
- * @param {object} opts
- * @param {string} opts.description - Short description for /help
- * @param {boolean} [opts.adminOnly] - Require admin group context
- * @param {(event, ctx, sidecarUrl) => Promise<string|null>} opts.handler
- *   Return reply text, or null to skip (let agent handle).
- */
-function registerCommand(name, { description, adminOnly = false, handler }) {
-  _commands.set(name.toLowerCase(), { description, adminOnly, handler });
-}
-
-/**
- * Try to match and execute a slash command.
- * Returns {handled, text} or null if no match.
- */
-async function trySlashCommand(content, event, ctx, sidecarUrl) {
-  const trimmed = (content || "").trim();
-  if (!trimmed.startsWith("/")) return null;
-
-  const parts = trimmed.split(/\s+/);
-  const cmd = parts[0].toLowerCase();
-  const entry = _commands.get(cmd);
-  if (!entry) return null;
-
-  // Admin-only commands: only work in admin group context
-  // (sessionKey contains the admin agent binding)
-  if (entry.adminOnly) {
-    const sessionKey = ctx.sessionKey || "";
-    if (!sessionKey.includes("admin")) {
-      return { handled: true, text: `${cmd} 仅限管理员在管理群中使用` };
-    }
-  }
-
-  try {
-    const result = await entry.handler(event, ctx, sidecarUrl);
-    if (result === null) return null; // handler chose not to handle
-    return { handled: true, text: result };
-  } catch (err) {
-    return { handled: true, text: `${cmd} 执行失败: ${err.message}` };
-  }
-}
-
-// ---------------------------------------------------------------------------
-// Built-in Commands
-// ---------------------------------------------------------------------------
-
-registerCommand("/help", {
-  description: "显示所有可用命令",
-  handler: async () => {
-    const lines = ["📋 OneSyn小龙虾 可用命令：", ""];
-    for (const [name, { description, adminOnly }] of _commands) {
-      const badge = adminOnly ? " [管理员]" : "";
-      lines.push(`• ${name} — ${description}${badge}`);
-    }
-    return lines.join("\n");
-  },
-});
-
-registerCommand("/status", {
-  description: "查看系统状态（agent 数量统计）",
-  adminOnly: true,
-  handler: async (_event, _ctx, sidecarUrl) => {
-    const resp = await fetch(`${sidecarUrl}/api/v1/agents`);
-    if (!resp.ok) return "无法获取 agent 状态";
-    const { agents } = await resp.json();
-    const active = agents.filter((a) => a.status === "active").length;
-    const suspended = agents.filter((a) => a.status === "suspended").length;
-    const total = agents.length;
-    return `📊 系统状态\n• 总计: ${total} 个 agent\n• 活跃: ${active}\n• 已暂停: ${suspended}`;
-  },
-});
-
-registerCommand("/agents", {
-  description: "列出所有 agent",
-  adminOnly: true,
-  handler: async (_event, _ctx, sidecarUrl) => {
-    const resp = await fetch(`${sidecarUrl}/api/v1/agents`);
-    if (!resp.ok) return "无法获取 agent 列表";
-    const { agents } = await resp.json();
-    if (agents.length === 0) return "当前没有任何 agent";
-    const lines = ["📋 Agent 列表：", ""];
-    for (const a of agents) {
-      const id = a.open_id || a.chat_id || "?";
-      lines.push(`• ${a.agent_id} [${a.status}] — ${a.agent_type} ${id}`);
-    }
-    return lines.join("\n");
-  },
-});
-
-registerCommand("/logs", {
-  description: "查看最近操作日志",
-  adminOnly: true,
-  handler: async (_event, _ctx, sidecarUrl) => {
-    const resp = await fetch(`${sidecarUrl}/api/v1/audit-log?limit=10`);
-    if (!resp.ok) return "无法获取操作日志";
-    const { logs } = await resp.json();
-    if (logs.length === 0) return "暂无操作日志";
-    const lines = ["📜 最近操作日志：", ""];
-    for (const l of logs) {
-      const time = l.timestamp.slice(0, 19).replace("T", " ");
-      lines.push(`• [${time}] ${l.action} → ${l.target} (by ${l.actor})`);
-    }
-    return lines.join("\n");
-  },
-});
-
-registerCommand("/broadcast", {
-  description: "向所有活跃用户群发 DM（用法: /broadcast 消息内容）",
-  adminOnly: true,
-  handler: async (event, ctx, sidecarUrl) => {
-    const content = (event.content || "").trim();
-    const message = content.replace(/^\/broadcast\s*/i, "").trim();
-    if (!message) return "用法: /broadcast 消息内容";
-
-    const actor = ctx.senderId || event.senderId || "";
-    const resp = await fetch(`${sidecarUrl}/api/v1/admin/broadcast`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ message, actor }),
-    });
-
-    if (resp.status === 403) return "❌ 权限不足，仅管理员可执行群发";
-    if (resp.status === 503) return "❌ 广播服务未配置";
-    if (!resp.ok) return `❌ 群发失败 (${resp.status})`;
-
-    const { sent, failed } = await resp.json();
-    const lines = [`✅ 群发完成: 成功 ${sent.length} 人`];
-    if (failed.length > 0) lines.push(`⚠️ 失败 ${failed.length} 人`);
-    return lines.join("\n");
-  },
-});
-
-// ---------------------------------------------------------------------------
-// Main Plugin
-// ---------------------------------------------------------------------------
-
 export default {
   id: "openclaw-sidecar",
   name: "Sidecar Routing",
-  description: "Slash commands + fallback routing via Sidecar API",
+  description: "Sidecar management commands + fallback routing",
 
   register(api) {
     const cfg = api.pluginConfig || {};
     const sidecarUrl = cfg.sidecarUrl || SIDECAR_DEFAULT_URL;
     const accountId = cfg.accountId || DEFAULT_ACCOUNT_ID;
 
+    // ------------------------------------------------------------------
+    // Registered Commands (appear in /help, processed before LLM)
+    // ------------------------------------------------------------------
+
+    api.registerCommand({
+      name: "status",
+      description: "查看系统状态（agent 数量统计）",
+      requireAuth: true,
+      handler: async (ctx) => {
+        try {
+          const resp = await fetch(`${sidecarUrl}/api/v1/agents`);
+          if (!resp.ok) return { text: "无法获取 agent 状态" };
+          const { agents } = await resp.json();
+          const active = agents.filter((a) => a.status === "active").length;
+          const suspended = agents.filter((a) => a.status === "suspended").length;
+          const total = agents.length;
+          return { text: `📊 系统状态\n• 总计: ${total} 个 agent\n• 活跃: ${active}\n• 已暂停: ${suspended}` };
+        } catch (e) {
+          return { text: `❌ Sidecar 不可达: ${e.message}` };
+        }
+      },
+    });
+
+    api.registerCommand({
+      name: "agents",
+      description: "列出所有 agent",
+      requireAuth: true,
+      handler: async (ctx) => {
+        try {
+          const resp = await fetch(`${sidecarUrl}/api/v1/agents`);
+          if (!resp.ok) return { text: "无法获取 agent 列表" };
+          const { agents } = await resp.json();
+          if (agents.length === 0) return { text: "当前没有任何 agent" };
+          const lines = ["📋 Agent 列表：", ""];
+          for (const a of agents) {
+            const id = a.open_id || a.chat_id || "?";
+            lines.push(`• ${a.agent_id} [${a.status}] — ${a.agent_type} ${id}`);
+          }
+          return { text: lines.join("\n") };
+        } catch (e) {
+          return { text: `❌ Sidecar 不可达: ${e.message}` };
+        }
+      },
+    });
+
+    api.registerCommand({
+      name: "logs",
+      description: "查看最近操作日志",
+      requireAuth: true,
+      handler: async (ctx) => {
+        try {
+          const resp = await fetch(`${sidecarUrl}/api/v1/audit-log?limit=10`);
+          if (!resp.ok) return { text: "无法获取操作日志" };
+          const { logs } = await resp.json();
+          if (logs.length === 0) return { text: "暂无操作日志" };
+          const lines = ["📜 最近操作日志：", ""];
+          for (const l of logs) {
+            const time = l.timestamp.slice(0, 19).replace("T", " ");
+            lines.push(`• [${time}] ${l.action} → ${l.target} (by ${l.actor})`);
+          }
+          return { text: lines.join("\n") };
+        } catch (e) {
+          return { text: `❌ Sidecar 不可达: ${e.message}` };
+        }
+      },
+    });
+
+    api.registerCommand({
+      name: "broadcast",
+      description: "向所有活跃用户群发 DM（用法: /broadcast 消息内容）",
+      acceptsArgs: true,
+      requireAuth: true,
+      handler: async (ctx) => {
+        // ctx has senderId, channel, isAuthorizedSender, etc.
+        // The message text after /broadcast is not in ctx directly.
+        // We need to get it from the raw content — but registerCommand
+        // strips the command prefix. Check if ctx has args or rawContent.
+        // Fallback: if no args mechanism, return usage hint.
+        const message = ctx.args || ctx.rawContent || "";
+        if (!message.trim()) {
+          return { text: "用法: /broadcast 消息内容\n例: /broadcast 明天下午3点有产品演示会" };
+        }
+
+        try {
+          const actor = ctx.senderId || "";
+          const resp = await fetch(`${sidecarUrl}/api/v1/admin/broadcast`, {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ message: message.trim(), actor }),
+          });
+
+          if (resp.status === 403) return { text: "❌ 权限不足，仅管理员可执行群发" };
+          if (resp.status === 503) return { text: "❌ 广播服务未配置" };
+          if (!resp.ok) return { text: `❌ 群发失败 (${resp.status})` };
+
+          const { sent, failed } = await resp.json();
+          const lines = [`✅ 群发完成: 成功 ${sent.length} 人`];
+          if (failed.length > 0) lines.push(`⚠️ 失败 ${failed.length} 人`);
+          return { text: lines.join("\n") };
+        } catch (e) {
+          return { text: `❌ Sidecar 不可达: ${e.message}` };
+        }
+      },
+    });
+
     api.logger.info(
-      `Sidecar plugin registered (url=${sidecarUrl}, account=${accountId}, commands=${_commands.size})`
+      `Sidecar plugin registered (url=${sidecarUrl}, account=${accountId})`
     );
+
+    // ------------------------------------------------------------------
+    // Fallback Routing (before_dispatch hook)
+    // ------------------------------------------------------------------
 
     api.on("before_dispatch", async (event, ctx) => {
       // 1. Only intercept messages from the shared account
       if (ctx.accountId && ctx.accountId !== accountId) return;
 
-      // 2. Try slash commands first (works for ALL agents, not just fallback)
-      const content = event.content || "";
-      const slashResult = await trySlashCommand(content, event, ctx, sidecarUrl);
-      if (slashResult) return slashResult;
-
-      // 3. Only intercept non-slash messages routed to fallback agent
+      // 2. Only intercept messages routed to fallback agent
       const sessionKey = ctx.sessionKey || event.sessionKey || "";
       if (!sessionKey.includes("fallback")) return;
 

@@ -973,7 +973,7 @@ class ChannelServer:
 
     def _send_file(self, chat_id: str, file_path: str) -> None:
         """Upload file to Feishu and send as file message. Blocking, meant for daemon thread."""
-        import lark_oapi as lark
+        from lark_oapi.api.im.v1 import CreateFileRequest, CreateFileRequestBody
 
         try:
             if not os.path.isfile(file_path):
@@ -982,25 +982,23 @@ class ChannelServer:
 
             file_name = os.path.basename(file_path)
 
-            # Step 1: Upload file to Feishu
+            # Step 1: Upload file to Feishu via SDK
             with open(file_path, "rb") as f:
-                upload_req = (
-                    lark.BaseRequest.builder()
-                    .http_method(lark.HttpMethod.POST)
-                    .uri("/open-apis/im/v1/files")
-                    .token_types({lark.AccessTokenType.TENANT})
-                    .body({"file_type": "stream", "file_name": file_name})
-                    .files([lark.File.builder().field_name("file").file_name(file_name).file(f).build()])
+                upload_body = (
+                    CreateFileRequestBody.builder()
+                    .file_type("stream")
+                    .file_name(file_name)
+                    .file(f)
                     .build()
                 )
-                upload_resp = self._feishu_client.request(upload_req)
+                upload_req = CreateFileRequest.builder().request_body(upload_body).build()
+                upload_resp = self._feishu_client.im.v1.file.create(upload_req)
 
             if not upload_resp.success():
                 log.warning("_send_file upload failed: code=%s msg=%s", upload_resp.code, upload_resp.msg)
                 return
 
-            data = json.loads(upload_resp.raw.content)
-            file_key = data.get("data", {}).get("file_key", "")
+            file_key = upload_resp.data.file_key if upload_resp.data else ""
             if not file_key:
                 log.warning("_send_file: no file_key in upload response")
                 return

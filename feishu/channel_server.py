@@ -13,6 +13,7 @@ import logging
 from logging.handlers import RotatingFileHandler
 import os
 import signal
+import subprocess
 import sys
 import threading
 import time
@@ -90,6 +91,11 @@ class ChannelServer:
 
         # Thread anchor persistence
         self._thread_anchors = self._load_thread_anchors()
+
+        # Child session process management
+        self._child_processes: dict[str, subprocess.Popen] = {}  # instance_id -> Popen
+        self._provisional_queues: dict[str, list[dict]] = {}     # instance_id -> pending messages
+        self.MAX_SESSIONS_PER_USER = 5
 
         self._stop_event = asyncio.Event()
         self._server: websockets.asyncio.server.Server | None = None
@@ -213,6 +219,10 @@ class ChannelServer:
         if self.feishu_enabled:
             task = asyncio.create_task(self._run_feishu_safe(), name="feishu-ws")
             self._tasks.append(task)
+
+        # Start health check for child processes
+        health_task = asyncio.create_task(self._health_check_loop(), name="health-check")
+        self._tasks.append(health_task)
 
         await self._notify_admin("Channel-Server online")
 
@@ -974,6 +984,12 @@ class ChannelServer:
                     await self._handle_forward(ws, msg)
                 elif msg_type == "message":
                     await self._handle_inbound_message(ws, msg)
+                elif msg_type == "spawn_session":
+                    await self._handle_spawn_session(ws, msg)
+                elif msg_type == "kill_session":
+                    await self._handle_kill_session(ws, msg)
+                elif msg_type == "list_sessions":
+                    await self._handle_list_sessions(ws, msg)
                 elif msg_type == "pong":
                     pass  # heartbeat response, no-op
                 else:
@@ -1034,12 +1050,18 @@ class ChannelServer:
 
         # Thread anchor: restore from persistence or create new
         if instance_id in self._thread_anchors:
-            # Restore existing thread anchor from persistence
+            # Restore existing thread anchor from persistence (or upgrade provisional route)
             anchor = self._thread_anchors[instance_id]
             anchor_msg_id = anchor["msg_id"]
             self.thread_routes[anchor_msg_id] = inst
             self.session_threads[instance_id] = anchor_msg_id
             log.info("Restored thread anchor for %s: %s", instance_id, anchor_msg_id)
+
+            # Flush provisional queue if any
+            pending = self._provisional_queues.pop(instance_id, [])
+            for pending_msg in pending:
+                await self._send(inst.ws, pending_msg)
+                log.info("Flushed provisional message to %s", instance_id)
         elif "." in instance_id and not instance_id.startswith("channel-"):
             # Create new thread anchor for named sessions
             tag = tag_name or instance_id.split(".", 1)[1]
@@ -1103,9 +1125,17 @@ class ChannelServer:
         root_id = message.get("root_id", "")
         if root_id and root_id in self.thread_routes:
             routed_instance = self.thread_routes[root_id]
-            await self._send(routed_instance.ws, message)
-            log.info("Thread-routed msg to %s (thread=%s)", routed_instance.instance_id, root_id[:16])
-            return
+            if routed_instance is None:
+                # Provisional route — child session not yet registered, queue the message
+                for child_id, anchor_msg_id in self.session_threads.items():
+                    if anchor_msg_id == root_id and child_id in self._provisional_queues:
+                        self._provisional_queues[child_id].append(message)
+                        log.info("Queued message for provisional session (thread=%s)", root_id[:16])
+                        return
+            else:
+                await self._send(routed_instance.ws, message)
+                log.info("Thread-routed msg to %s (thread=%s)", routed_instance.instance_id, root_id[:16])
+                return
 
         # 1. Exact match — send only to dedicated instance
         if chat_id in self.exact_routes:
@@ -1285,6 +1315,186 @@ class ChannelServer:
         })
         await self._send(ws, {"type": "forward_ack", "ok": True})
         log.info("Forwarded message from %s → %s: %s", sender_id, target_id, text[:60])
+
+    # ------------------------------------------------------------------
+    # Session management (spawn / kill / list)
+    # ------------------------------------------------------------------
+
+    async def _handle_spawn_session(self, ws: ServerConnection, msg: dict) -> None:
+        """Spawn a child session via cc-openclaw.sh."""
+        session_name = msg.get("session_name", "")
+        tag = msg.get("tag", "")
+        sender = self._ws_to_instance.get(ws)
+        if not sender:
+            await self._send(ws, {"type": "spawn_result", "ok": False, "text": "Error: not registered"})
+            return
+
+        # Extract user from sender's instance_id (e.g. "linyilun" from "linyilun.root")
+        if "." not in sender.instance_id:
+            await self._send(ws, {"type": "spawn_result", "ok": False, "text": "Error: cannot spawn from unnamed session"})
+            return
+
+        user = sender.instance_id.split(".", 1)[0]
+        child_id = f"{user}.{session_name}"
+
+        # Check if session already exists
+        if child_id in self.instances_by_id:
+            await self._send(ws, {"type": "spawn_result", "ok": False, "text": f"Session '{session_name}' already running"})
+            return
+
+        # Check concurrent session limit
+        user_sessions = [iid for iid in self.instances_by_id if iid.startswith(f"{user}.")]
+        if len(user_sessions) >= self.MAX_SESSIONS_PER_USER:
+            await self._send(ws, {
+                "type": "spawn_result", "ok": False,
+                "text": f"Session limit reached ({self.MAX_SESSIONS_PER_USER}). Kill a session first.",
+            })
+            return
+
+        # Create thread anchor first (before process starts)
+        anchor_chat_id = next((c for c in sender.chat_ids if c != "*"), None)
+        if anchor_chat_id:
+            display_tag = tag or session_name
+            anchor_msg_id = self._create_thread_anchor(child_id, anchor_chat_id, display_tag)
+            if anchor_msg_id:
+                # Register provisional route (queues messages until child registers)
+                self._provisional_queues[child_id] = []
+                self.thread_routes[anchor_msg_id] = None  # type: ignore — provisional
+                self.session_threads[child_id] = anchor_msg_id
+
+        # Start child process via cc-openclaw.sh
+        cmd = [str(PROJECT_ROOT / "cc-openclaw.sh"), "--user", user, "--session", session_name]
+        if tag:
+            cmd.extend(["--tag", tag])
+
+        try:
+            proc = subprocess.Popen(cmd, cwd=str(PROJECT_ROOT))
+            self._child_processes[child_id] = proc
+            log.info("Spawned child session %s (PID=%d)", child_id, proc.pid)
+            await self._send(ws, {
+                "type": "spawn_result", "ok": True,
+                "text": f"Session [{tag or session_name}] spawned",
+            })
+            await self._notify_admin(f"Session spawned: {child_id} (tag={tag or session_name})")
+        except Exception as e:
+            log.error("Failed to spawn session %s: %s", child_id, e)
+            # Clean up provisional route
+            if child_id in self._provisional_queues:
+                del self._provisional_queues[child_id]
+            anchor_msg_id = self.session_threads.pop(child_id, None)
+            if anchor_msg_id:
+                self.thread_routes.pop(anchor_msg_id, None)
+            self._remove_thread_anchor(child_id)
+            await self._send(ws, {"type": "spawn_result", "ok": False, "text": f"Failed to spawn: {e}"})
+
+    async def _handle_kill_session(self, ws: ServerConnection, msg: dict) -> None:
+        """Kill a child session by name."""
+        session_name = msg.get("session_name", "")
+        sender = self._ws_to_instance.get(ws)
+        if not sender or "." not in sender.instance_id:
+            await self._send(ws, {"type": "kill_result", "ok": False, "text": "Error: not registered"})
+            return
+
+        user = sender.instance_id.split(".", 1)[0]
+        child_id = f"{user}.{session_name}"
+
+        # Send end message in child's thread
+        anchor_msg_id = self.session_threads.get(child_id)
+        anchor = self._thread_anchors.get(child_id, {})
+        display_tag = anchor.get("tag", session_name)
+        if anchor_msg_id:
+            chat_id = anchor.get("chat_id", "")
+            if chat_id:
+                await self._reply_feishu(chat_id, f"🔴 Session [{display_tag}] ended", thread_anchor_msg_id=anchor_msg_id)
+
+        # Kill the tmux window (cc-openclaw.sh manages the process via tmux)
+        window_name = f"{user}.{session_name}"
+        try:
+            subprocess.run(
+                ["tmux", "kill-window", "-t", f"cc-openclaw:{window_name}"],
+                capture_output=True, timeout=5,
+            )
+            log.info("Killed tmux window %s", window_name)
+        except Exception as e:
+            log.warning("Failed to kill tmux window %s: %s", window_name, e)
+
+        # Clean up process handle
+        proc = self._child_processes.pop(child_id, None)
+        if proc:
+            try:
+                proc.kill()
+            except Exception:
+                pass
+
+        # Clean up thread anchor and routes
+        self._remove_thread_anchor(child_id)
+
+        await self._send(ws, {
+            "type": "kill_result", "ok": True,
+            "text": f"Session [{display_tag}] killed",
+        })
+        await self._notify_admin(f"Session killed: {child_id}")
+
+    async def _handle_list_sessions(self, ws: ServerConnection, msg: dict) -> None:
+        """List active sessions for the requesting user."""
+        sender = self._ws_to_instance.get(ws)
+        if not sender:
+            await self._send(ws, {"type": "sessions_list", "text": "Error: not registered"})
+            return
+
+        # Determine user prefix
+        if "." in sender.instance_id:
+            user = sender.instance_id.split(".", 1)[0]
+        else:
+            user = sender.instance_id
+
+        # Find all sessions for this user
+        lines = ["Active sessions:"]
+        for iid, inst in sorted(self.instances_by_id.items()):
+            if not iid.startswith(f"{user}."):
+                continue
+            session = iid.split(".", 1)[1] if "." in iid else iid
+            tag_info = f" (tag: {inst.tag_name})" if inst.tag_name else ""
+            age = datetime.now(timezone.utc) - inst.connected_at
+            age_str = f"{int(age.total_seconds() // 3600)}h" if age.total_seconds() >= 3600 else f"{int(age.total_seconds() // 60)}m"
+            thread = self.session_threads.get(iid, "")
+            thread_info = f" thread={thread[:16]}" if thread else ""
+            lines.append(f"  [{session}]{tag_info} — started {age_str} ago{thread_info}")
+
+        if len(lines) == 1:
+            lines.append("  (none)")
+
+        await self._send(ws, {"type": "sessions_list", "text": "\n".join(lines)})
+
+    async def _health_check_loop(self) -> None:
+        """Periodically check child processes and clean up dead ones."""
+        while not self._stop_event.is_set():
+            try:
+                await asyncio.sleep(30)
+                dead = []
+                for child_id, proc in list(self._child_processes.items()):
+                    if proc.poll() is not None:
+                        dead.append(child_id)
+
+                for child_id in dead:
+                    log.info("Child process %s exited, cleaning up", child_id)
+                    self._child_processes.pop(child_id, None)
+
+                    # Send end message in thread
+                    anchor_msg_id = self.session_threads.get(child_id)
+                    anchor = self._thread_anchors.get(child_id, {})
+                    display_tag = anchor.get("tag", child_id.split(".", 1)[-1] if "." in child_id else child_id)
+                    if anchor_msg_id:
+                        chat_id = anchor.get("chat_id", "")
+                        if chat_id:
+                            await self._reply_feishu(chat_id, f"🔴 Session [{display_tag}] ended (process exited)", thread_anchor_msg_id=anchor_msg_id)
+
+                    self._remove_thread_anchor(child_id)
+                    await self._notify_admin(f"Session ended (process exited): {child_id}")
+            except asyncio.CancelledError:
+                break
+            except Exception as e:
+                log.error("Health check error: %s", e)
 
     async def _handle_inbound_message(self, ws: ServerConnection, msg: dict) -> None:
         """Handle an inbound message from another source."""

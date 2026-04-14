@@ -211,6 +211,9 @@ def _parse_interactive(content: dict, message, server) -> tuple[str, str]:
     _extract_from_nodes(elements)
 
     text = "\n".join(p for p in parts if p)
+    # Detect Feishu's fallback text for cards that can't be rendered via API
+    if text and "请升级至最新版本客户端" in text:
+        return "[消息卡片 — 内容不可通过 API 获取]", ""
     return text or "[消息卡片]", ""
 
 

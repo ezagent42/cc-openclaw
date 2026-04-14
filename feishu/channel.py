@@ -136,6 +136,17 @@ class ChannelClient:
                     "source": "forward",
                     "ts": datetime.now(tz=timezone.utc).isoformat(),
                 })
+            elif msg.get("type") in ("spawn_result", "kill_result", "sessions_list"):
+                # Session management responses — inject as channel notification
+                await self._message_queue.put({
+                    "type": "message",
+                    "text": msg.get("text", json.dumps(msg)),
+                    "user": "channel-server",
+                    "user_id": "system",
+                    "chat_id": "internal",
+                    "source": "system",
+                    "ts": datetime.now(tz=timezone.utc).isoformat(),
+                })
             elif msg.get("type") == "ping":
                 await ws.send(json.dumps({"type": "pong"}))
             elif msg.get("type") == "error":
@@ -171,6 +182,26 @@ class ChannelClient:
             await self.ws.send(json.dumps({
                 "type": "forward", "target_instance": "monitor", "text": text,
             }))
+
+    async def send_spawn(self, session_name, tag=None):
+        """Request channel_server to spawn a child session."""
+        if self.ws:
+            payload = {"type": "spawn_session", "session_name": session_name}
+            if tag:
+                payload["tag"] = tag
+            await self.ws.send(json.dumps(payload))
+
+    async def send_kill(self, session_name):
+        """Request channel_server to kill a child session."""
+        if self.ws:
+            await self.ws.send(json.dumps({
+                "type": "kill_session", "session_name": session_name,
+            }))
+
+    async def send_list_sessions(self):
+        """Request channel_server to list active sessions for this user."""
+        if self.ws:
+            await self.ws.send(json.dumps({"type": "list_sessions"}))
 
     async def send_ux_event(self, chat_id, event, data=None):
         if self.ws:
@@ -362,6 +393,37 @@ def register_tools(server: Server):
                     "required": ["summary"],
                 },
             ),
+            Tool(
+                name="spawn_session",
+                description="Spawn a new child CC session. Creates a thread anchor and starts a new Claude Code process.",
+                inputSchema={
+                    "type": "object",
+                    "properties": {
+                        "name": {"type": "string", "description": "Session name (e.g. 'dev', 'refactor')"},
+                        "tag": {"type": "string", "description": "Optional display tag for the session"},
+                    },
+                    "required": ["name"],
+                },
+            ),
+            Tool(
+                name="kill_session",
+                description="Kill a child CC session by name. Sends shutdown signal and cleans up thread routes.",
+                inputSchema={
+                    "type": "object",
+                    "properties": {
+                        "name": {"type": "string", "description": "Session name to kill (e.g. 'dev')"},
+                    },
+                    "required": ["name"],
+                },
+            ),
+            Tool(
+                name="list_sessions",
+                description="List all active CC sessions for the current user/group.",
+                inputSchema={
+                    "type": "object",
+                    "properties": {},
+                },
+            ),
         ]
 
     @server.call_tool()
@@ -376,6 +438,12 @@ def register_tools(server: Server):
             return _handle_forward_tool(arguments)
         elif name == "send_summary":
             return _handle_send_summary_tool(arguments)
+        elif name == "spawn_session":
+            return _handle_spawn_session(arguments)
+        elif name == "kill_session":
+            return _handle_kill_session(arguments)
+        elif name == "list_sessions":
+            return _handle_list_sessions(arguments)
         raise ValueError(f"Unknown tool: {name}")
 
 
@@ -432,6 +500,33 @@ def _handle_send_summary_tool(args: dict) -> list[TextContent]:
         asyncio.run_coroutine_threadsafe(
             _channel_client.send_summary(summary), _event_loop)
         return [TextContent(type="text", text=f"Summary sent to monitor")]
+    return [TextContent(type="text", text="Error: not connected")]
+
+
+def _handle_spawn_session(args: dict) -> list[TextContent]:
+    name = args["name"]
+    tag = args.get("tag", "")
+    if _channel_client and _channel_client.ws and _event_loop:
+        asyncio.run_coroutine_threadsafe(
+            _channel_client.send_spawn(name, tag), _event_loop)
+        return [TextContent(type="text", text=f"Spawn request sent for session '{name}'")]
+    return [TextContent(type="text", text="Error: not connected")]
+
+
+def _handle_kill_session(args: dict) -> list[TextContent]:
+    name = args["name"]
+    if _channel_client and _channel_client.ws and _event_loop:
+        asyncio.run_coroutine_threadsafe(
+            _channel_client.send_kill(name), _event_loop)
+        return [TextContent(type="text", text=f"Kill request sent for session '{name}'")]
+    return [TextContent(type="text", text="Error: not connected")]
+
+
+def _handle_list_sessions(args: dict) -> list[TextContent]:
+    if _channel_client and _channel_client.ws and _event_loop:
+        asyncio.run_coroutine_threadsafe(
+            _channel_client.send_list_sessions(), _event_loop)
+        return [TextContent(type="text", text="Session list requested")]
     return [TextContent(type="text", text="Error: not connected")]
 
 

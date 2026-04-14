@@ -489,34 +489,14 @@ class ChannelServer:
             # ACK reaction (tracked for removal after reply)
             threading.Thread(target=self._send_reaction, args=(msg_id,), kwargs={"track": True}, daemon=True).start()
 
-            # Parse text / files
-            text = ""
-            file_path = ""
+            # Parse message content via extensible parser registry
+            from feishu.message_parsers import parse_message
             msg_type = message.message_type or "text"
-            if msg_type == "text":
-                try:
-                    text = json.loads(message.content or "{}").get("text", "")
-                except Exception:
-                    pass
-            elif msg_type == "post":
-                try:
-                    parsed = json.loads(message.content or "{}")
-                    parts = [parsed.get("title", "")]
-                    for para in parsed.get("content", []):
-                        for node in para or []:
-                            if node.get("text"):
-                                parts.append(node["text"])
-                    text = " ".join(p for p in parts if p)
-                except Exception:
-                    pass
-            elif msg_type in ("file", "image", "audio", "media"):
-                file_path = self._download_feishu_file(msg_id, message)
-                if file_path:
-                    text = f"[File received: {file_path}]"
-                else:
-                    text = f"({msg_type} message — download failed)"
-            if not text:
-                text = f"({msg_type} message)"
+            try:
+                content_json = json.loads(message.content or "{}")
+            except Exception:
+                content_json = {}
+            text, file_path = parse_message(msg_type, content_json, message, self)
 
             chat_id = message.chat_id or ""
             ts = datetime.now(tz=timezone.utc).isoformat()

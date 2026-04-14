@@ -1,0 +1,29 @@
+# Role definitions and user-to-role mapping for 管理小龙虾 CC sessions.
+# cc-openclaw.sh reads this file to determine permissions and chat_id routing.
+
+roles:
+  superadmin:
+    description: "总管理员，完整权限"
+
+  operator:
+    description: "运营管理员，只读+数据查询"
+
+  monitor:
+    description: "管理群监控 agent，只读"
+
+users:
+  linyilun:
+    role: superadmin
+    open_id: "ou_6b11faf8e93aedfb9d3857b9cc23b9e7"
+    display_name: "林懿伦"
+
+# To add a new user:
+# username:
+#   role: operator
+#   open_id: "ou_xxx"
+#   display_name: "Name"
+
+group:
+  chat_id: "oc_e75a27e1cb30a93a700014dd7d014b6c"
+  display_name: "龙虾管理群"
+  role: monitor

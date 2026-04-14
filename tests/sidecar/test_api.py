@@ -15,6 +15,7 @@ def mock_db():
     db = AsyncMock()
     db.get_permission.return_value = None
     db.get_agent_by_open_id.return_value = None
+    db.get_agent_by_chat_id.return_value = None
     db.check_deny_rate.return_value = True
     db.list_agents.return_value = []
     db.query_audit_log.return_value = []
@@ -142,6 +143,49 @@ async def test_resolve_sender_authorized_provisioning(client, mock_db):
     assert resp.status == 200
     body = await resp.json()
     assert body["action"] == "retry_later"
+
+
+# ── resolve-sender (group via chat_id) ─────────────────────────────
+
+
+async def test_resolve_sender_group_no_agent(client, mock_db):
+    """Group chat_id with no existing agent gets provision_group action."""
+    mock_db.get_agent_by_chat_id.return_value = None
+
+    resp = await client.post("/api/v1/resolve-sender", json={"chat_id": "oc_group1"})
+    assert resp.status == 200
+    body = await resp.json()
+    assert body["action"] == "provision_group"
+    mock_db.get_agent_by_chat_id.assert_awaited_once_with("oc_group1")
+
+
+async def test_resolve_sender_group_active_agent(client, mock_db):
+    """Group chat_id with existing agent gets active action."""
+    mock_db.get_agent_by_chat_id.return_value = {
+        "agent_id": "g-shared-oc_group1",
+        "status": "active",
+    }
+
+    resp = await client.post("/api/v1/resolve-sender", json={"chat_id": "oc_group1"})
+    assert resp.status == 200
+    body = await resp.json()
+    assert body["action"] == "active"
+    mock_db.get_agent_by_chat_id.assert_awaited_once_with("oc_group1")
+
+
+# ── provision-group ────────────────────────────────────────────────
+
+
+async def test_provision_group_calls_provisioner(client, mock_provisioner):
+    """POST /provision-group calls provisioner.provision_group and returns agent_id."""
+    mock_provisioner.provision_group.return_value = "g-shared-oc_group1"
+
+    resp = await client.post("/api/v1/provision-group", json={"chat_id": "oc_group1"})
+    assert resp.status == 200
+    body = await resp.json()
+    assert body["ok"] is True
+    assert body["agent_id"] == "g-shared-oc_group1"
+    mock_provisioner.provision_group.assert_awaited_once_with("oc_group1")
 
 
 # ── provision ───────────────────────────────────────────────────────

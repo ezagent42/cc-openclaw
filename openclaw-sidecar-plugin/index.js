@@ -31,6 +31,63 @@ export default {
       const sessionKey = ctx.sessionKey || event.sessionKey || "";
       if (!sessionKey.includes("fallback")) return;
 
+      // ── Group messages ───────────────────────────────────────────
+      if (event.isGroup) {
+        const conversationId = ctx.conversationId || event.conversationId;
+        if (!conversationId) {
+          api.logger.warn("before_dispatch: group message without conversationId, skipping");
+          return;
+        }
+
+        api.logger.info(`Intercepting fallback group message in ${conversationId}`);
+
+        try {
+          const resolveResp = await fetch(`${sidecarUrl}/api/v1/resolve-sender`, {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ chat_id: conversationId }),
+          });
+
+          if (!resolveResp.ok) {
+            api.logger.error(`resolve-sender (group) failed: ${resolveResp.status}`);
+            return { handled: true, text: "系统维护中，请稍后重试" };
+          }
+
+          const { action } = await resolveResp.json();
+          api.logger.info(`resolve-sender (group): ${conversationId} → ${action}`);
+
+          if (action === "active") {
+            // Group agent exists — let normal routing handle it
+            return;
+          }
+
+          if (action === "provision_group") {
+            const provResp = await fetch(`${sidecarUrl}/api/v1/provision-group`, {
+              method: "POST",
+              headers: { "Content-Type": "application/json" },
+              body: JSON.stringify({ chat_id: conversationId }),
+            });
+            if (provResp.ok) {
+              api.logger.info(`Provisioned group agent for ${conversationId}`);
+              return {
+                handled: true,
+                text: "群助手正在准备中，请稍后再 @ 我",
+              };
+            }
+            api.logger.error(`provision-group failed: ${provResp.status}`);
+            return { handled: true, text: "系统维护中，请稍后重试" };
+          }
+
+          // Other actions (deny, retry_later, etc.) — don't intercept
+          api.logger.warn(`Unexpected group action: ${action}`);
+          return;
+        } catch (err) {
+          api.logger.error(`Sidecar API error (group): ${err.message}`);
+          return;
+        }
+      }
+
+      // ── DM messages ─────────────────────────────────────────────
       const senderId = ctx.senderId || event.senderId;
       if (!senderId) {
         api.logger.warn("before_dispatch: no senderId, skipping");

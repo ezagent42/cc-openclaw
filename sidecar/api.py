@@ -30,6 +30,16 @@ def _is_authorized(perm: dict | None) -> bool:
 async def _resolve_sender(request: web.Request) -> web.Response:
     db = request.app[_db_key]
     body = await request.json()
+
+    # ── Group resolution (chat_id provided) ──────────────────────
+    chat_id: str | None = body.get("chat_id")
+    if chat_id is not None:
+        agent = await db.get_agent_by_chat_id(chat_id)
+        if agent is not None:
+            return web.json_response({"action": "active"})
+        return web.json_response({"action": "provision_group"})
+
+    # ── DM resolution (open_id provided) ─────────────────────────
     open_id: str = body["open_id"]
 
     perm = await db.get_permission(open_id)
@@ -63,6 +73,15 @@ async def _provision(request: web.Request) -> web.Response:
     display_name = perm["display_name"] if perm else open_id
 
     agent_id = await provisioner.provision_user(open_id, display_name)
+    return web.json_response({"ok": True, "agent_id": agent_id})
+
+
+async def _provision_group(request: web.Request) -> web.Response:
+    provisioner = request.app[_provisioner_key]
+    body = await request.json()
+    chat_id: str = body["chat_id"]
+
+    agent_id = await provisioner.provision_group(chat_id)
     return web.json_response({"ok": True, "agent_id": agent_id})
 
 
@@ -168,6 +187,7 @@ def create_app(
 
     app.router.add_post("/api/v1/resolve-sender", _resolve_sender)
     app.router.add_post("/api/v1/provision", _provision)
+    app.router.add_post("/api/v1/provision-group", _provision_group)
     app.router.add_post("/api/v1/restore", _restore)
     app.router.add_get("/api/v1/agents", _list_agents)
     app.router.add_get("/api/v1/audit-log", _audit_log)

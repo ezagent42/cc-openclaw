@@ -1,0 +1,36 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>ai.openclaw.channel-server</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>/opt/homebrew/bin/uv</string>
+        <string>run</string>
+        <string>python3</string>
+        <string>feishu/channel_server.py</string>
+    </array>
+    <key>WorkingDirectory</key>
+    <string>/Users/h2oslabs/cc-openclaw</string>
+    <key>RunAtLoad</key>
+    <true/>
+    <key>KeepAlive</key>
+    <true/>
+    <key>StandardOutPath</key>
+    <string>/Users/h2oslabs/.openclaw/logs/channel-server.log</string>
+    <key>StandardErrorPath</key>
+    <string>/Users/h2oslabs/.openclaw/logs/channel-server.err.log</string>
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>PATH</key>
+        <string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin</string>
+        <key>ADMIN_CHAT_ID</key>
+        <string>oc_d9b47511b085e9d5b66c4595b3ef9bb9</string>
+        <key>http_proxy</key>
+        <string>http://127.0.0.1:7897</string>
+        <key>https_proxy</key>
+        <string>http://127.0.0.1:7897</string>
+    </dict>
+</dict>
+</plist>

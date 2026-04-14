@@ -55,19 +55,44 @@ class ChannelClient:
     """WebSocket client that connects to channel-server.py."""
 
     def __init__(self, server_url="ws://localhost:9999", chat_ids=None,
-                 instance_id="", runtime_mode="discussion"):
+                 instance_id="", runtime_mode="discussion",
+                 pidfile_path=None):
         self.server_url = server_url
+        self._pidfile_path = pidfile_path
         self.chat_ids = chat_ids or ["*"]
         self.instance_id = instance_id or f"channel-{os.getpid()}"
         self.runtime_mode = runtime_mode
         self.ws = None
         self._message_queue: asyncio.Queue = asyncio.Queue()
 
+    def _resolve_server_url(self) -> str:
+        """Re-read the PID file to get the latest port (handles server restarts)."""
+        if not self._pidfile_path:
+            return self.server_url
+        try:
+            pidfile = Path(self._pidfile_path)
+            if pidfile.exists():
+                parts = pidfile.read_text().strip().split(":")
+                port = int(parts[1])
+                url = f"ws://localhost:{port}"
+                if url != self.server_url:
+                    log.info("channel-server port changed: %s → %s", self.server_url, url)
+                    self.server_url = url
+                return url
+        except Exception as e:
+            log.warning("Failed to read pidfile: %s", e)
+        return self.server_url
+
     async def connect(self):
-        """Connect to channel-server with auto-reconnect."""
+        """Connect to channel-server with auto-reconnect.
+
+        On each reconnect attempt, re-reads the PID file to pick up
+        a new port if channel-server was restarted.
+        """
         while True:
             try:
-                async with websockets.connect(self.server_url) as ws:
+                url = self._resolve_server_url()
+                async with websockets.connect(url) as ws:
                     self.ws = ws
                     await self._register(ws)
                     await self._message_loop(ws)
@@ -323,6 +348,7 @@ async def main():
         server_url=server_url,
         chat_ids=chat_ids,
         runtime_mode=os.environ.get("OPENCLAW_RUNTIME_MODE", "discussion"),
+        pidfile_path=str(pidfile),
     )
 
     server = create_server()

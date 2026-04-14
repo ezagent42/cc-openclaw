@@ -1101,10 +1101,9 @@ async def _async_main() -> None:
 
     admin_chat_id = os.environ.get("ADMIN_CHAT_ID")
     feishu_enabled = os.environ.get("FEISHU_ENABLED", "true").lower() in ("true", "1", "yes")
-    server_port = int(os.environ.get("CHANNEL_SERVER_PORT", "9800"))
 
     server = ChannelServer(
-        port=server_port,
+        port=0,
         feishu_enabled=feishu_enabled,
         admin_chat_id=admin_chat_id,
     )

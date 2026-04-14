@@ -125,6 +125,32 @@ registerCommand("/logs", {
   },
 });
 
+registerCommand("/broadcast", {
+  description: "向所有活跃用户群发 DM（用法: /broadcast 消息内容）",
+  adminOnly: true,
+  handler: async (event, ctx, sidecarUrl) => {
+    const content = (event.content || "").trim();
+    const message = content.replace(/^\/broadcast\s*/i, "").trim();
+    if (!message) return "用法: /broadcast 消息内容";
+
+    const actor = ctx.senderId || event.senderId || "";
+    const resp = await fetch(`${sidecarUrl}/api/v1/admin/broadcast`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ message, actor }),
+    });
+
+    if (resp.status === 403) return "❌ 权限不足，仅管理员可执行群发";
+    if (resp.status === 503) return "❌ 广播服务未配置";
+    if (!resp.ok) return `❌ 群发失败 (${resp.status})`;
+
+    const { sent, failed } = await resp.json();
+    const lines = [`✅ 群发完成: 成功 ${sent.length} 人`];
+    if (failed.length > 0) lines.push(`⚠️ 失败 ${failed.length} 人`);
+    return lines.join("\n");
+  },
+});
+
 // ---------------------------------------------------------------------------
 // Main Plugin
 // ---------------------------------------------------------------------------

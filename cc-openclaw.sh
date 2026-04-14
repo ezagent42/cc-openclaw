@@ -43,6 +43,306 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # Feishu credentials for channel.py (loaded from .feishu-credentials.json)
 # No lark-cli needed — uses lark_oapi SDK directly
 
+# --- Role management helpers (requires uv + pyyaml) ---
+
+ROLES_FILE="$SCRIPT_DIR/roles/roles.yaml"
+
+parse_roles_yaml() {
+    local user="$1"
+    uv run python3 -c "
+import yaml, sys
+with open('$ROLES_FILE') as f:
+    data = yaml.safe_load(f)
+user = data.get('users', {}).get('$user')
+if not user:
+    sys.exit(1)
+print(f'ROLE={user[\"role\"]}')
+print(f'OPEN_ID={user[\"open_id\"]}')
+print(f'DISPLAY_NAME={user.get(\"display_name\", \"$user\")}')
+" 2>/dev/null
+}
+
+get_group_config() {
+    uv run python3 -c "
+import yaml
+with open('$ROLES_FILE') as f:
+    data = yaml.safe_load(f)
+group = data.get('group', {})
+print(f'GROUP_CHAT_ID={group.get(\"chat_id\", \"\")}')
+print(f'GROUP_DISPLAY_NAME={group.get(\"display_name\", \"\")}')
+print(f'GROUP_ROLE={group.get(\"role\", \"monitor\")}')
+" 2>/dev/null
+}
+
+get_superadmin_name() {
+    uv run python3 -c "
+import yaml
+with open('$ROLES_FILE') as f:
+    data = yaml.safe_load(f)
+for name, info in data.get('users', {}).items():
+    if info.get('role') == 'superadmin':
+        print(info.get('display_name', name))
+        break
+" 2>/dev/null
+}
+
+list_users() {
+    uv run python3 -c "
+import yaml
+with open('$ROLES_FILE') as f:
+    data = yaml.safe_load(f)
+for name, info in data.get('users', {}).items():
+    print(f'  {name:20s} role={info[\"role\"]:15s} {info.get(\"display_name\", \"\")}')
+" 2>/dev/null
+}
+
+get_chat_id_for_user() {
+    local open_id="$1"
+    uv run python3 -c "
+import json, sys
+try:
+    with open('$SCRIPT_DIR/.workspace/chat_id_map.json') as f:
+        m = json.load(f)
+    cid = m.get('$open_id', '')
+    if cid:
+        print(cid)
+    else:
+        sys.exit(1)
+except:
+    sys.exit(1)
+" 2>/dev/null
+}
+
+render_claude_md() {
+    local template="$1"
+    local output="$2"
+    local username="$3"
+    local display_name="$4"
+    local role="$5"
+    local superadmin_name
+    superadmin_name=$(get_superadmin_name)
+    eval "$(get_group_config)"
+
+    sed -e "s|{{USERNAME}}|$username|g" \
+        -e "s|{{DISPLAY_NAME}}|$display_name|g" \
+        -e "s|{{ROLE}}|$role|g" \
+        -e "s|{{WORKSPACE_DIR}}|$SCRIPT_DIR|g" \
+        -e "s|{{SUPERADMIN_DISPLAY_NAME}}|${superadmin_name:-总管理员}|g" \
+        -e "s|{{GROUP_DISPLAY_NAME}}|${GROUP_DISPLAY_NAME:-管理群}|g" \
+        -e "s|{{GROUP_CHAT_ID}}|${GROUP_CHAT_ID:-}|g" \
+        "$template" > "$output"
+}
+
+# --- CLI argument parsing ---
+CLI_ACTION=""
+CLI_TARGET=""
+
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --user)   CLI_ACTION="user";   CLI_TARGET="$2"; shift 2 ;;
+        --group)  CLI_ACTION="group";  shift ;;
+        --list)   CLI_ACTION="list";   shift ;;
+        --status) CLI_ACTION="status"; shift ;;
+        --stop)   CLI_ACTION="stop";   CLI_TARGET="$2"; shift 2 ;;
+        --help|-h) CLI_ACTION="help";  shift ;;
+        *) break ;;  # Unknown args pass through to existing logic
+    esac
+done
+
+SESSION_NAME="cc-openclaw"
+
+if [ "$CLI_ACTION" = "help" ]; then
+    cat <<'HELP'
+Usage: cc-openclaw.sh [OPTIONS]
+
+Multi-user CC session manager.
+
+Options:
+  --user <name>       Start a CC session for the specified user (from roles/roles.yaml)
+  --group             Start the admin group monitor session
+  --list              List all configured users and roles
+  --status            Show running CC sessions
+  --stop <name>       Stop a user's CC session
+  --help              Show this help
+
+  (no arguments)      Interactive mode selection (existing behavior)
+
+Examples:
+  cc-openclaw.sh --user <username>    Start a user's session
+  cc-openclaw.sh --group              Start admin group monitor
+  cc-openclaw.sh --list               List configured users
+  cc-openclaw.sh --status             Show active sessions
+  cc-openclaw.sh --stop <username>    Stop a session
+HELP
+    exit 0
+fi
+
+if [ "$CLI_ACTION" = "list" ]; then
+    echo "📋 Configured users (roles/roles.yaml):"
+    echo ""
+    list_users
+    echo ""
+    echo "Group monitor:"
+    eval "$(get_group_config)"
+    echo "  chat_id=$GROUP_CHAT_ID  display_name=$GROUP_DISPLAY_NAME  role=$GROUP_ROLE"
+    exit 0
+fi
+
+if [ "$CLI_ACTION" = "status" ]; then
+    if tmux has-session -t "$SESSION_NAME" 2>/dev/null; then
+        echo "📊 Running CC sessions (tmux: $SESSION_NAME):"
+        echo ""
+        tmux list-windows -t "$SESSION_NAME" -F "  #{window_name}"
+    else
+        echo "No active tmux session '$SESSION_NAME'"
+    fi
+    exit 0
+fi
+
+if [ "$CLI_ACTION" = "stop" ]; then
+    if [ -z "$CLI_TARGET" ]; then
+        echo "❌ Usage: cc-openclaw.sh --stop <username>"
+        exit 1
+    fi
+    if tmux has-session -t "$SESSION_NAME" 2>/dev/null; then
+        tmux kill-window -t "$SESSION_NAME:$CLI_TARGET" 2>/dev/null && \
+            echo "✓ Stopped session: $CLI_TARGET" || \
+            echo "❌ No active session: $CLI_TARGET"
+    else
+        echo "❌ No active tmux session"
+    fi
+    exit 0
+fi
+
+if [ "$CLI_ACTION" = "user" ]; then
+    if [ -z "$CLI_TARGET" ]; then
+        echo "❌ Usage: cc-openclaw.sh --user <username>"
+        exit 1
+    fi
+
+    ROLE_INFO=$(parse_roles_yaml "$CLI_TARGET")
+    if [ $? -ne 0 ]; then
+        echo "❌ User '$CLI_TARGET' not found in roles/roles.yaml"
+        exit 1
+    fi
+    eval "$ROLE_INFO"
+
+    echo "🦞 Starting CC session: $DISPLAY_NAME ($CLI_TARGET)"
+    echo "   Role: $ROLE"
+
+    CHAT_ID=$(get_chat_id_for_user "$OPEN_ID")
+    if [ -z "$CHAT_ID" ]; then
+        echo "⚠️  No chat_id mapping found for $CLI_TARGET."
+        echo "   The user needs to DM the bot first to register their chat_id."
+        echo "   Then retry this command."
+        exit 1
+    fi
+    echo "   Chat ID: $CHAT_ID"
+
+    mkdir -p "$SCRIPT_DIR/.workspace/$CLI_TARGET"
+
+    # Render CLAUDE.md template
+    ROLE_DIR="$SCRIPT_DIR/roles/$ROLE"
+    if [ -f "$ROLE_DIR/CLAUDE.md" ]; then
+        render_claude_md "$ROLE_DIR/CLAUDE.md" "$SCRIPT_DIR/.workspace/$CLI_TARGET/CLAUDE.md" "$CLI_TARGET" "$DISPLAY_NAME" "$ROLE"
+        echo "   CLAUDE.md: rendered from roles/$ROLE/CLAUDE.md"
+    fi
+
+    # Ensure tmux session
+    tmux has-session -t "$SESSION_NAME" 2>/dev/null || tmux new-session -d -s "$SESSION_NAME"
+
+    # Check if already running
+    if tmux list-windows -t "$SESSION_NAME" -F "#{window_name}" 2>/dev/null | grep -q "^${CLI_TARGET}$"; then
+        echo "⚠️  Session '$CLI_TARGET' already running. Attaching..."
+        tmux select-window -t "$SESSION_NAME:$CLI_TARGET"
+        tmux attach-session -t "$SESSION_NAME"
+        exit 0
+    fi
+
+    # Check channel_server
+    PIDFILE="$SCRIPT_DIR/.channel-server.pid"
+    if [ ! -f "$PIDFILE" ]; then
+        echo "❌ channel-server not running!"
+        exit 1
+    fi
+
+    # Source local config
+    LOCAL_SH="$SCRIPT_DIR/cc-openclaw.local.sh"
+    [ -f "$LOCAL_SH" ] && source "$LOCAL_SH"
+
+    # Build claude command with env vars
+    SETTINGS_FILE="roles/$ROLE/settings.json"
+    CLAUDE_CMD="cd $SCRIPT_DIR && OPENCLAW_CHAT_ID=$CHAT_ID OPENCLAW_USER=$CLI_TARGET OPENCLAW_ROLE=$ROLE"
+    CLAUDE_CMD="$CLAUDE_CMD claude --permission-mode bypassPermissions"
+    CLAUDE_CMD="$CLAUDE_CMD --dangerously-load-development-channels server:openclaw-channel"
+    CLAUDE_CMD="$CLAUDE_CMD --mcp-config .mcp.json"
+    [ -f "$SCRIPT_DIR/$SETTINGS_FILE" ] && CLAUDE_CMD="$CLAUDE_CMD --settings $SETTINGS_FILE"
+
+    tmux new-window -t "$SESSION_NAME" -n "$CLI_TARGET" "$CLAUDE_CMD" \; \
+        run-shell "sleep 3" \; \
+        send-keys Enter
+
+    echo "✓ Session started: $CLI_TARGET (tmux window)"
+    echo "   Attach: tmux attach -t $SESSION_NAME"
+    exit 0
+fi
+
+if [ "$CLI_ACTION" = "group" ]; then
+    eval "$(get_group_config)"
+    if [ -z "$GROUP_CHAT_ID" ]; then
+        echo "❌ No group.chat_id in roles/roles.yaml"
+        exit 1
+    fi
+
+    CLI_TARGET="monitor"
+    ROLE="$GROUP_ROLE"
+    CHAT_ID="$GROUP_CHAT_ID"
+    DISPLAY_NAME="$GROUP_DISPLAY_NAME"
+
+    echo "🦞 Starting group monitor session"
+    echo "   Role: $ROLE"
+    echo "   Group: $GROUP_DISPLAY_NAME ($CHAT_ID)"
+
+    mkdir -p "$SCRIPT_DIR/.workspace/$CLI_TARGET"
+
+    ROLE_DIR="$SCRIPT_DIR/roles/$ROLE"
+    if [ -f "$ROLE_DIR/CLAUDE.md" ]; then
+        render_claude_md "$ROLE_DIR/CLAUDE.md" "$SCRIPT_DIR/.workspace/$CLI_TARGET/CLAUDE.md" "$CLI_TARGET" "$DISPLAY_NAME" "$ROLE"
+    fi
+
+    tmux has-session -t "$SESSION_NAME" 2>/dev/null || tmux new-session -d -s "$SESSION_NAME"
+
+    if tmux list-windows -t "$SESSION_NAME" -F "#{window_name}" 2>/dev/null | grep -q "^${CLI_TARGET}$"; then
+        echo "⚠️  Monitor session already running."
+        exit 0
+    fi
+
+    PIDFILE="$SCRIPT_DIR/.channel-server.pid"
+    if [ ! -f "$PIDFILE" ]; then
+        echo "❌ channel-server not running!"
+        exit 1
+    fi
+
+    LOCAL_SH="$SCRIPT_DIR/cc-openclaw.local.sh"
+    [ -f "$LOCAL_SH" ] && source "$LOCAL_SH"
+
+    SETTINGS_FILE="roles/$ROLE/settings.json"
+    CLAUDE_CMD="cd $SCRIPT_DIR && OPENCLAW_CHAT_ID=$CHAT_ID OPENCLAW_USER=$CLI_TARGET OPENCLAW_ROLE=$ROLE"
+    CLAUDE_CMD="$CLAUDE_CMD claude --permission-mode bypassPermissions"
+    CLAUDE_CMD="$CLAUDE_CMD --dangerously-load-development-channels server:openclaw-channel"
+    CLAUDE_CMD="$CLAUDE_CMD --mcp-config .mcp.json"
+    [ -f "$SCRIPT_DIR/$SETTINGS_FILE" ] && CLAUDE_CMD="$CLAUDE_CMD --settings $SETTINGS_FILE"
+
+    tmux new-window -t "$SESSION_NAME" -n "$CLI_TARGET" "$CLAUDE_CMD" \; \
+        run-shell "sleep 3" \; \
+        send-keys Enter
+
+    echo "✓ Monitor session started (tmux window: $CLI_TARGET)"
+    exit 0
+fi
+
+# --- If no CLI_ACTION, fall through to existing interactive mode ---
+
 # Get project name from directory (sanitize for tmux session name)
 PROJECT_NAME=$(basename "$SCRIPT_DIR" | tr '[:upper:]' '[:lower:]' | sed 's/[^a-z0-9_-]/-/g')
 

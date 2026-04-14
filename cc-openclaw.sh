@@ -270,9 +270,10 @@ if [ "$CLI_ACTION" = "user" ]; then
     LOCAL_SH="$SCRIPT_DIR/cc-openclaw.local.sh"
     [ -f "$LOCAL_SH" ] && source "$LOCAL_SH"
 
-    # Build claude command with env vars
+    # Build claude command with env vars (source local.sh inside tmux for proxy/env)
     SETTINGS_FILE="roles/$ROLE/settings.json"
-    CLAUDE_CMD="cd $SCRIPT_DIR && OPENCLAW_CHAT_ID=$CHAT_ID OPENCLAW_USER=$CLI_TARGET OPENCLAW_ROLE=$ROLE"
+    CLAUDE_CMD="cd $SCRIPT_DIR && [ -f cc-openclaw.local.sh ] && source cc-openclaw.local.sh;"
+    CLAUDE_CMD="$CLAUDE_CMD OPENCLAW_CHAT_ID=$CHAT_ID OPENCLAW_USER=$CLI_TARGET OPENCLAW_ROLE=$ROLE"
     CLAUDE_CMD="$CLAUDE_CMD claude --permission-mode bypassPermissions"
     CLAUDE_CMD="$CLAUDE_CMD --dangerously-load-development-channels server:openclaw-channel"
     CLAUDE_CMD="$CLAUDE_CMD --mcp-config .mcp.json"
@@ -327,7 +328,8 @@ if [ "$CLI_ACTION" = "group" ]; then
     [ -f "$LOCAL_SH" ] && source "$LOCAL_SH"
 
     SETTINGS_FILE="roles/$ROLE/settings.json"
-    CLAUDE_CMD="cd $SCRIPT_DIR && OPENCLAW_CHAT_ID=$CHAT_ID OPENCLAW_USER=$CLI_TARGET OPENCLAW_ROLE=$ROLE"
+    CLAUDE_CMD="cd $SCRIPT_DIR && [ -f cc-openclaw.local.sh ] && source cc-openclaw.local.sh;"
+    CLAUDE_CMD="$CLAUDE_CMD OPENCLAW_CHAT_ID=$CHAT_ID OPENCLAW_USER=$CLI_TARGET OPENCLAW_ROLE=$ROLE"
     CLAUDE_CMD="$CLAUDE_CMD claude --permission-mode bypassPermissions"
     CLAUDE_CMD="$CLAUDE_CMD --dangerously-load-development-channels server:openclaw-channel"
     CLAUDE_CMD="$CLAUDE_CMD --mcp-config .mcp.json"

@@ -2,15 +2,19 @@
 
 from __future__ import annotations
 
+import logging
 from typing import TYPE_CHECKING
 
 from aiohttp import web
 
 from sidecar.db import Database
 from sidecar.provisioner import Provisioner
+from sidecar.reconciler import FeishuGroupAPI
 
 if TYPE_CHECKING:
     from sidecar.feishu_events import FeishuEventHandler
+
+log = logging.getLogger(__name__)
 
 DENY_MESSAGE = "您没有权限使用本助手，如需使用请联系管理员"
 
@@ -18,6 +22,9 @@ _db_key = web.AppKey("db", Database)
 _provisioner_key = web.AppKey("provisioner", Provisioner)
 _event_handler_key: web.AppKey["FeishuEventHandler | None"] = web.AppKey(
     "event_handler",
+)
+_feishu_api_key: web.AppKey["FeishuGroupAPI | None"] = web.AppKey(
+    "feishu_api",
 )
 
 
@@ -154,17 +161,76 @@ async def _event_group_disbanded(request: web.Request) -> web.Response:
     return web.json_response({"ok": True})
 
 
+# ── Admin batch operations ────────────────────────────────────────
+
+
+async def _batch_provision(request: web.Request) -> web.Response:
+    """Batch-provision agents for all authorized members of a Feishu group."""
+    feishu_api = request.app[_feishu_api_key]
+    if feishu_api is None:
+        return web.json_response(
+            {"error": "Feishu API not configured"}, status=503,
+        )
+
+    body = await request.json()
+    chat_id: str = body["chat_id"]
+
+    db = request.app[_db_key]
+    provisioner = request.app[_provisioner_key]
+
+    members = await feishu_api.get_group_members(chat_id)
+
+    provisioned: list[str] = []
+    skipped: list[dict] = []
+    errors: list[dict] = []
+
+    for member in members:
+        open_id = member["open_id"]
+        name = member.get("name", open_id)
+
+        # Check if authorized
+        perm = await db.get_permission(open_id)
+        if not _is_authorized(perm):
+            skipped.append({"open_id": open_id, "reason": "not_authorized"})
+            continue
+
+        # Check if agent already exists
+        agent = await db.get_agent_by_open_id(open_id)
+        if agent and agent["status"] == "active":
+            skipped.append({"open_id": open_id, "reason": "already_active"})
+            continue
+
+        try:
+            if agent and agent["status"] == "suspended":
+                await provisioner.restore_user(open_id)
+            else:
+                await provisioner.provision_user(open_id, name)
+            provisioned.append(open_id)
+        except Exception as e:
+            log.warning("batch-provision failed for %s: %s", open_id, e)
+            errors.append({"open_id": open_id, "error": str(e)})
+
+    return web.json_response({
+        "ok": True,
+        "provisioned": provisioned,
+        "skipped": skipped,
+        "errors": errors,
+    })
+
+
 def create_app(
     *,
     db: Database,
     provisioner: Provisioner,
     event_handler: "FeishuEventHandler | None" = None,
+    feishu_api: "FeishuGroupAPI | None" = None,
 ) -> web.Application:
     """Create aiohttp app with all routes registered."""
     app = web.Application()
     app[_db_key] = db
     app[_provisioner_key] = provisioner
     app[_event_handler_key] = event_handler
+    app[_feishu_api_key] = feishu_api
 
     app.router.add_post("/api/v1/resolve-sender", _resolve_sender)
     app.router.add_post("/api/v1/provision", _provision)
@@ -172,6 +238,7 @@ def create_app(
     app.router.add_get("/api/v1/agents", _list_agents)
     app.router.add_get("/api/v1/audit-log", _audit_log)
     app.router.add_post("/api/v1/admin/reset-agent", _admin_reset_agent)
+    app.router.add_post("/api/v1/admin/batch-provision", _batch_provision)
 
     # Feishu event forwarding (from channel_server)
     app.router.add_post("/api/v1/event/member-added", _event_member_added)

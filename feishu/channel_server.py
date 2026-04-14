@@ -51,6 +51,8 @@ class Instance:
 class ChannelServer:
     """Local WebSocket server that routes messages between instances."""
 
+    CHAT_ID_MAP_PATH = Path(__file__).resolve().parent.parent / ".workspace" / "chat_id_map.json"
+
     def __init__(
         self,
         *,
@@ -68,6 +70,7 @@ class ChannelServer:
             "SIDECAR_URL", "http://127.0.0.1:18791"
         )
         self.pidfile = PROJECT_ROOT / ".channel-server.pid"
+        self._chat_id_map = self._load_chat_id_map()
 
         # Route tables
         self.exact_routes: dict[str, Instance] = {}      # chat_id -> Instance
@@ -79,6 +82,34 @@ class ChannelServer:
         self._stop_event = asyncio.Event()
         self._server: websockets.asyncio.server.Server | None = None
         self._tasks: list[asyncio.Task] = []
+
+    # ------------------------------------------------------------------
+    # Chat ID mapping persistence
+    # ------------------------------------------------------------------
+
+    def _load_chat_id_map(self) -> dict:
+        """Read chat_id map from disk. Returns {} if file doesn't exist."""
+        try:
+            if self.CHAT_ID_MAP_PATH.exists():
+                return json.loads(self.CHAT_ID_MAP_PATH.read_text())
+        except Exception as e:
+            log.warning("Failed to load chat_id map: %s", e)
+        return {}
+
+    def _save_chat_id_map(self) -> None:
+        """Write chat_id map to disk."""
+        try:
+            self.CHAT_ID_MAP_PATH.parent.mkdir(parents=True, exist_ok=True)
+            self.CHAT_ID_MAP_PATH.write_text(json.dumps(self._chat_id_map, indent=2, ensure_ascii=False))
+        except Exception as e:
+            log.warning("Failed to save chat_id map: %s", e)
+
+    def _record_chat_id(self, open_id: str, chat_id: str) -> None:
+        """Record a user's DM chat_id if not already known."""
+        if open_id not in self._chat_id_map:
+            self._chat_id_map[open_id] = chat_id
+            self._save_chat_id_map()
+            log.info("Recorded chat_id mapping: %s → %s", open_id[:16], chat_id)
 
     # ------------------------------------------------------------------
     # Public lifecycle
@@ -451,6 +482,25 @@ class ChannelServer:
             .build()
         )
 
+        # Load admin group members for unrouted DM handling
+        self._admin_group_members = set()
+        admin_group_id = os.environ.get("ADMIN_GROUP_CHAT_ID", "")
+        if admin_group_id:
+            try:
+                req = lark.RawRequest.builder().http_method(lark.HttpMethod.GET).uri(
+                    f"/open-apis/im/v1/chats/{admin_group_id}/members"
+                ).token_types({lark.AccessTokenType.TENANT}).build()
+                resp = self._feishu_client.request(req)
+                if resp.success():
+                    data = json.loads(resp.raw.content)
+                    for m in data.get("data", {}).get("items", []):
+                        mid = m.get("member_id", "")
+                        if mid:
+                            self._admin_group_members.add(mid)
+                    log.info("Loaded %d admin group members", len(self._admin_group_members))
+            except Exception as e:
+                log.warning("Failed to load admin group members: %s", e)
+
         # --- per-instance mutable state (avoid class-var sharing) ---
         self._seen = set()
         self._recent_sent = set()
@@ -499,6 +549,12 @@ class ChannelServer:
             text, file_path = parse_message(msg_type, content_json, message, self)
 
             chat_id = message.chat_id or ""
+
+            # Record DM chat_id for cc-openclaw.sh --user routing
+            chat_type = message.chat_type or ""
+            if chat_type == "p2p" and sender_id:
+                self._record_chat_id(sender_id, chat_id)
+
             ts = datetime.now(tz=timezone.utc).isoformat()
             if message.create_time:
                 try:
@@ -924,7 +980,16 @@ class ChannelServer:
                 source, user, chat_id,
             )
         elif routed_instance is None and not self.wildcard_instances:
-            log.warning("No route for chat_id=%s, message dropped", chat_id)
+            user = message.get("user", "")
+            open_id = message.get("user_id", "")
+            if open_id and hasattr(self, '_admin_group_members') and open_id in self._admin_group_members:
+                log.info("Unrouted DM from admin member %s — session not started", user)
+                msg_chat_id = message.get("chat_id", "")
+                if msg_chat_id:
+                    text = "您的管理 session 尚未启动，请联系总管理员开启。"
+                    await self._reply_feishu(msg_chat_id, text)
+            else:
+                log.warning("No route for chat_id=%s, message dropped", message.get("chat_id", "?"))
 
     # ------------------------------------------------------------------
     # Message handlers

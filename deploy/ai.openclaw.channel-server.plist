@@ -27,6 +27,8 @@
         <string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin</string>
         <key>ADMIN_CHAT_ID</key>
         <string>oc_d9b47511b085e9d5b66c4595b3ef9bb9</string>
+        <key>ADMIN_GROUP_CHAT_ID</key>
+        <string>oc_e75a27e1cb30a93a700014dd7d014b6c</string>
         <key>http_proxy</key>
         <string>http://127.0.0.1:7897</string>
         <key>https_proxy</key>

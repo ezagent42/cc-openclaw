@@ -9,3 +9,4 @@ sidecar-config.yaml
 *.sqlite
 .workspace/
 .claude/worktrees/
+node_modules/

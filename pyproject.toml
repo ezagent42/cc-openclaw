@@ -29,6 +29,7 @@ voice = [
     "livekit-plugins-silero",
     "httpx",
     "aiohttp",
+    "livekit-api>=1.1.0",
 ]
 
 [tool.hatch.build.targets.wheel]

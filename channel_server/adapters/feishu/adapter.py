@@ -225,8 +225,16 @@ class FeishuAdapter:
 
         msg = Message(
             sender=f"feishu_user:{user_id}" if user_id else "feishu_user:unknown",
-            type=msg_type,
-            payload={"text": text, "chat_id": chat_id, "message_id": message_id},
+            payload={
+                # --- content (message body) ---
+                "text": text,
+                "file_path": event.get("file_path", ""),
+                # --- addressing (routing metadata) ---
+                "chat_id": chat_id,
+                "message_id": message_id,
+                # --- discriminator (content format) ---
+                "msg_type": msg_type,
+            },
             metadata={
                 "user": user,
                 "user_id": user_id,
@@ -243,15 +251,7 @@ class FeishuAdapter:
     # ------------------------------------------------------------------
 
     def _handle_chat_transport(self, actor: Actor, payload: dict) -> None:
-        """Send message to a Feishu chat (main conversation).
-
-        Dispatches based on payload type:
-        - text -> _send_message
-        - send_file -> _send_file
-        - react -> _send_reaction
-        - tool_card_update -> _update_card
-        """
-        ptype = payload.get("type", "text")
+        action = payload.get("action")
         chat_id = actor.transport.config["chat_id"] if actor.transport else ""
 
         # Remove ACK reaction for the last inbound message in this chat
@@ -259,91 +259,54 @@ class FeishuAdapter:
         if last_msg:
             threading.Thread(target=self._remove_reaction, args=(last_msg,), daemon=True).start()
 
-        if ptype == "text":
+        if action is None:
+            # Default: send text message
             text = payload.get("text", "")
-            threading.Thread(
-                target=self._send_message,
-                args=(chat_id, text, None),
-                daemon=True,
-            ).start()
-        elif ptype == "send_file":
-            file_path = payload.get("file_path", "")
-            threading.Thread(
-                target=self._send_file,
-                args=(chat_id, file_path),
-                daemon=True,
-            ).start()
-        elif ptype == "react":
+            threading.Thread(target=self._send_message, args=(chat_id, text, None), daemon=True).start()
+        elif action == "react":
             message_id = payload.get("message_id", "")
             emoji_type = payload.get("emoji_type", "THUMBSUP")
-            threading.Thread(
-                target=self._send_reaction,
-                args=(message_id, emoji_type),
-                daemon=True,
-            ).start()
-        elif ptype == "tool_card_update":
+            threading.Thread(target=self._send_reaction, args=(message_id, emoji_type), daemon=True).start()
+        elif action == "send_file":
+            file_path = payload.get("file_path", "")
+            threading.Thread(target=self._send_file, args=(payload.get("chat_id", chat_id), file_path), daemon=True).start()
+        elif action == "tool_notify":
             msg_id = payload.get("card_msg_id", "")
             text = payload.get("text", "")
-            threading.Thread(
-                target=self._update_card,
-                args=(msg_id, text),
-                daemon=True,
-            ).start()
+            threading.Thread(target=self._update_card, args=(msg_id, text), daemon=True).start()
+        else:
+            log.warning("_handle_chat_transport: unhandled action=%s actor=%s", action, actor.address)
 
     def _handle_thread_transport(self, actor: Actor, payload: dict) -> None:
-        """Send message to a Feishu thread.
-
-        Similar dispatch as chat but uses thread anchor for reply_in_thread.
-        Also handles: update_title -> _update_anchor_card
-        """
         config = actor.transport.config if actor.transport else {}
         chat_id = config.get("chat_id", "")
         root_id = config.get("root_id", "")
-        ptype = payload.get("type", "text")
+        action = payload.get("action")
 
-        # Remove ACK reaction for the last inbound message in this chat
         last_msg = self._last_msg_id.pop(chat_id, "")
         if last_msg:
             threading.Thread(target=self._remove_reaction, args=(last_msg,), daemon=True).start()
 
-        if ptype == "text":
+        if action is None:
             text = payload.get("text", "")
-            threading.Thread(
-                target=self._send_message,
-                args=(chat_id, text, root_id),
-                daemon=True,
-            ).start()
-        elif ptype == "send_file":
-            file_path = payload.get("file_path", "")
-            threading.Thread(
-                target=self._send_file,
-                args=(chat_id, file_path),
-                daemon=True,
-            ).start()
-        elif ptype == "react":
+            threading.Thread(target=self._send_message, args=(chat_id, text, root_id), daemon=True).start()
+        elif action == "react":
             message_id = payload.get("message_id", "")
             emoji_type = payload.get("emoji_type", "THUMBSUP")
-            threading.Thread(
-                target=self._send_reaction,
-                args=(message_id, emoji_type),
-                daemon=True,
-            ).start()
-        elif ptype == "update_title":
+            threading.Thread(target=self._send_reaction, args=(message_id, emoji_type), daemon=True).start()
+        elif action == "send_file":
+            file_path = payload.get("file_path", "")
+            threading.Thread(target=self._send_file, args=(payload.get("chat_id", chat_id), file_path), daemon=True).start()
+        elif action == "update_title":
             msg_id = payload.get("msg_id", "")
             title = payload.get("title", "")
-            threading.Thread(
-                target=self._update_anchor_card,
-                args=(msg_id, title),
-                daemon=True,
-            ).start()
-        elif ptype == "tool_card_update":
+            threading.Thread(target=self._update_anchor_card, args=(msg_id, title), daemon=True).start()
+        elif action == "tool_notify":
             msg_id = payload.get("card_msg_id", "")
             text = payload.get("text", "")
-            threading.Thread(
-                target=self._update_card,
-                args=(msg_id, text),
-                daemon=True,
-            ).start()
+            threading.Thread(target=self._update_card, args=(msg_id, text), daemon=True).start()
+        else:
+            log.warning("_handle_thread_transport: unhandled action=%s actor=%s", action, actor.address)
 
     # ------------------------------------------------------------------
     # Feishu API methods (blocking — run in threads)

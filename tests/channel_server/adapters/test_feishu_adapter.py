@@ -30,12 +30,14 @@ def feishu_event(
     user_id: str = "ou_alice",
     root_id: str | None = None,
     msg_type: str = "text",
+    file_path: str = "",
 ) -> dict:
     """Build a minimal Feishu message event dict."""
     evt: dict = {
         "chat_id": chat_id,
         "message_id": message_id,
         "text": text,
+        "file_path": file_path,
         "user": user,
         "user_id": user_id,
         "msg_type": msg_type,
@@ -97,11 +99,15 @@ def test_on_feishu_event_sends_message():
     assert not mailbox.empty()
     msg = mailbox.get_nowait()
     assert isinstance(msg, Message)
-    assert msg.type == "text"
+    # Content fields in payload
     assert msg.payload["text"] == "hello"
+    assert msg.payload["msg_type"] == "text"
+    assert msg.payload["file_path"] == ""
+    assert msg.payload["chat_id"] == "oc_abc123"
+    assert msg.payload["message_id"] == "msg_001"
+    # Metadata preserved
     assert msg.metadata["user"] == "Alice"
     assert msg.metadata["user_id"] == "ou_alice"
-    assert msg.metadata["message_id"] == "msg_001"
 
 
 # ---------------------------------------------------------------------------
@@ -158,6 +164,21 @@ def test_on_feishu_event_thread_transport():
 
 # ---------------------------------------------------------------------------
 # 8. dedup set is bounded (max 10K entries)
+# ---------------------------------------------------------------------------
+
+def test_on_feishu_event_includes_file_path():
+    adapter, rt = make_adapter()
+    evt = feishu_event(msg_type="image", file_path="/tmp/downloads/photo.png")
+    adapter.on_feishu_event(evt)
+
+    addr = "feishu:oc_abc123"
+    msg = rt.mailboxes[addr].get_nowait()
+    assert msg.payload["msg_type"] == "image"
+    assert msg.payload["file_path"] == "/tmp/downloads/photo.png"
+
+
+# ---------------------------------------------------------------------------
+# 9. dedup set is bounded (max 10K entries)
 # ---------------------------------------------------------------------------
 
 def test_dedup_set_bounded():

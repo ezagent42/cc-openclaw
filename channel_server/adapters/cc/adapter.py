@@ -192,6 +192,18 @@ class CCAdapter:
         payload = dict(msg)
         payload["command"] = msg_type  # CCSessionHandler dispatches on 'command'
 
+        # Inject parent_feishu for send_summary so the handler can route correctly
+        if msg_type == "send_summary":
+            actor = self.runtime.lookup(address)
+            if actor and actor.parent:
+                parent = self.runtime.lookup(actor.parent)
+                if parent:
+                    parent_feishu = next(
+                        (d for d in parent.downstream if d.startswith("feishu:")), ""
+                    )
+                    if parent_feishu:
+                        payload["parent_feishu"] = parent_feishu
+
         actor_msg = Message(
             sender=address,
             type=msg_type,

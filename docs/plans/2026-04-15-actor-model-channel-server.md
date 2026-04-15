@@ -2210,3 +2210,462 @@ Run a Bash command → verify tool card appears in correct location (main chat f
 git add -A
 git commit -m "feat(actor): actor model channel server — complete migration"
 ```
+
+---
+
+## Addendum: Review Fixes (post code-review)
+
+The following tasks address critical gaps and warnings identified by independent code review. They should be implemented in the order listed, after the original 10 tasks (or interleaved where noted).
+
+---
+
+### Task 11: Feishu WebSocket Event Listener (Critical — C1)
+
+**Context:** The original Task 5 (`FeishuAdapter`) provides `on_feishu_event()` but never implements the actual Feishu WebSocket connection that receives events. The existing `_run_feishu()` in `feishu/channel_server.py:694-1079` is ~380 lines handling the `lark_oapi.ws.client` setup, event registration, message parsing, and consumer loop. Without this, the server receives zero Feishu messages.
+
+**Files:**
+- Modify: `channel_server/adapters/feishu/adapter.py`
+- Test: `tests/channel_server/adapters/test_feishu_adapter.py`
+
+**Insert after Task 5, Step 3.**
+
+- [ ] **Step 1: Migrate Feishu WS client startup into FeishuAdapter**
+
+Port from `feishu/channel_server.py` lines 694-770 (event handler registration) and lines 940-1079 (consumer loop + Feishu WS thread). Key methods to add to `FeishuAdapter`:
+
+```python
+def start_feishu_ws(self):
+    """Start the Feishu WebSocket listener in a background thread.
+    
+    Mirrors the existing _run_feishu() logic:
+    1. Load credentials from .feishu-credentials.json
+    2. Register lark_oapi event handlers (on_message, on_member_added, etc.)
+    3. Start lark_oapi.ws.client in a daemon thread
+    4. Run consumer loop that calls on_feishu_event() for each message
+    """
+    ...
+
+def _on_feishu_message(self, message, event) -> None:
+    """lark_oapi callback: parse message type, extract text/file, build event dict.
+    
+    Port from feishu/channel_server.py lines 730-870.
+    Uses parsers from channel_server/adapters/feishu/parsers.py.
+    """
+    ...
+```
+
+- [ ] **Step 2: Add message deduplication (W7)**
+
+Port `_seen` set (bounded deque or set with max 10K entries) from existing code:
+
+```python
+def on_feishu_event(self, event: dict) -> None:
+    msg_id = event.get("message_id", "")
+    # Dedup: skip already-seen messages
+    if msg_id in self._seen:
+        return
+    self._seen.add(msg_id)
+    if len(self._seen) > 10000:
+        # Trim oldest entries (use collections.OrderedDict or deque)
+        ...
+    # ... rest of existing on_feishu_event logic
+```
+
+- [ ] **Step 3: Add ACK reaction flow (C3)**
+
+```python
+def on_feishu_event(self, event: dict) -> None:
+    # ... after dedup check, before routing to actor
+    msg_id = event.get("message_id", "")
+    if msg_id:
+        self._send_ack_reaction(msg_id)
+    # ... route to actor
+
+def _send_ack_reaction(self, message_id: str) -> None:
+    """Send 'OnIt' reaction to indicate message received."""
+    ...
+
+def remove_ack_reaction(self, message_id: str) -> None:
+    """Remove ACK reaction after CC replies. Called from outbound transport."""
+    ...
+```
+
+Wire `remove_ack_reaction` into `_handle_chat_transport` and `_handle_thread_transport` so it fires when the reply goes out.
+
+- [ ] **Step 4: Test Feishu WS startup**
+
+```python
+async def test_feishu_ws_start_with_mock_client(adapter):
+    """Verify start_feishu_ws initializes event handlers."""
+    adapter.feishu_client = MagicMock()
+    # Should not raise; we can't test full WS connection without Feishu
+    # but verify the setup doesn't crash
+```
+
+- [ ] **Step 5: Commit**
+
+```bash
+git add channel_server/adapters/feishu/adapter.py tests/channel_server/adapters/test_feishu_adapter.py
+git commit -m "feat(actor): Feishu WS event listener + dedup + ACK reactions"
+```
+
+---
+
+### Task 12: Migrate Parser Dependencies (Critical — C2)
+
+**Context:** `parsers.py` calls `server._download_feishu_file()`, `server._download_feishu_image_by_key()`, and `server._resolve_user()`. These must exist on `FeishuAdapter`.
+
+**Files:**
+- Modify: `channel_server/adapters/feishu/adapter.py`
+- Modify: `channel_server/adapters/feishu/parsers.py`
+
+- [ ] **Step 1: Port file download methods to FeishuAdapter**
+
+Migrate from `feishu/channel_server.py`:
+- `_download_feishu_file()` (lines 462-525) → `FeishuAdapter.download_file()`
+- `_download_feishu_image_by_key()` (lines 527-559) → `FeishuAdapter.download_image_by_key()`
+
+- [ ] **Step 2: Update parsers.py to reference FeishuAdapter**
+
+Change the `server` parameter type hint in parser functions from `ChannelServer` to `FeishuAdapter`. The `TYPE_CHECKING` import block should reference the new class. Method names may differ — update calls accordingly:
+- `server._download_feishu_file(msg_id, message)` → `server.download_file(msg_id, message)`
+- `server._download_feishu_image_by_key(msg_id, image_key)` → `server.download_image_by_key(msg_id, image_key)`
+
+- [ ] **Step 3: Test parser integration**
+
+```python
+def test_parse_image_message_calls_download(adapter):
+    """Verify image parser invokes adapter.download_file()."""
+    ...
+
+def test_parse_post_with_inline_image(adapter):
+    """Verify post parser invokes adapter.download_image_by_key()."""
+    ...
+```
+
+- [ ] **Step 4: Commit**
+
+```bash
+git add channel_server/adapters/feishu/
+git commit -m "feat(actor): migrate file download + parser dependencies to FeishuAdapter"
+```
+
+---
+
+### Task 13: Admin Actor and Notifications (Critical — C4, W6)
+
+**Context:** The existing system handles `/help`, `/status`, `/inject`, `/explain` as admin commands and sends notifications (instance connect/disconnect, session spawn/kill) to the admin chat. These need an actor representation.
+
+**Files:**
+- Modify: `channel_server/core/handler.py` — add `AdminHandler`
+- Modify: `channel_server/app.py` — spawn `system:admin` actor on startup
+- Test: `tests/channel_server/core/test_handler.py`
+
+- [ ] **Step 1: Implement AdminHandler**
+
+```python
+class AdminHandler:
+    """Handles admin commands (/help, /status, /inject) and admin notifications."""
+
+    def handle(self, actor: Actor, msg: Message) -> list[Action]:
+        text = msg.payload.get("text", "").strip()
+
+        if msg.type == "system":
+            # Admin notification (instance connected, session spawned, etc.)
+            # Forward to downstream (admin feishu actor) as-is
+            return [Send(to=addr, message=msg) for addr in actor.downstream]
+
+        if not text.startswith("/"):
+            # Non-command: forward to downstream for CC to handle
+            return [Send(to=addr, message=msg) for addr in actor.downstream]
+
+        if text == "/help":
+            help_text = "..."  # Generate help text
+            reply = Message(sender=actor.address, type="text",
+                           payload={"text": help_text})
+            return [Send(to=addr, message=reply) for addr in actor.downstream]
+
+        if text == "/status":
+            # Status requires runtime access — use metadata to pass runtime ref
+            status_text = actor.metadata.get("status_fn", lambda: "No status")()
+            reply = Message(sender=actor.address, type="text",
+                           payload={"text": status_text})
+            return [Send(to=addr, message=reply) for addr in actor.downstream]
+
+        # Unknown command
+        cmd = text.split()[0]
+        reply = Message(sender=actor.address, type="text",
+                       payload={"text": f"未知命令: {cmd}\n发送 /help 查看可用命令"})
+        return [Send(to=addr, message=reply) for addr in actor.downstream]
+```
+
+- [ ] **Step 2: Register AdminHandler**
+
+Add to `HANDLER_REGISTRY`:
+```python
+"admin": AdminHandler(),
+```
+
+- [ ] **Step 3: Spawn admin actor in app.py startup**
+
+```python
+# In ChannelServerApp.start():
+if self.admin_chat_id:
+    admin_feishu_addr = f"feishu:{self.admin_chat_id}"
+    self.runtime.spawn(
+        "system:admin", handler="admin", tag="admin",
+        downstream=[admin_feishu_addr],
+    )
+```
+
+- [ ] **Step 4: Wire admin notifications**
+
+Add a `notify_admin(text)` method to `ChannelServerApp` that sends a system message to `system:admin`:
+```python
+def notify_admin(self, text: str):
+    self.runtime.send("system:admin", Message(
+        sender="system:runtime", type="system",
+        payload={"text": text},
+    ))
+```
+
+Call this on: instance connect/disconnect, session spawn/kill, server start/stop.
+
+- [ ] **Step 5: Commit**
+
+```bash
+git add channel_server/core/handler.py channel_server/app.py tests/
+git commit -m "feat(actor): admin actor — /help, /status, admin notifications"
+```
+
+---
+
+### Task 14: Complete CCSessionHandler Commands (Critical — C5, W3)
+
+**Context:** `CCSessionHandler` only handles reply/forward/send_summary/update_title. Missing: send_file, react, spawn_session, kill_session, list_sessions. Also, send_summary's `parent_feishu` is never injected (W2).
+
+**Files:**
+- Modify: `channel_server/core/handler.py`
+- Modify: `channel_server/adapters/cc/adapter.py`
+- Test: `tests/channel_server/core/test_handler.py`
+
+- [ ] **Step 1: Fix send_summary parent_feishu resolution (W2)**
+
+The handler cannot resolve parent_feishu on its own — it needs to know the parent's downstream feishu actor. Two options:
+- (A) CC adapter injects `parent_feishu` into the message payload by looking up the parent actor's downstream
+- (B) Handler accesses runtime to look up parent (breaks pure function pattern)
+
+Choose (A): In `CCAdapter.handle_message()`, when command is `send_summary`:
+
+```python
+if msg_type == "send_summary":
+    # Resolve parent's feishu actor for summary routing
+    address = self._ws_to_address.get(id(ws))
+    actor = self.runtime.lookup(address)
+    if actor and actor.parent:
+        parent = self.runtime.lookup(actor.parent)
+        if parent:
+            parent_feishu = next((d for d in parent.downstream if d.startswith("feishu:")), "")
+            msg["parent_feishu"] = parent_feishu
+```
+
+- [ ] **Step 2: Add send_file handler branch**
+
+```python
+if command == "send_file":
+    chat_id = msg.payload.get("chat_id", "")
+    file_path = msg.payload.get("file_path", "")
+    return [TransportSend(payload={"type": "send_file", "chat_id": chat_id, "file_path": file_path})]
+```
+
+- [ ] **Step 3: Add react handler branch**
+
+```python
+if command == "react":
+    message_id = msg.payload.get("message_id", "")
+    emoji_type = msg.payload.get("emoji_type", "THUMBSUP")
+    return [TransportSend(payload={"type": "react", "message_id": message_id, "emoji_type": emoji_type})]
+```
+
+- [ ] **Step 4: Route spawn/kill/list through CC adapter directly**
+
+These are session management commands that require runtime + adapter coordination, not pure handler logic. In `CCAdapter.handle_message()`, handle them directly instead of routing through the actor:
+
+```python
+if msg_type == "spawn_session":
+    await self._handle_spawn(ws, msg)
+    return
+elif msg_type == "kill_session":
+    await self._handle_kill(ws, msg)
+    return
+elif msg_type == "list_sessions":
+    await self._handle_list(ws, msg)
+    return
+```
+
+Implement `_handle_spawn`, `_handle_kill`, `_handle_list` in `CCAdapter`, following the spec's spawn/kill flow (using `runtime.spawn()`, `feishu_adapter.create_thread_anchor()`, `kill_cc_process()`, etc.).
+
+- [ ] **Step 5: Add Feishu transport handlers for send_file and react**
+
+In `FeishuAdapter`, add handling for `send_file` and `react` payload types in the transport callbacks.
+
+- [ ] **Step 6: Tests**
+
+```python
+def test_cc_session_send_file():
+    ...
+
+def test_cc_session_react():
+    ...
+
+def test_send_summary_with_resolved_parent_feishu():
+    ...
+```
+
+- [ ] **Step 7: Commit**
+
+```bash
+git add channel_server/core/handler.py channel_server/adapters/ tests/
+git commit -m "feat(actor): complete CC handler — send_file, react, spawn/kill, fix send_summary"
+```
+
+---
+
+### Task 15: Startup Notifications and Chat ID Map (Suggestions — S3, S4)
+
+**Files:**
+- Modify: `channel_server/app.py`
+- Modify: `channel_server/adapters/feishu/adapter.py`
+
+- [ ] **Step 1: Port startup notification**
+
+Migrate from `feishu/channel_server.py` lines 991-1048. On startup, send a message to all known users:
+
+```python
+# In ChannelServerApp.start(), after all adapters initialized:
+if self.feishu_adapter:
+    self.feishu_adapter.send_startup_notifications(self.admin_chat_id)
+```
+
+- [ ] **Step 2: Port chat_id_map recording**
+
+Migrate `_record_chat_id()` into `FeishuAdapter.on_feishu_event()`:
+
+```python
+def on_feishu_event(self, event):
+    # ... existing logic
+    # Record chat_id mapping for user discovery
+    open_id = event.get("user_id", "")
+    chat_id = event.get("chat_id", "")
+    if open_id and chat_id:
+        self._record_chat_id(open_id, chat_id)
+```
+
+- [ ] **Step 3: Commit**
+
+```bash
+git add channel_server/
+git commit -m "feat(actor): startup notifications + chat_id map recording"
+```
+
+---
+
+### Task 16: Improve Test Coverage (Suggestion — S1)
+
+**Files:**
+- Modify: `tests/channel_server/core/test_runtime.py`
+- Modify: `tests/channel_server/test_integration.py`
+
+- [ ] **Step 1: Add error path tests**
+
+```python
+async def test_actor_loop_handler_error_notifies_parent(runtime):
+    """Handler raises → parent receives error message."""
+    # Register a bad handler that always raises
+    from channel_server.core.handler import HANDLER_REGISTRY, Handler
+    class BadHandler:
+        def handle(self, actor, msg):
+            raise ValueError("test error")
+    HANDLER_REGISTRY["bad"] = BadHandler()
+
+    runtime.spawn("parent", handler="forward_all", tag="p")
+    runtime.spawn("child", handler="bad", tag="c", parent="parent")
+    task = asyncio.create_task(runtime.run())
+
+    runtime.send("child", Message(sender="x", type="text", payload={}))
+    await asyncio.sleep(0.2)
+
+    # Parent should have received error message
+    parent_mailbox = runtime.mailboxes["parent"]
+    assert not parent_mailbox.empty()
+    err = parent_mailbox.get_nowait()
+    assert err.type == "error"
+
+    await runtime.shutdown()
+    await task
+    HANDLER_REGISTRY.pop("bad")
+
+
+async def test_max_errors_stops_actor(runtime):
+    """10 consecutive errors → actor state: ended."""
+    from channel_server.core.handler import HANDLER_REGISTRY
+    class BadHandler:
+        def handle(self, actor, msg):
+            raise ValueError("boom")
+    HANDLER_REGISTRY["bad"] = BadHandler()
+
+    runtime.spawn("doomed", handler="bad", tag="d")
+    task = asyncio.create_task(runtime.run())
+
+    for _ in range(15):
+        runtime.send("doomed", Message(sender="x", type="text", payload={}))
+    await asyncio.sleep(1.0)
+
+    assert runtime.lookup("doomed").state == "ended"
+
+    await runtime.shutdown()
+    await task
+    HANDLER_REGISTRY.pop("bad")
+```
+
+- [ ] **Step 2: Fix integration test transport mock (S7)**
+
+```python
+async def test_end_to_end_feishu_to_cc():
+    # ... fix: attach transport with actual ws mock reference
+    mock_ws = AsyncMock()
+    runtime.attach("cc:linyilun.root", Transport(type="websocket", config={"ws": mock_ws}))
+    # ... verify mock_ws.send was called
+```
+
+- [ ] **Step 3: Commit**
+
+```bash
+git add tests/
+git commit -m "test(actor): add error path + integration test fixes"
+```
+
+---
+
+## Operational Notes
+
+### Multiple channel_server Instances
+
+The system runs multiple channel_server processes:
+- **PID 28334** — `feishu/channel_server.py` on port 55894 (this project, launchd: `ai.openclaw.channel-server`)
+- **PID 51867** — `channels/feishu/channel_server.py` on port 9999 (AutoService-Cinnox project)
+- **PID 48742** — `channels/feishu/channel_server.py` (AutoService-Cinnox project, stale?)
+
+**Migration rule:** Only restart `ai.openclaw.channel-server` (this project). Use `launchctl kickstart -k gui/$(id -u)/ai.openclaw.channel-server` — never `killall python3` or similar broad commands. The pidfile at `/Users/h2oslabs/cc-openclaw/.channel-server.pid` identifies our instance.
+
+### Slash Command Passthrough
+
+Session commands (`/spawn`, `/kill`, `/sessions`) must pass through the admin handler to reach CC actors. Update the admin actor's handler logic:
+
+```python
+# In AdminHandler.handle():
+session_commands = ("/spawn", "/kill", "/sessions")
+if text.startswith(session_commands):
+    # Pass through to downstream CC actor, not handled by admin
+    return [Send(to=addr, message=msg) for addr in actor.downstream]
+```

@@ -59,7 +59,7 @@ class ChannelServer:
     def __init__(
         self,
         *,
-        host: str = "localhost",
+        host: str = "127.0.0.1",
         port: int = 0,
         feishu_enabled: bool = True,
         admin_chat_id: str | None = None,
@@ -91,6 +91,10 @@ class ChannelServer:
 
         # Thread anchor persistence
         self._thread_anchors = self._load_thread_anchors()
+
+        # Tool notification threads (hook notifications routed to a dedicated thread)
+        self._tool_threads: dict[str, str] = {}  # chat_id -> card_msg_id
+        self._tool_history: dict[str, list[str]] = {}  # chat_id -> recent log lines
 
         # Child session process management
         self._child_processes: dict[str, subprocess.Popen] = {}  # instance_id -> Popen
@@ -167,12 +171,16 @@ class ChannelServer:
                 ReplyMessageRequest, ReplyMessageRequestBody,
             )
 
-            # Step 1: Send the anchor message
+            # Step 1: Send the anchor as an interactive card (cards can be updated via PATCH)
+            card = {
+                "header": {"title": {"tag": "plain_text", "content": f"🟢 [{tag}]"}, "template": "green"},
+                "elements": [{"tag": "div", "text": {"tag": "plain_text", "content": f"Session [{tag}] started — reply in this thread"}}],
+            }
             body = (
                 CreateMessageRequestBody.builder()
                 .receive_id(chat_id)
-                .msg_type("text")
-                .content(json.dumps({"text": f"🟢 Session [{tag}] started — reply in this thread"}))
+                .msg_type("interactive")
+                .content(json.dumps(card))
                 .build()
             )
             req = CreateMessageRequest.builder().receive_id_type("chat_id").request_body(body).build()
@@ -236,29 +244,35 @@ class ChannelServer:
             log.warning("Error pinning message: %s", e)
             return False
 
-    def _update_anchor_text(self, message_id: str, new_text: str) -> bool:
-        """Update the text content of a thread anchor message."""
+    def _update_anchor_text(self, message_id: str, title: str, body_text: str = "", template: str = "green") -> bool:
+        """Update the card content of a thread anchor message.
+
+        Args:
+            message_id: The anchor message ID.
+            title: Card header title (shown as topic title).
+            body_text: Optional card body text.
+            template: Card color template (green, blue, red, etc.).
+        """
         if not self._feishu_client:
             return False
         try:
             from lark_oapi.api.im.v1 import PatchMessageRequest, PatchMessageRequestBody
 
-            body = (
-                PatchMessageRequestBody.builder()
-                .msg_type("text")
-                .content(json.dumps({"text": new_text}))
-                .build()
-            )
+            card = {
+                "header": {"title": {"tag": "plain_text", "content": title}, "template": template},
+                "elements": [{"tag": "div", "text": {"tag": "plain_text", "content": body_text or title}}],
+            }
+            body = PatchMessageRequestBody.builder().content(json.dumps(card)).build()
             req = PatchMessageRequest.builder().message_id(message_id).request_body(body).build()
             resp = self._feishu_client.im.v1.message.patch(req)
             if resp.success():
-                log.info("Updated anchor text %s: %s", message_id, new_text[:60])
+                log.info("Updated anchor %s: %s", message_id, title[:60])
                 return True
             else:
                 log.warning("Failed to update anchor %s: %s", message_id, resp.msg)
                 return False
         except Exception as e:
-            log.warning("Error updating anchor text: %s", e)
+            log.warning("Error updating anchor: %s", e)
             return False
 
     def _remove_thread_anchor(self, instance_id: str) -> None:
@@ -522,6 +536,38 @@ class ChannelServer:
 
         except Exception as e:
             log.error("File download error: %s", e, exc_info=True)
+            return ""
+
+    def _download_feishu_image_by_key(self, message_id: str, image_key: str) -> str:
+        """Download an inline image from a post message by image_key.
+
+        Returns the local file path on success, empty string on failure.
+        """
+        if not self._feishu_client or not message_id or not image_key:
+            return ""
+        try:
+            import lark_oapi as lark
+
+            req = (
+                lark.BaseRequest.builder()
+                .http_method(lark.HttpMethod.GET)
+                .uri(f"/open-apis/im/v1/messages/{message_id}/resources/{image_key}?type=image")
+                .token_types({lark.AccessTokenType.TENANT})
+                .build()
+            )
+            resp = self._feishu_client.request(req)
+            if not resp.success():
+                log.warning("Inline image download failed: code=%s msg=%s", resp.code, resp.msg)
+                return ""
+
+            upload_dir = PROJECT_ROOT / ".openclaw" / "uploads" / "inline"
+            upload_dir.mkdir(parents=True, exist_ok=True)
+            dest = upload_dir / f"{image_key}.png"
+            dest.write_bytes(resp.raw.content)
+            log.info("Downloaded inline image → %s (%d bytes)", dest, len(resp.raw.content))
+            return str(dest)
+        except Exception as e:
+            log.error("Inline image download error: %s", e, exc_info=True)
             return ""
 
     # -- Admin message handling -----------------------------------------
@@ -1016,10 +1062,12 @@ class ChannelServer:
 
                 chat_id = msg.get("chat_id", "")
 
-                # Admin group: intercept slash commands, pass through normal messages
+                # Admin group: intercept server slash commands, pass through session commands
                 if self.admin_chat_id and chat_id == self.admin_chat_id:
                     text = msg.get("text", "").strip()
-                    if text.startswith("/"):
+                    # Session commands (/spawn, /kill, /sessions) are forwarded to the CC session
+                    session_commands = ("/spawn", "/kill", "/sessions")
+                    if text.startswith("/") and not text.startswith(session_commands):
                         await self._handle_admin_message(msg)
                         continue
                     # Non-command messages in admin group → route normally
@@ -1058,6 +1106,10 @@ class ChannelServer:
                     await self._handle_forward(ws, msg)
                 elif msg_type == "send_summary":
                     await self._handle_send_summary(ws, msg)
+                elif msg_type == "update_title":
+                    await self._handle_update_title(ws, msg)
+                elif msg_type == "tool_notify":
+                    await self._handle_tool_notify(ws, msg)
                 elif msg_type == "message":
                     await self._handle_inbound_message(ws, msg)
                 elif msg_type == "spawn_session":
@@ -1170,18 +1222,36 @@ class ChannelServer:
         if inst is None:
             return
 
-        self.instances_by_id.pop(inst.instance_id, None)
+        instance_id = inst.instance_id
+        self.instances_by_id.pop(instance_id, None)
 
         # Clean up alias (e.g. "linyilun" alias for "linyilun.root")
-        if "." in inst.instance_id:
-            alias = inst.instance_id.split(".", 1)[0]
+        if "." in instance_id:
+            alias = instance_id.split(".", 1)[0]
             if self.instances_by_id.get(alias) is inst:
                 self.instances_by_id.pop(alias, None)
 
-        # Clean up thread routes (keep anchor in persistence for reconnect)
-        anchor_msg_id = self.session_threads.pop(inst.instance_id, None)
-        if anchor_msg_id:
-            self.thread_routes.pop(anchor_msg_id, None)
+        # For non-root child sessions: send end notification and remove anchor
+        if "." in instance_id and not instance_id.endswith(".root") and not instance_id.startswith("channel-"):
+            anchor = self._thread_anchors.get(instance_id, {})
+            anchor_msg_id = self.session_threads.get(instance_id)
+            display_tag = anchor.get("tag", instance_id.split(".", 1)[-1])
+            if anchor_msg_id:
+                chat_id = anchor.get("chat_id", "")
+                if chat_id:
+                    # Update anchor text to show ended
+                    self._update_anchor_text(anchor_msg_id, f"🔴 [{display_tag}] ended", template="red")
+                    # Notify in main chat
+                    asyncio.ensure_future(
+                        self._reply_feishu(chat_id, f"🔴 Session [{display_tag}] ended"))
+            self._remove_thread_anchor(instance_id)
+            asyncio.ensure_future(
+                self._notify_admin(f"Session ended: {instance_id}"))
+        else:
+            # Root/channel sessions: keep anchor for reconnect, just clean up routes
+            anchor_msg_id = self.session_threads.pop(instance_id, None)
+            if anchor_msg_id:
+                self.thread_routes.pop(anchor_msg_id, None)
 
         for cid in inst.chat_ids:
             if cid == "*":
@@ -1299,6 +1369,90 @@ class ChannelServer:
         else:
             log.warning("Reply for unknown channel prefix: chat_id=%s", chat_id)
 
+    def _create_tool_card(self, chat_id: str, text: str) -> str | None:
+        """Create an interactive card for tool notifications. Returns msg_id or None."""
+        if not self._feishu_client:
+            return None
+        try:
+            from lark_oapi.api.im.v1 import CreateMessageRequest, CreateMessageRequestBody
+
+            card = self._build_tool_card(text)
+            body = (
+                CreateMessageRequestBody.builder()
+                .receive_id(chat_id)
+                .msg_type("interactive")
+                .content(json.dumps(card))
+                .build()
+            )
+            req = CreateMessageRequest.builder().receive_id_type("chat_id").request_body(body).build()
+            resp = self._feishu_client.im.v1.message.create(req)
+            if resp.success() and resp.data and resp.data.message_id:
+                msg_id = resp.data.message_id
+                self._recent_sent.add(msg_id)
+                log.info("Created tool card for chat %s: %s", chat_id, msg_id)
+                return msg_id
+            log.warning("Failed to create tool card: %s", resp.msg if resp else "no response")
+            return None
+        except Exception as e:
+            log.warning("Error creating tool card: %s", e)
+            return None
+
+    def _build_tool_card(self, text: str) -> dict:
+        """Build a card JSON for tool notification display."""
+        return {
+            "header": {"title": {"tag": "plain_text", "content": "🔧 Tool Activity"}, "template": "grey"},
+            "elements": [{"tag": "div", "text": {"tag": "plain_text", "content": text}}],
+        }
+
+    def _update_tool_card(self, msg_id: str, text: str) -> bool:
+        """Update an existing tool notification card."""
+        if not self._feishu_client:
+            return False
+        try:
+            from lark_oapi.api.im.v1 import PatchMessageRequest, PatchMessageRequestBody
+
+            card = self._build_tool_card(text)
+            body = PatchMessageRequestBody.builder().content(json.dumps(card)).build()
+            req = PatchMessageRequest.builder().message_id(msg_id).request_body(body).build()
+            resp = self._feishu_client.im.v1.message.patch(req)
+            return resp.success()
+        except Exception:
+            return False
+
+    async def _handle_tool_notify(self, ws: ServerConnection, msg: dict) -> None:
+        """Show tool notifications in a single updatable card per chat_id."""
+        chat_id = msg.get("chat_id", "")
+        text = msg.get("text", "")
+        if not chat_id or not text:
+            return
+
+        # Append to recent log (keep last 5 lines)
+        history = self._tool_history.setdefault(chat_id, [])
+        history.append(text)
+        if len(history) > 5:
+            history[:] = history[-5:]
+        display = "\n".join(history)
+
+        card_id = self._tool_threads.get(chat_id)
+        if card_id:
+            # Update existing card
+            ok = await asyncio.get_event_loop().run_in_executor(
+                None, self._update_tool_card, card_id, display
+            )
+            if ok:
+                log.info("Tool card updated: %s", text[:60])
+                return
+            # Card might have been deleted — recreate
+            self._tool_threads.pop(chat_id, None)
+
+        # Create new card
+        card_id = await asyncio.get_event_loop().run_in_executor(
+            None, self._create_tool_card, chat_id, display
+        )
+        if card_id:
+            self._tool_threads[chat_id] = card_id
+            log.info("Tool card created: %s", text[:60])
+
     async def _handle_react(self, ws: ServerConnection, msg: dict) -> None:
         """Forward a reaction to Feishu API."""
         message_id = msg.get("message_id", "")
@@ -1405,7 +1559,7 @@ class ChannelServer:
         log.info("Forwarded message from %s → %s: %s", sender_id, target_id, text[:60])
 
     async def _handle_send_summary(self, ws: ServerConnection, msg: dict) -> None:
-        """Handle summary from a child session: update anchor text + notify root session in main chat."""
+        """Send a progress summary to the root session's main chat (for human eyes only)."""
         summary = msg.get("summary", "")
         sender = self._ws_to_instance.get(ws)
         if not sender:
@@ -1415,25 +1569,37 @@ class ChannelServer:
         instance_id = sender.instance_id
         tag = sender.tag_name or (instance_id.split(".", 1)[1] if "." in instance_id else instance_id)
 
-        # 1. Update thread anchor text to reflect current activity
-        anchor_msg_id = self.session_threads.get(instance_id)
-        if anchor_msg_id:
-            new_text = f"🟢 [{tag}] {summary}"
-            self._update_anchor_text(anchor_msg_id, new_text)
-
-        # 2. Send summary to root session's main chat (so user sees it without entering the thread)
+        # Send summary to root session's main chat (human-readable notification)
         if "." in instance_id:
             user = instance_id.split(".", 1)[0]
-            root_inst = self.instances_by_id.get(f"{user}.root") or self.instances_by_id.get(user)
-            if root_inst:
-                anchor = self._thread_anchors.get(instance_id, {})
-                chat_id = anchor.get("chat_id", "")
-                if chat_id:
-                    notification = f"📋 [{tag}] {summary}"
-                    await self._reply_feishu(chat_id, notification)
+            anchor = self._thread_anchors.get(instance_id, {})
+            chat_id = anchor.get("chat_id", "")
+            if chat_id:
+                notification = f"📋 [{tag}] {summary}"
+                await self._reply_feishu(chat_id, notification)
 
         await self._send(ws, {"type": "summary_ack", "ok": True})
         log.info("Summary from %s: %s", instance_id, summary[:60])
+
+    async def _handle_update_title(self, ws: ServerConnection, msg: dict) -> None:
+        """Update the session's thread anchor card title."""
+        title = msg.get("title", "")
+        sender = self._ws_to_instance.get(ws)
+        if not sender:
+            await self._send(ws, {"type": "update_title_ack", "ok": False, "error": "not registered"})
+            return
+
+        instance_id = sender.instance_id
+        tag = sender.tag_name or (instance_id.split(".", 1)[1] if "." in instance_id else instance_id)
+
+        anchor_msg_id = self.session_threads.get(instance_id)
+        if anchor_msg_id:
+            self._update_anchor_text(anchor_msg_id, f"🟢 [{tag}] {title}", template="blue")
+            await self._send(ws, {"type": "update_title_ack", "ok": True})
+            log.info("Title updated for %s: %s", instance_id, title[:60])
+        else:
+            await self._send(ws, {"type": "update_title_ack", "ok": False, "error": "no thread anchor"})
+            log.warning("No thread anchor for %s, cannot update title", instance_id)
 
     # ------------------------------------------------------------------
     # Session management (spawn / kill / list)
@@ -1529,13 +1695,28 @@ class ChannelServer:
                 await self._reply_feishu(chat_id, f"🔴 Session [{display_tag}] ended", thread_anchor_msg_id=anchor_msg_id)
 
         # Kill the tmux window (cc-openclaw.sh manages the process via tmux)
+        # Window names contain dots (e.g. "linyilun.dev") which tmux interprets
+        # as session.window separator, so we look up the window index first.
         window_name = f"{user}.{session_name}"
         try:
-            subprocess.run(
-                ["tmux", "kill-window", "-t", f"cc-openclaw:{window_name}"],
-                capture_output=True, timeout=5,
+            result = subprocess.run(
+                ["tmux", "list-windows", "-t", "cc-openclaw", "-F", "#{window_index}:#{window_name}"],
+                capture_output=True, text=True, timeout=5,
             )
-            log.info("Killed tmux window %s", window_name)
+            window_idx = None
+            for line in result.stdout.strip().splitlines():
+                idx, name = line.split(":", 1)
+                if name == window_name:
+                    window_idx = idx
+                    break
+            if window_idx:
+                subprocess.run(
+                    ["tmux", "kill-window", "-t", f"cc-openclaw:{window_idx}"],
+                    capture_output=True, timeout=5,
+                )
+                log.info("Killed tmux window %s (index %s)", window_name, window_idx)
+            else:
+                log.warning("Tmux window %s not found", window_name)
         except Exception as e:
             log.warning("Failed to kill tmux window %s: %s", window_name, e)
 
@@ -1547,7 +1728,9 @@ class ChannelServer:
             except Exception:
                 pass
 
-        # Clean up thread anchor and routes
+        # Update anchor card to show ended, then clean up
+        if anchor_msg_id:
+            self._update_anchor_text(anchor_msg_id, f"🔴 [{display_tag}] ended", template="red")
         self._remove_thread_anchor(child_id)
 
         await self._send(ws, {
@@ -1588,30 +1771,22 @@ class ChannelServer:
         await self._send(ws, {"type": "sessions_list", "text": "\n".join(lines)})
 
     async def _health_check_loop(self) -> None:
-        """Periodically check child processes and clean up dead ones."""
+        """Periodically clean up stale launcher processes (informational only).
+
+        Session liveness is determined by WebSocket connection, not launcher PID.
+        The cc-openclaw.sh launcher exits immediately after creating the tmux
+        window, so process polling cannot detect session end.  Actual cleanup
+        happens in _unregister() when the WebSocket disconnects.
+        """
         while not self._stop_event.is_set():
             try:
                 await asyncio.sleep(30)
-                dead = []
-                for child_id, proc in list(self._child_processes.items()):
-                    if proc.poll() is not None:
-                        dead.append(child_id)
-
-                for child_id in dead:
-                    log.info("Child process %s exited, cleaning up", child_id)
+                # Clean up finished launcher processes (just bookkeeping, no session cleanup)
+                for child_id in [
+                    cid for cid, proc in list(self._child_processes.items())
+                    if proc.poll() is not None
+                ]:
                     self._child_processes.pop(child_id, None)
-
-                    # Send end message in thread
-                    anchor_msg_id = self.session_threads.get(child_id)
-                    anchor = self._thread_anchors.get(child_id, {})
-                    display_tag = anchor.get("tag", child_id.split(".", 1)[-1] if "." in child_id else child_id)
-                    if anchor_msg_id:
-                        chat_id = anchor.get("chat_id", "")
-                        if chat_id:
-                            await self._reply_feishu(chat_id, f"🔴 Session [{display_tag}] ended (process exited)", thread_anchor_msg_id=anchor_msg_id)
-
-                    self._remove_thread_anchor(child_id)
-                    await self._notify_admin(f"Session ended (process exited): {child_id}")
             except asyncio.CancelledError:
                 break
             except Exception as e:

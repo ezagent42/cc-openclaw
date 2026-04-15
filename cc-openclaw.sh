@@ -119,6 +119,7 @@ render_claude_md() {
     local username="$3"
     local display_name="$4"
     local role="$5"
+    local session="${6:-root}"
     local superadmin_name
     superadmin_name=$(get_superadmin_name)
     eval "$(get_group_config)"
@@ -126,6 +127,9 @@ render_claude_md() {
     sed -e "s|{{USERNAME}}|$username|g" \
         -e "s|{{DISPLAY_NAME}}|$display_name|g" \
         -e "s|{{ROLE}}|$role|g" \
+        -e "s|{{SESSION}}|$session|g" \
+        -e "s|{{INSTANCE_ID}}|${username}.${session}|g" \
+        -e "s|{{ROOT_INSTANCE}}|${username}.root|g" \
         -e "s|{{WORKSPACE_DIR}}|$SCRIPT_DIR|g" \
         -e "s|{{SUPERADMIN_DISPLAY_NAME}}|${superadmin_name:-总管理员}|g" \
         -e "s|{{GROUP_DISPLAY_NAME}}|${GROUP_DISPLAY_NAME:-管理群}|g" \
@@ -252,12 +256,13 @@ if [ "$CLI_ACTION" = "user" ]; then
     fi
     echo "   Chat ID: $CHAT_ID"
 
-    mkdir -p "$SCRIPT_DIR/.workspace/$CLI_TARGET"
+    WORKSPACE_DIR="$SCRIPT_DIR/.workspace/$CLI_TARGET/$CLI_SESSION"
+    mkdir -p "$WORKSPACE_DIR"
 
-    # Render CLAUDE.md template
+    # Render CLAUDE.md template with session identity
     ROLE_DIR="$SCRIPT_DIR/roles/$ROLE"
     if [ -f "$ROLE_DIR/CLAUDE.md" ]; then
-        render_claude_md "$ROLE_DIR/CLAUDE.md" "$SCRIPT_DIR/.workspace/$CLI_TARGET/CLAUDE.md" "$CLI_TARGET" "$DISPLAY_NAME" "$ROLE"
+        render_claude_md "$ROLE_DIR/CLAUDE.md" "$WORKSPACE_DIR/CLAUDE.md" "$CLI_TARGET" "$DISPLAY_NAME" "$ROLE" "$CLI_SESSION"
         echo "   CLAUDE.md: rendered from roles/$ROLE/CLAUDE.md"
     fi
 
@@ -291,6 +296,7 @@ if [ "$CLI_ACTION" = "user" ]; then
     CLAUDE_CMD="$CLAUDE_CMD claude --permission-mode bypassPermissions"
     CLAUDE_CMD="$CLAUDE_CMD --dangerously-load-development-channels server:openclaw-channel"
     CLAUDE_CMD="$CLAUDE_CMD --mcp-config .mcp.json"
+    CLAUDE_CMD="$CLAUDE_CMD --add-dir $WORKSPACE_DIR"
     [ -f "$SCRIPT_DIR/$SETTINGS_FILE" ] && CLAUDE_CMD="$CLAUDE_CMD --settings $SETTINGS_FILE"
 
     tmux new-window -t "$SESSION_NAME" -n "$WINDOW_NAME" "$CLAUDE_CMD" \; \
@@ -321,11 +327,12 @@ if [ "$CLI_ACTION" = "group" ]; then
     echo "   Group: $GROUP_DISPLAY_NAME ($CHAT_ID)"
     [ -n "$CLI_TAG" ] && echo "   Tag: $CLI_TAG"
 
-    mkdir -p "$SCRIPT_DIR/.workspace/$CLI_TARGET"
+    WORKSPACE_DIR="$SCRIPT_DIR/.workspace/$CLI_TARGET/$CLI_SESSION"
+    mkdir -p "$WORKSPACE_DIR"
 
     ROLE_DIR="$SCRIPT_DIR/roles/$ROLE"
     if [ -f "$ROLE_DIR/CLAUDE.md" ]; then
-        render_claude_md "$ROLE_DIR/CLAUDE.md" "$SCRIPT_DIR/.workspace/$CLI_TARGET/CLAUDE.md" "$CLI_TARGET" "$DISPLAY_NAME" "$ROLE"
+        render_claude_md "$ROLE_DIR/CLAUDE.md" "$WORKSPACE_DIR/CLAUDE.md" "$CLI_TARGET" "$DISPLAY_NAME" "$ROLE" "$CLI_SESSION"
     fi
 
     tmux has-session -t "$SESSION_NAME" 2>/dev/null || tmux new-session -d -s "$SESSION_NAME"
@@ -351,6 +358,7 @@ if [ "$CLI_ACTION" = "group" ]; then
     CLAUDE_CMD="$CLAUDE_CMD claude --permission-mode bypassPermissions"
     CLAUDE_CMD="$CLAUDE_CMD --dangerously-load-development-channels server:openclaw-channel"
     CLAUDE_CMD="$CLAUDE_CMD --mcp-config .mcp.json"
+    CLAUDE_CMD="$CLAUDE_CMD --add-dir $WORKSPACE_DIR"
     [ -f "$SCRIPT_DIR/$SETTINGS_FILE" ] && CLAUDE_CMD="$CLAUDE_CMD --settings $SETTINGS_FILE"
 
     tmux new-window -t "$SESSION_NAME" -n "$WINDOW_NAME" "$CLAUDE_CMD" \; \

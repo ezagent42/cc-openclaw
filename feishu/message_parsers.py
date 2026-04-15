@@ -64,11 +64,31 @@ def _parse_text(content: dict, message, server) -> tuple[str, str]:
 @register_parser("post")
 def _parse_post(content: dict, message, server) -> tuple[str, str]:
     parts = [content.get("title", "")]
+    image_keys: list[str] = []
     for para in content.get("content", []):
         for node in para or []:
-            if node.get("text"):
-                parts.append(node["text"])
-    return " ".join(p for p in parts if p), ""
+            tag = node.get("tag", "")
+            if tag == "text" or node.get("text"):
+                parts.append(node.get("text", ""))
+            elif tag == "img":
+                image_keys.append(node.get("image_key", ""))
+
+    # Download the first inline image if present
+    file_path = ""
+    if image_keys and image_keys[0] and server:
+        msg_id = message.message_id or ""
+        image_key = image_keys[0]
+        try:
+            file_path = server._download_feishu_image_by_key(msg_id, image_key)
+        except Exception as e:
+            log.warning("Failed to download inline image: %s", e)
+        if not file_path:
+            parts.append(f"[图片: {image_key}]")
+    elif image_keys:
+        for ik in image_keys:
+            parts.append(f"[图片: {ik}]")
+
+    return " ".join(p for p in parts if p), file_path
 
 
 @register_parser("image", "file", "audio", "media")
@@ -206,7 +226,10 @@ def _parse_interactive(content: dict, message, server) -> tuple[str, str]:
                 parts.append(node.get("text", "") or node.get("href", ""))
             elif tag == "at":
                 parts.append(f"@{node.get('user_name', node.get('user_id', ''))}")
-            # img and other non-text tags are silently skipped
+            elif tag == "img":
+                parts.append(f"[图片: {node.get('image_key', 'unknown')}]")
+            elif tag:
+                parts.append(f"[{tag}]")
 
     _extract_from_nodes(elements)
 

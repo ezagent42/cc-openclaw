@@ -177,10 +177,17 @@ class ChannelClient:
             }))
 
     async def send_summary(self, text):
-        """Send summary: updates thread anchor text + notifies root session in main chat."""
+        """Send summary to root session's main chat (for human eyes)."""
         if self.ws:
             await self.ws.send(json.dumps({
                 "type": "send_summary", "summary": text,
+            }))
+
+    async def update_title(self, title):
+        """Update this session's thread anchor card title."""
+        if self.ws:
+            await self.ws.send(json.dumps({
+                "type": "update_title", "title": title,
             }))
 
     async def send_spawn(self, session_name, tag=None):
@@ -384,13 +391,24 @@ def register_tools(server: Server):
             ),
             Tool(
                 name="send_summary",
-                description="Send a summary: updates the session's thread topic title and notifies the root session in main chat so the user can see progress without entering the thread.",
+                description="Send a progress notification to the root session's main chat. The human user can see it without entering your thread. Root session's CC should NOT respond to this.",
                 inputSchema={
                     "type": "object",
                     "properties": {
-                        "summary": {"type": "string", "description": "Short summary of current activity (e.g. '正在调试登录bug')"},
+                        "summary": {"type": "string", "description": "Short progress summary (e.g. '已完成路由优化，修改了3个文件')"},
                     },
                     "required": ["summary"],
+                },
+            ),
+            Tool(
+                name="update_title",
+                description="Update this session's thread topic title (the anchor card). Use this to show what you're currently working on.",
+                inputSchema={
+                    "type": "object",
+                    "properties": {
+                        "title": {"type": "string", "description": "New title for the thread (e.g. '正在调试登录bug')"},
+                    },
+                    "required": ["title"],
                 },
             ),
             Tool(
@@ -438,6 +456,8 @@ def register_tools(server: Server):
             return _handle_forward_tool(arguments)
         elif name == "send_summary":
             return _handle_send_summary_tool(arguments)
+        elif name == "update_title":
+            return _handle_update_title_tool(arguments)
         elif name == "spawn_session":
             return _handle_spawn_session(arguments)
         elif name == "kill_session":
@@ -499,7 +519,16 @@ def _handle_send_summary_tool(args: dict) -> list[TextContent]:
     if _channel_client and _channel_client.ws and _event_loop:
         asyncio.run_coroutine_threadsafe(
             _channel_client.send_summary(summary), _event_loop)
-        return [TextContent(type="text", text=f"Summary sent (anchor updated + root notified)")]
+        return [TextContent(type="text", text=f"Summary sent to root session main chat")]
+    return [TextContent(type="text", text="Error: not connected")]
+
+
+def _handle_update_title_tool(args: dict) -> list[TextContent]:
+    title = args["title"]
+    if _channel_client and _channel_client.ws and _event_loop:
+        asyncio.run_coroutine_threadsafe(
+            _channel_client.update_title(title), _event_loop)
+        return [TextContent(type="text", text=f"Thread title updated")]
     return [TextContent(type="text", text="Error: not connected")]
 
 

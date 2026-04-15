@@ -59,8 +59,13 @@ fi
 # Truncate final message
 MSG="${MSG:0:$MAX}"
 
-# Fire-and-forget: send to channel-server, 2s timeout
-PAYLOAD=$(jq -nc --arg cid "$CHAT_ID" --arg txt "$MSG" '{"type":"reply","chat_id":$cid,"text":$txt}')
-echo "$PAYLOAD" | websocat -n1 --no-close "ws://localhost:${PORT}" &>/dev/null &
+# Fire-and-forget: send to channel-server (tool_notify routes to a dedicated thread)
+PAYLOAD=$(jq -nc --arg cid "$CHAT_ID" --arg txt "$MSG" '{"type":"tool_notify","chat_id":$cid,"text":$txt}')
+(
+  echo "$PAYLOAD" | websocat -t --no-close -1 "ws://127.0.0.1:${PORT}" &>/dev/null &
+  WS_PID=$!
+  sleep 2
+  kill $WS_PID 2>/dev/null
+) &>/dev/null &
 
 exit 0

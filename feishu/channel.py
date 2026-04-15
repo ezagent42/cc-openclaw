@@ -73,8 +73,16 @@ class ChannelClient:
         try:
             pidfile = Path(self._pidfile_path)
             if pidfile.exists():
-                parts = pidfile.read_text().strip().split(":")
-                port = int(parts[1])
+                content = pidfile.read_text().strip()
+                try:
+                    # New format: JSON {"pid": ..., "port": ...}
+                    import json as _json
+                    pidinfo = _json.loads(content)
+                    port = int(pidinfo["port"])
+                except (ValueError, KeyError):
+                    # Legacy format: "pid:port"
+                    parts = content.split(":")
+                    port = int(parts[1])
                 url = f"ws://localhost:{port}"
                 if url != self.server_url:
                     log.info("channel-server port changed: %s → %s", self.server_url, url)

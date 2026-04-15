@@ -570,8 +570,16 @@ async def main():
     if not pidfile.exists():
         log.error("channel-server not running — .channel-server.pid not found")
         sys.exit(1)
-    parts = pidfile.read_text().strip().split(":")
-    pid, port = int(parts[0]), int(parts[1])
+    pidfile_content = pidfile.read_text().strip()
+    try:
+        # New format: JSON {"pid": ..., "port": ...}
+        import json as _json
+        pidinfo = _json.loads(pidfile_content)
+        pid, port = int(pidinfo["pid"]), int(pidinfo["port"])
+    except (ValueError, KeyError):
+        # Legacy format: "pid:port"
+        parts = pidfile_content.split(":")
+        pid, port = int(parts[0]), int(parts[1])
     try:
         os.kill(pid, 0)
     except OSError:

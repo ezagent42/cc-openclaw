@@ -77,6 +77,11 @@ class ChannelServerApp:
                 self.cc_adapter.feishu_adapter = self.feishu_adapter
                 log.info("Feishu adapter initialized")
 
+                # Start Feishu WS event listener
+                creds = json.loads((PROJECT_ROOT / ".feishu-credentials.json").read_text())
+                self.feishu_adapter.start_feishu_ws(creds["app_id"], creds["app_secret"])
+                log.info("Feishu WS listener started")
+
                 # 4. Reactivate feishu actors (their transport is always available)
                 for actor in self.runtime.actors.values():
                     if (

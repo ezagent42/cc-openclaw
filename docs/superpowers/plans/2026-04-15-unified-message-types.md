@@ -126,12 +126,9 @@ class Message:
 Run: `uv run --extra test python3 -m pytest tests/channel_server/core/test_actor.py -v`
 Expected: PASS
 
-- [ ] **Step 5: Commit**
+- [ ] **Step 5: Do NOT commit yet — Task 1 is merged with Tasks 2-3 into a single commit (see Task 3 Step 5)**
 
-```bash
-git add channel_server/core/actor.py tests/channel_server/core/test_actor.py
-git commit -m "refactor(actor): remove Message.type, add Delivery enum and delivery field"
-```
+> **Note (C3 fix):** Tasks 1, 2, and 3 are committed together as a single atomic change. Committing Task 1 alone would break all other modules that reference `msg.type` (handler.py, runtime.py, app.py). The tests at each step only verify the specific test file for that module.
 
 ---
 
@@ -460,7 +457,11 @@ class FeishuInboundHandler:
         if msg.sender.startswith("feishu_user:"):
             return [Send(to=addr, message=msg) for addr in actor.downstream]
 
-        return [TransportSend(payload=msg.payload)]
+        # Outbound reply from CC -> push via transport to Feishu
+        actions: list[Action] = []
+        if actor.transport is not None:
+            actions.append(TransportSend(payload=msg.payload))
+        return actions
 
 
 # ---------------------------------------------------------------------------
@@ -646,10 +647,11 @@ git commit -m "refactor(handler): dispatch on payload action instead of msg.type
 
 ---
 
-### Task 3: Update runtime.py — log format and error messages
+### Task 3: Update runtime.py, app.py — log format and error messages
 
 **Files:**
 - Modify: `channel_server/core/runtime.py`
+- Modify: `channel_server/app.py`
 - Modify: `tests/channel_server/core/test_runtime.py`
 
 - [ ] **Step 1: Update test_runtime.py — fix all Message() calls**
@@ -749,16 +751,38 @@ Change the error notification (line 170-176):
                         )
 ```
 
+- [ ] **Step 3b: Update app.py — fix notify_admin Message construction**
+
+In `channel_server/app.py`, change `notify_admin` (line 174):
+
+```python
+    def notify_admin(self, text: str) -> None:
+        """Send a system notification to the admin actor."""
+        from channel_server.core.actor import Message
+
+        self.runtime.send(
+            "system:admin",
+            Message(sender="system:runtime", payload={"msg_type": "system", "text": text}),
+        )
+```
+
 - [ ] **Step 4: Run tests to verify they pass**
 
 Run: `uv run --extra test python3 -m pytest tests/channel_server/core/test_runtime.py -v`
 Expected: PASS
 
-- [ ] **Step 5: Commit**
+- [ ] **Step 5: Commit Tasks 1+2+3 together as atomic change**
 
 ```bash
-git add channel_server/core/runtime.py tests/channel_server/core/test_runtime.py
-git commit -m "refactor(runtime): update log format and error messages for typeless Message"
+git add channel_server/core/actor.py channel_server/core/handler.py channel_server/core/runtime.py channel_server/app.py tests/channel_server/core/
+git commit -m "refactor(core): remove Message.type, add Delivery enum, dispatch on payload action
+
+- Message.type removed, Message.delivery added with Delivery enum
+- Handlers dispatch on payload['action'] instead of msg.type/payload['command']
+- ToolCardHandler output uses action='tool_notify' (was type='tool_card_update')
+- CCSessionHandler routes tool_notify to tool_card:* actor
+- Runtime logs show payload action instead of msg.type
+- app.py notify_admin uses payload msg_type instead of Message.type"
 ```
 
 ---
@@ -981,12 +1005,38 @@ def test_on_feishu_event_sends_message():
     assert msg.metadata["user_id"] == "ou_alice"
 ```
 
+Also update the `feishu_event()` helper to accept `file_path`:
+```python
+def feishu_event(
+    chat_id: str = "oc_abc123",
+    message_id: str = "msg_001",
+    text: str = "hello",
+    user: str = "Alice",
+    user_id: str = "ou_alice",
+    root_id: str | None = None,
+    msg_type: str = "text",
+    file_path: str = "",
+) -> dict:
+    """Build a minimal Feishu message event dict."""
+    evt: dict = {
+        "chat_id": chat_id,
+        "message_id": message_id,
+        "text": text,
+        "file_path": file_path,
+        "user": user,
+        "user_id": user_id,
+        "msg_type": msg_type,
+    }
+    if root_id is not None:
+        evt["root_id"] = root_id
+    return evt
+```
+
 Add a test for file_path in payload:
 ```python
 def test_on_feishu_event_includes_file_path():
     adapter, rt = make_adapter()
-    evt = feishu_event(msg_type="image")
-    evt["file_path"] = "/tmp/downloads/photo.png"
+    evt = feishu_event(msg_type="image", file_path="/tmp/downloads/photo.png")
     adapter.on_feishu_event(evt)
 
     addr = "feishu:oc_abc123"
@@ -1229,11 +1279,23 @@ git commit -m "refactor(feishu-adapter): add msg_type/file_path to payload, disp
             await self.ws.send(json.dumps({"method": "list_sessions"}))
 ```
 
-- [ ] **Step 4: Update inject_message — read "method" for type field in notification**
+- [ ] **Step 4: Update inject_message and consume_messages — read "method" not "type"**
 
 Find the `inject_message` function and update it to read `method` from the message dict instead of `type`. Keep the MCP notification key as-is (that's the MCP protocol, not our internal protocol).
 
-- [ ] **Step 5: Commit**
+Find the `consume_messages` log line (around line 642) and change `msg.get('type')` to `msg.get('method')`.
+
+- [ ] **Step 5: Update send_ux_event — "type" to "method"**
+
+```python
+    async def send_ux_event(self, chat_id, event, data=None):
+        if self.ws:
+            await self.ws.send(json.dumps({
+                "method": "ux_event", "chat_id": chat_id, "event": event, "data": data,
+            }))
+```
+
+- [ ] **Step 6: Commit**
 
 ```bash
 git add channel_server/adapters/cc/channel.py

@@ -80,6 +80,20 @@ class CCSessionHandler:
             parent_feishu = msg.payload.get("parent_feishu", "")
             return [Send(to=parent_feishu, message=msg)]
 
+        if command == "send_file":
+            return [TransportSend(payload={
+                "type": "send_file",
+                "chat_id": msg.payload.get("chat_id", ""),
+                "file_path": msg.payload.get("file_path", ""),
+            })]
+
+        if command == "react":
+            return [TransportSend(payload={
+                "type": "react",
+                "message_id": msg.payload.get("message_id", ""),
+                "emoji_type": msg.payload.get("emoji_type", "THUMBSUP"),
+            })]
+
         if command == "update_title":
             update_msg = Message(
                 sender=actor.address,
@@ -124,6 +138,76 @@ class ToolCardHandler:
 
 
 # ---------------------------------------------------------------------------
+# AdminHandler
+# ---------------------------------------------------------------------------
+
+class AdminHandler:
+    """Handles admin commands and notifications.
+
+    - System notifications are forwarded to downstream actors.
+    - Session commands (/spawn, /kill, /sessions) pass through to downstream.
+    - Non-slash messages pass through to downstream.
+    - /help shows available commands.
+    - Unknown slash commands get an error message.
+    """
+
+    SESSION_COMMANDS = ("/spawn", "/kill", "/sessions")
+
+    def handle(self, actor: Actor, msg: Message) -> list[Action]:
+        text = msg.payload.get("text", "").strip()
+
+        # System notifications -> forward to downstream
+        if msg.type == "system":
+            return [Send(to=addr, message=msg) for addr in actor.downstream]
+
+        # Session commands -> pass through to downstream CC actor
+        if text.startswith(self.SESSION_COMMANDS):
+            return [Send(to=addr, message=msg) for addr in actor.downstream]
+
+        # Non-slash messages -> forward to downstream
+        if not text.startswith("/"):
+            return [Send(to=addr, message=msg) for addr in actor.downstream]
+
+        # Admin commands
+        if text == "/help":
+            return [
+                Send(
+                    to=addr,
+                    message=Message(
+                        sender=actor.address,
+                        type="text",
+                        payload={"text": self._help_text()},
+                    ),
+                )
+                for addr in actor.downstream
+            ]
+
+        # Unknown slash command
+        cmd = text.split()[0]
+        return [
+            Send(
+                to=addr,
+                message=Message(
+                    sender=actor.address,
+                    type="text",
+                    payload={"text": f"\u672a\u77e5\u547d\u4ee4: {cmd}\n\u53d1\u9001 /help \u67e5\u770b\u53ef\u7528\u547d\u4ee4"},
+                ),
+            )
+            for addr in actor.downstream
+        ]
+
+    @staticmethod
+    def _help_text() -> str:
+        return (
+            "\u53ef\u7528\u547d\u4ee4:\n"
+            "/help \u2014 \u663e\u793a\u5e2e\u52a9\n"
+            "/spawn <name> \u2014 \u521b\u5efa\u5b50 session\n"
+            "/kill <name> \u2014 \u7ed3\u675f\u5b50 session\n"
+            "/sessions \u2014 \u5217\u51fa\u6d3b\u8dc3 sessions"
+        )
+
+
+# ---------------------------------------------------------------------------
 # Registry
 # ---------------------------------------------------------------------------
 
@@ -132,6 +216,7 @@ HANDLER_REGISTRY: dict[str, Handler] = {
     "cc_session": CCSessionHandler(),
     "forward_all": ForwardAllHandler(),
     "tool_card": ToolCardHandler(),
+    "admin": AdminHandler(),
 }
 
 

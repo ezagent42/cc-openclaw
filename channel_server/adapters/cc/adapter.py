@@ -145,6 +145,25 @@ class CCAdapter:
             )
             log.info("Attached transport to existing CC actor: %s", address)
 
+        # Wire topology for root sessions:
+        # system:admin → cc:user.root → feishu:chat_id
+        chat_ids = msg.get("chat_ids", [])
+        session = instance_id.split(".")[-1] if "." in instance_id else ""
+        if session == "root" and chat_ids:
+            cc_actor = self.runtime.lookup(address)
+            chat_id = next((c for c in chat_ids if c != "*"), None)
+            if cc_actor and chat_id:
+                feishu_addr = f"feishu:{chat_id}"
+                # Wire CC → feishu (reply path)
+                if feishu_addr not in cc_actor.downstream:
+                    cc_actor.downstream.append(feishu_addr)
+                    log.info("Wired %s → %s", address, feishu_addr)
+                # Wire admin → CC (inbound path)
+                admin = self.runtime.lookup("system:admin")
+                if admin and address not in admin.downstream:
+                    admin.downstream.append(address)
+                    log.info("Wired system:admin → %s", address)
+
         await ws.send(json.dumps({"type": "registered", "address": address}))
 
     # ------------------------------------------------------------------

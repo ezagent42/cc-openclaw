@@ -215,6 +215,52 @@ class ChannelServer:
             log.warning("Error creating thread anchor: %s", e)
         return None
 
+    def _pin_message(self, message_id: str) -> bool:
+        """Pin a message in its chat via Feishu API."""
+        if not self._feishu_client:
+            return False
+        try:
+            import lark_oapi as lark
+            from lark_oapi.api.im.v1 import CreatePinRequest, CreatePinRequestBody
+
+            body = CreatePinRequestBody.builder().message_id(message_id).build()
+            req = CreatePinRequest.builder().request_body(body).build()
+            resp = self._feishu_client.im.v1.pin.create(req)
+            if resp.success():
+                log.info("Pinned message %s", message_id)
+                return True
+            else:
+                log.warning("Failed to pin message %s: %s", message_id, resp.msg)
+                return False
+        except Exception as e:
+            log.warning("Error pinning message: %s", e)
+            return False
+
+    def _update_anchor_text(self, message_id: str, new_text: str) -> bool:
+        """Update the text content of a thread anchor message."""
+        if not self._feishu_client:
+            return False
+        try:
+            from lark_oapi.api.im.v1 import PatchMessageRequest, PatchMessageRequestBody
+
+            body = (
+                PatchMessageRequestBody.builder()
+                .msg_type("text")
+                .content(json.dumps({"text": new_text}))
+                .build()
+            )
+            req = PatchMessageRequest.builder().message_id(message_id).request_body(body).build()
+            resp = self._feishu_client.im.v1.message.patch(req)
+            if resp.success():
+                log.info("Updated anchor text %s: %s", message_id, new_text[:60])
+                return True
+            else:
+                log.warning("Failed to update anchor %s: %s", message_id, resp.msg)
+                return False
+        except Exception as e:
+            log.warning("Error updating anchor text: %s", e)
+            return False
+
     def _remove_thread_anchor(self, instance_id: str) -> None:
         """Remove a thread anchor from persistence and route tables."""
         anchor = self._thread_anchors.pop(instance_id, None)
@@ -1010,6 +1056,8 @@ class ChannelServer:
                     await self._handle_send_file(ws, msg)
                 elif msg_type == "forward":
                     await self._handle_forward(ws, msg)
+                elif msg_type == "send_summary":
+                    await self._handle_send_summary(ws, msg)
                 elif msg_type == "message":
                     await self._handle_inbound_message(ws, msg)
                 elif msg_type == "spawn_session":
@@ -1078,20 +1126,26 @@ class ChannelServer:
 
         # Thread anchor: restore from persistence or create new
         if instance_id in self._thread_anchors:
-            # Restore existing thread anchor from persistence (or upgrade provisional route)
-            anchor = self._thread_anchors[instance_id]
-            anchor_msg_id = anchor["msg_id"]
-            self.thread_routes[anchor_msg_id] = inst
-            self.session_threads[instance_id] = anchor_msg_id
-            log.info("Restored thread anchor for %s: %s", instance_id, anchor_msg_id)
+            if instance_id.endswith(".root"):
+                # Root sessions don't use thread anchors — clean up stale entry
+                del self._thread_anchors[instance_id]
+                self._save_thread_anchors()
+                log.info("Removed stale thread anchor for root session %s", instance_id)
+            else:
+                # Restore existing thread anchor from persistence (or upgrade provisional route)
+                anchor = self._thread_anchors[instance_id]
+                anchor_msg_id = anchor["msg_id"]
+                self.thread_routes[anchor_msg_id] = inst
+                self.session_threads[instance_id] = anchor_msg_id
+                log.info("Restored thread anchor for %s: %s", instance_id, anchor_msg_id)
 
             # Flush provisional queue if any
             pending = self._provisional_queues.pop(instance_id, [])
             for pending_msg in pending:
                 await self._send(inst.ws, pending_msg)
                 log.info("Flushed provisional message to %s", instance_id)
-        elif "." in instance_id and not instance_id.startswith("channel-"):
-            # Create new thread anchor for named sessions
+        elif "." in instance_id and not instance_id.startswith("channel-") and not instance_id.endswith(".root"):
+            # Create new thread anchor for named sessions (not root — root uses exact route)
             tag = tag_name or instance_id.split(".", 1)[1]
             # Use first non-wildcard chat_id for anchor; for child sessions with
             # empty chat_ids, look up the root session's chat_id
@@ -1350,6 +1404,37 @@ class ChannelServer:
         await self._send(ws, {"type": "forward_ack", "ok": True})
         log.info("Forwarded message from %s → %s: %s", sender_id, target_id, text[:60])
 
+    async def _handle_send_summary(self, ws: ServerConnection, msg: dict) -> None:
+        """Handle summary from a child session: update anchor text + notify root session in main chat."""
+        summary = msg.get("summary", "")
+        sender = self._ws_to_instance.get(ws)
+        if not sender:
+            await self._send(ws, {"type": "summary_ack", "ok": False, "error": "not registered"})
+            return
+
+        instance_id = sender.instance_id
+        tag = sender.tag_name or (instance_id.split(".", 1)[1] if "." in instance_id else instance_id)
+
+        # 1. Update thread anchor text to reflect current activity
+        anchor_msg_id = self.session_threads.get(instance_id)
+        if anchor_msg_id:
+            new_text = f"🟢 [{tag}] {summary}"
+            self._update_anchor_text(anchor_msg_id, new_text)
+
+        # 2. Send summary to root session's main chat (so user sees it without entering the thread)
+        if "." in instance_id:
+            user = instance_id.split(".", 1)[0]
+            root_inst = self.instances_by_id.get(f"{user}.root") or self.instances_by_id.get(user)
+            if root_inst:
+                anchor = self._thread_anchors.get(instance_id, {})
+                chat_id = anchor.get("chat_id", "")
+                if chat_id:
+                    notification = f"📋 [{tag}] {summary}"
+                    await self._reply_feishu(chat_id, notification)
+
+        await self._send(ws, {"type": "summary_ack", "ok": True})
+        log.info("Summary from %s: %s", instance_id, summary[:60])
+
     # ------------------------------------------------------------------
     # Session management (spawn / kill / list)
     # ------------------------------------------------------------------
@@ -1395,6 +1480,8 @@ class ChannelServer:
                 self._provisional_queues[child_id] = []
                 self.thread_routes[anchor_msg_id] = None  # type: ignore — provisional
                 self.session_threads[child_id] = anchor_msg_id
+                # Pin the anchor so users can quickly find the session thread
+                self._pin_message(anchor_msg_id)
 
         # Start child process via cc-openclaw.sh
         cmd = [str(PROJECT_ROOT / "cc-openclaw.sh"), "--user", user, "--session", session_name]

@@ -177,10 +177,10 @@ class ChannelClient:
             }))
 
     async def send_summary(self, text):
-        """Forward summary to monitor session."""
+        """Send summary: updates thread anchor text + notifies root session in main chat."""
         if self.ws:
             await self.ws.send(json.dumps({
-                "type": "forward", "target_instance": "monitor", "text": text,
+                "type": "send_summary", "summary": text,
             }))
 
     async def send_spawn(self, session_name, tag=None):
@@ -384,11 +384,11 @@ def register_tools(server: Server):
             ),
             Tool(
                 name="send_summary",
-                description="Send a task completion summary to the monitor session (管理群)",
+                description="Send a summary: updates the session's thread topic title and notifies the root session in main chat so the user can see progress without entering the thread.",
                 inputSchema={
                     "type": "object",
                     "properties": {
-                        "summary": {"type": "string", "description": "Task completion summary text"},
+                        "summary": {"type": "string", "description": "Short summary of current activity (e.g. '正在调试登录bug')"},
                     },
                     "required": ["summary"],
                 },
@@ -499,7 +499,7 @@ def _handle_send_summary_tool(args: dict) -> list[TextContent]:
     if _channel_client and _channel_client.ws and _event_loop:
         asyncio.run_coroutine_threadsafe(
             _channel_client.send_summary(summary), _event_loop)
-        return [TextContent(type="text", text=f"Summary sent to monitor")]
+        return [TextContent(type="text", text=f"Summary sent (anchor updated + root notified)")]
     return [TextContent(type="text", text="Error: not connected")]
 
 

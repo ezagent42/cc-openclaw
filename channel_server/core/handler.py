@@ -24,10 +24,22 @@ class Handler(Protocol):
 # ---------------------------------------------------------------------------
 
 class FeishuInboundHandler:
-    """Forward every inbound message to all downstream actors."""
+    """Route messages for a Feishu chat/thread actor.
+
+    - Messages from external users (feishu_user:*) -> forward to downstream CC actors.
+    - Messages from CC actors (cc:* or others) -> push to Feishu transport (outbound reply).
+    """
 
     def handle(self, actor: Actor, msg: Message) -> list[Action]:
-        return [Send(to=addr, message=msg) for addr in actor.downstream]
+        if msg.sender.startswith("feishu_user:"):
+            # Inbound from Feishu user -> forward to downstream (CC actors)
+            return [Send(to=addr, message=msg) for addr in actor.downstream]
+
+        # Outbound reply from CC -> push via transport to Feishu chat/thread
+        actions: list[Action] = []
+        if actor.transport is not None:
+            actions.append(TransportSend(payload=msg.payload))
+        return actions
 
 
 # ---------------------------------------------------------------------------

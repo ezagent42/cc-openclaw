@@ -47,7 +47,7 @@ def make_msg(
 
 def test_feishu_inbound_single_downstream():
     actor = make_actor(downstream=["actor://ds1"])
-    msg = make_msg()
+    msg = make_msg(sender="feishu_user:u123")
     actions = FeishuInboundHandler().handle(actor, msg)
     assert len(actions) == 1
     assert isinstance(actions[0], Send)
@@ -61,7 +61,7 @@ def test_feishu_inbound_single_downstream():
 
 def test_feishu_inbound_multiple_downstream():
     actor = make_actor(downstream=["actor://ds1", "actor://ds2", "actor://ds3"])
-    msg = make_msg()
+    msg = make_msg(sender="feishu_user:u123")
     actions = FeishuInboundHandler().handle(actor, msg)
     assert len(actions) == 3
     targets = {a.to for a in actions}

@@ -8,4 +8,6 @@ uv.lock
 sidecar-config.yaml
 *.sqlite
 .workspace/
+.openclaw/
+.mcp.env
 .claude/worktrees/

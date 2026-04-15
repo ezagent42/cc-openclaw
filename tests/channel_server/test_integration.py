@@ -46,8 +46,7 @@ async def test_end_to_end_feishu_to_cc():
         "feishu:oc_xxx",
         Message(
             sender="feishu_user:testuser",
-            type="text",
-            payload={"text": "hello"},
+            payload={"msg_type": "text", "text": "hello", "chat_id": "oc_xxx", "message_id": "om_1", "file_path": ""},
             metadata={"chat_id": "oc_xxx", "user": "testuser"},
         ),
     )
@@ -55,6 +54,7 @@ async def test_end_to_end_feishu_to_cc():
 
     assert len(transport_log) == 1
     assert transport_log[0]["text"] == "hello"
+    assert transport_log[0]["method"] == "message"
 
     await runtime.shutdown()
     await task
@@ -94,8 +94,7 @@ async def test_end_to_end_cc_reply():
         "cc:linyilun.root",
         Message(
             sender="cc:linyilun.root",
-            type="command",
-            payload={"command": "reply", "text": "world"},
+            payload={"text": "world"},
         ),
     )
     await asyncio.sleep(0.2)
@@ -125,8 +124,7 @@ async def test_round_trip():
             actor.address,
             Message(
                 sender=actor.address,
-                type="command",
-                payload={"command": "reply", "text": f"echo: {payload.get('text', '')}"},
+                payload={"text": f"echo: {payload.get('text', '')}"},
             ),
         )
 
@@ -156,8 +154,7 @@ async def test_round_trip():
         "feishu:oc_round",
         Message(
             sender="feishu_user:testuser",
-            type="text",
-            payload={"text": "ping"},
+            payload={"msg_type": "text", "text": "ping", "chat_id": "oc_round", "message_id": "om_1", "file_path": ""},
             metadata={"chat_id": "oc_round"},
         ),
     )
@@ -212,8 +209,7 @@ async def test_suspended_actor_no_processing():
         "feishu:oc_sus",
         Message(
             sender="feishu_user:testuser",
-            type="text",
-            payload={"text": "queued"},
+            payload={"msg_type": "text", "text": "queued", "chat_id": "oc_sus", "message_id": "om_1", "file_path": ""},
         ),
     )
     await asyncio.sleep(0.15)

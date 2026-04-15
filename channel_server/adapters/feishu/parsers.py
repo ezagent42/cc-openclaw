@@ -4,7 +4,7 @@ Each parser is a function registered via @register_parser("msg_type").
 New message types can be supported by adding a decorated function.
 
 Parser signature:
-    (content: dict, message, server) -> tuple[str, str]
+    (content: dict, message, adapter) -> tuple[str, str]
     Returns (text_representation, file_path)
     - text_representation: human-readable text for the message
     - file_path: local file path if a file was downloaded, else ""
@@ -17,7 +17,7 @@ import logging
 from typing import TYPE_CHECKING, Callable
 
 if TYPE_CHECKING:
-    from feishu.channel_server import ChannelServer
+    from channel_server.adapters.feishu.adapter import FeishuAdapter
 
 log = logging.getLogger("channel-server.parsers")
 
@@ -37,7 +37,7 @@ def register_parser(*msg_types: str):
     return decorator
 
 
-def parse_message(msg_type: str, content: dict, message, server: ChannelServer) -> tuple[str, str]:
+def parse_message(msg_type: str, content: dict, message, server: FeishuAdapter) -> tuple[str, str]:
     """Parse a Feishu message into (text, file_path).
 
     Falls back to a descriptive label for unregistered types.
@@ -64,17 +64,37 @@ def _parse_text(content: dict, message, server) -> tuple[str, str]:
 @register_parser("post")
 def _parse_post(content: dict, message, server) -> tuple[str, str]:
     parts = [content.get("title", "")]
+    image_keys: list[str] = []
     for para in content.get("content", []):
         for node in para or []:
-            if node.get("text"):
-                parts.append(node["text"])
-    return " ".join(p for p in parts if p), ""
+            tag = node.get("tag", "")
+            if tag == "text" or node.get("text"):
+                parts.append(node.get("text", ""))
+            elif tag == "img":
+                image_keys.append(node.get("image_key", ""))
+
+    # Download the first inline image if present
+    file_path = ""
+    if image_keys and image_keys[0] and server:
+        msg_id = message.message_id or ""
+        image_key = image_keys[0]
+        try:
+            file_path = server.download_image_by_key(msg_id, image_key)
+        except Exception as e:
+            log.warning("Failed to download inline image: %s", e)
+        if not file_path:
+            parts.append(f"[图片: {image_key}]")
+    elif image_keys:
+        for ik in image_keys:
+            parts.append(f"[图片: {ik}]")
+
+    return " ".join(p for p in parts if p), file_path
 
 
 @register_parser("image", "file", "audio", "media")
 def _parse_downloadable(content: dict, message, server) -> tuple[str, str]:
     msg_id = message.message_id or ""
-    file_path = server._download_feishu_file(msg_id, message)
+    file_path = server.download_file(msg_id, message)
     msg_type = message.message_type or "file"
     if file_path:
         return f"[File received: {file_path}]", file_path
@@ -89,14 +109,14 @@ def _parse_downloadable(content: dict, message, server) -> tuple[str, str]:
 def _parse_merge_forward(content: dict, message, server) -> tuple[str, str]:
     """Fetch sub-messages via GET /im/v1/messages/{message_id}."""
     msg_id = message.message_id or ""
-    if not msg_id or not server._feishu_client:
+    if not msg_id or not server.feishu_client:
         return "[合并转发消息]", ""
 
     try:
         from lark_oapi.api.im.v1 import GetMessageRequest
 
         req = GetMessageRequest.builder().message_id(msg_id).build()
-        resp = server._feishu_client.im.v1.message.get(req)
+        resp = server.feishu_client.im.v1.message.get(req)
 
         if not resp.success() or not resp.data or not resp.data.items:
             log.warning("Failed to fetch merge_forward sub-messages: %s", resp.msg if resp else "no response")
@@ -206,7 +226,10 @@ def _parse_interactive(content: dict, message, server) -> tuple[str, str]:
                 parts.append(node.get("text", "") or node.get("href", ""))
             elif tag == "at":
                 parts.append(f"@{node.get('user_name', node.get('user_id', ''))}")
-            # img and other non-text tags are silently skipped
+            elif tag == "img":
+                parts.append(f"[图片: {node.get('image_key', 'unknown')}]")
+            elif tag:
+                parts.append(f"[{tag}]")
 
     _extract_from_nodes(elements)
 

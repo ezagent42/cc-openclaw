@@ -24,7 +24,7 @@ test = [
 ]
 
 [tool.hatch.build.targets.wheel]
-packages = ["feishu", "sidecar"]
+packages = ["feishu", "sidecar", "channel_server"]
 
 [tool.pytest.ini_options]
 asyncio_mode = "auto"

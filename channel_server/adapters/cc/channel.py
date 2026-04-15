@@ -27,9 +27,9 @@ from mcp.types import JSONRPCMessage, JSONRPCNotification, Tool, TextContent
 
 # -- Config ------------------------------------------------------------------
 
-PROJECT_ROOT = Path(__file__).resolve().parent.parent
+PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent.parent
 LOG_FILE = PROJECT_ROOT / ".openclaw" / "logs" / "channel.log"
-INSTRUCTIONS_PATH = Path(__file__).parent / "channel-instructions.md"
+INSTRUCTIONS_PATH = Path(__file__).resolve().parent / "channel-instructions.md"
 IDENTITY_PATH = PROJECT_ROOT / ".openclaw" / "identity.yaml"
 
 LOG_FILE.parent.mkdir(parents=True, exist_ok=True)
@@ -73,11 +73,17 @@ class ChannelClient:
         try:
             pidfile = Path(self._pidfile_path)
             if pidfile.exists():
-                parts = pidfile.read_text().strip().split(":")
-                port = int(parts[1])
+                content = pidfile.read_text().strip()
+                try:
+                    import json as _json
+                    pidinfo = _json.loads(content)
+                    port = int(pidinfo["port"])
+                except (ValueError, KeyError):
+                    parts = content.split(":")
+                    port = int(parts[1])
                 url = f"ws://localhost:{port}"
                 if url != self.server_url:
-                    log.info("channel-server port changed: %s → %s", self.server_url, url)
+                    log.info("channel-server port changed: %s -> %s", self.server_url, url)
                     self.server_url = url
                 return url
         except Exception as e:
@@ -104,7 +110,7 @@ class ChannelClient:
 
     async def _register(self, ws):
         payload = {
-            "type": "register",
+            "method": "register",
             "role": "developer" if ("*" in self.chat_ids or not self.chat_ids) else "production",
             "chat_ids": self.chat_ids,
             "instance_id": self.instance_id,
@@ -114,7 +120,7 @@ class ChannelClient:
             payload["tag_name"] = self.tag_name
         await ws.send(json.dumps(payload))
         resp = json.loads(await ws.recv())
-        if resp.get("type") == "error":
+        if resp.get("method") == "error":
             log.error(f"Registration failed: {resp}")
             raise RuntimeError(resp.get("message", "Registration failed"))
         log.info(f"Registered with channel-server: chat_ids={self.chat_ids}")
@@ -122,24 +128,25 @@ class ChannelClient:
     async def _message_loop(self, ws):
         async for raw in ws:
             msg = json.loads(raw)
-            if msg.get("type") == "message":
+            method = msg.get("method")
+            if method == "message":
                 await self._message_queue.put(msg)
-            elif msg.get("type") == "forwarded_message":
+            elif method == "forwarded_message":
                 from_id = msg.get("from", "unknown")
                 text = msg.get("text", "")
                 await self._message_queue.put({
-                    "type": "message",
-                    "text": f"[来自 {from_id}] {text}",
+                    "method": "message",
+                    "text": f"[from {from_id}] {text}",
                     "user": from_id,
                     "user_id": from_id,
                     "chat_id": "internal",
                     "source": "forward",
                     "ts": datetime.now(tz=timezone.utc).isoformat(),
                 })
-            elif msg.get("type") in ("spawn_result", "kill_result", "sessions_list"):
-                # Session management responses — inject as channel notification
+            elif method in ("spawn_result", "kill_result", "sessions_list"):
+                # Session management responses -- inject as channel notification
                 await self._message_queue.put({
-                    "type": "message",
+                    "method": "message",
                     "text": msg.get("text", json.dumps(msg)),
                     "user": "channel-server",
                     "user_id": "system",
@@ -147,46 +154,55 @@ class ChannelClient:
                     "source": "system",
                     "ts": datetime.now(tz=timezone.utc).isoformat(),
                 })
-            elif msg.get("type") == "ping":
-                await ws.send(json.dumps({"type": "pong"}))
-            elif msg.get("type") == "error":
+            elif method == "ping":
+                await ws.send(json.dumps({"method": "pong"}))
+            elif method == "error":
                 log.error(f"Server error: {msg}")
+            else:
+                log.warning(f"_message_loop: unhandled method={method!r} keys={list(msg.keys())}")
 
     async def send_reply(self, chat_id, text):
         if self.ws:
             await self.ws.send(json.dumps({
-                "type": "reply", "chat_id": chat_id, "text": text,
+                "method": "reply", "chat_id": chat_id, "text": text,
             }))
 
     async def send_react(self, message_id, emoji_type):
         if self.ws:
             await self.ws.send(json.dumps({
-                "type": "react", "message_id": message_id, "emoji_type": emoji_type,
+                "method": "react", "message_id": message_id, "emoji_type": emoji_type,
             }))
 
     async def send_file(self, chat_id, file_path):
         if self.ws:
             await self.ws.send(json.dumps({
-                "type": "send_file", "chat_id": chat_id, "file_path": file_path,
+                "method": "send_file", "chat_id": chat_id, "file_path": file_path,
             }))
 
     async def send_forward(self, target_instance, text):
         if self.ws:
             await self.ws.send(json.dumps({
-                "type": "forward", "target_instance": target_instance, "text": text,
+                "method": "forward", "target_instance": target_instance, "text": text,
             }))
 
     async def send_summary(self, text):
-        """Forward summary to monitor session."""
+        """Send summary to notify root session main chat."""
         if self.ws:
             await self.ws.send(json.dumps({
-                "type": "forward", "target_instance": "monitor", "text": text,
+                "method": "send_summary", "text": text,
+            }))
+
+    async def update_title(self, title):
+        """Update this session's thread anchor card title."""
+        if self.ws:
+            await self.ws.send(json.dumps({
+                "method": "update_title", "title": title,
             }))
 
     async def send_spawn(self, session_name, tag=None):
         """Request channel_server to spawn a child session."""
         if self.ws:
-            payload = {"type": "spawn_session", "session_name": session_name}
+            payload = {"method": "spawn_session", "session_name": session_name}
             if tag:
                 payload["tag"] = tag
             await self.ws.send(json.dumps(payload))
@@ -195,18 +211,18 @@ class ChannelClient:
         """Request channel_server to kill a child session."""
         if self.ws:
             await self.ws.send(json.dumps({
-                "type": "kill_session", "session_name": session_name,
+                "method": "kill_session", "session_name": session_name,
             }))
 
     async def send_list_sessions(self):
         """Request channel_server to list active sessions for this user."""
         if self.ws:
-            await self.ws.send(json.dumps({"type": "list_sessions"}))
+            await self.ws.send(json.dumps({"method": "list_sessions"}))
 
     async def send_ux_event(self, chat_id, event, data=None):
         if self.ws:
             await self.ws.send(json.dumps({
-                "type": "ux_event", "chat_id": chat_id, "event": event,
+                "method": "ux_event", "chat_id": chat_id, "event": event,
                 "data": data or {},
             }))
 
@@ -222,7 +238,7 @@ _event_loop: asyncio.AbstractEventLoop | None = None
 
 async def inject_message(write_stream, msg: dict):
     """Send a channel notification to Claude Code via the MCP write stream."""
-    # Build meta — omit None values to avoid potential issues with Claude Code
+    # Build meta -- omit None values to avoid potential issues with Claude Code
     meta = {
         "chat_id": msg["chat_id"],
         "message_id": msg.get("message_id", ""),
@@ -275,7 +291,7 @@ def _load_identity() -> str:
         import yaml
         data = yaml.safe_load(IDENTITY_PATH.read_text(encoding="utf-8"))
         lines = [f"## Identity\n"]
-        lines.append(f"You are **{data.get('name', 'AI Bot')}** — {data.get('description', '')}.")
+        lines.append(f"You are **{data.get('name', 'AI Bot')}** -- {data.get('description', '')}.")
         modes = data.get("modes", {})
         for mode_key, mode_name in modes.items():
             lines.append(f"- In {mode_key} mode (`runtime_mode: {mode_key}`): introduce yourself as **{mode_name}**")
@@ -384,13 +400,24 @@ def register_tools(server: Server):
             ),
             Tool(
                 name="send_summary",
-                description="Send a task completion summary to the monitor session (管理群)",
+                description="Notify root session main chat with a progress update. The human user can see it without entering your thread. Root session's CC should NOT respond to this.",
                 inputSchema={
                     "type": "object",
                     "properties": {
-                        "summary": {"type": "string", "description": "Task completion summary text"},
+                        "summary": {"type": "string", "description": "Short progress summary"},
                     },
                     "required": ["summary"],
+                },
+            ),
+            Tool(
+                name="update_title",
+                description="Update this session's thread topic title (the anchor card). Use this to show what you're currently working on.",
+                inputSchema={
+                    "type": "object",
+                    "properties": {
+                        "title": {"type": "string", "description": "New title for the thread"},
+                    },
+                    "required": ["title"],
                 },
             ),
             Tool(
@@ -438,6 +465,8 @@ def register_tools(server: Server):
             return _handle_forward_tool(arguments)
         elif name == "send_summary":
             return _handle_send_summary_tool(arguments)
+        elif name == "update_title":
+            return _handle_update_title_tool(arguments)
         elif name == "spawn_session":
             return _handle_spawn_session(arguments)
         elif name == "kill_session":
@@ -499,7 +528,16 @@ def _handle_send_summary_tool(args: dict) -> list[TextContent]:
     if _channel_client and _channel_client.ws and _event_loop:
         asyncio.run_coroutine_threadsafe(
             _channel_client.send_summary(summary), _event_loop)
-        return [TextContent(type="text", text=f"Summary sent to monitor")]
+        return [TextContent(type="text", text=f"Summary sent to root session main chat")]
+    return [TextContent(type="text", text="Error: not connected")]
+
+
+def _handle_update_title_tool(args: dict) -> list[TextContent]:
+    title = args["title"]
+    if _channel_client and _channel_client.ws and _event_loop:
+        asyncio.run_coroutine_threadsafe(
+            _channel_client.update_title(title), _event_loop)
+        return [TextContent(type="text", text=f"Thread title updated")]
     return [TextContent(type="text", text="Error: not connected")]
 
 
@@ -539,10 +577,18 @@ async def main():
 
     pidfile = PROJECT_ROOT / ".channel-server.pid"
     if not pidfile.exists():
-        log.error("channel-server not running — .channel-server.pid not found")
+        log.error("channel-server not running -- .channel-server.pid not found")
         sys.exit(1)
-    parts = pidfile.read_text().strip().split(":")
-    pid, port = int(parts[0]), int(parts[1])
+    pidfile_content = pidfile.read_text().strip()
+    try:
+        # New format: JSON {"pid": ..., "port": ...}
+        import json as _json
+        pidinfo = _json.loads(pidfile_content)
+        pid, port = int(pidinfo["pid"]), int(pidinfo["port"])
+    except (ValueError, KeyError):
+        # Legacy format: "pid:port"
+        parts = pidfile_content.split(":")
+        pid, port = int(parts[0]), int(parts[1])
     try:
         os.kill(pid, 0)
     except OSError:
@@ -561,7 +607,7 @@ async def main():
     else:
         instance_id = f"channel-{os.getpid()}"
 
-    # Child sessions (non-root) don't register exact chat_id routes —
+    # Child sessions (non-root) don't register exact chat_id routes --
     # they are reached exclusively via thread routes. This avoids
     # REGISTRATION_CONFLICT when multiple sessions share the same DM chat.
     if oc_session == "root" or not oc_user:
@@ -594,7 +640,7 @@ async def main():
         async def consume_messages():
             while True:
                 msg = await _channel_client._message_queue.get()
-                log.info(f"consume_messages: got msg type={msg.get('type')} chat_id={msg.get('chat_id')} source={msg.get('source')} text={msg.get('text','')[:40]}")
+                log.info(f"consume_messages: got msg method={msg.get('method')} chat_id={msg.get('chat_id')} source={msg.get('source')} text={msg.get('text','')[:40]}")
                 try:
                     _refresh_instructions(server)
                     await inject_message(write_stream, msg)

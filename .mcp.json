@@ -2,7 +2,7 @@
   "mcpServers": {
     "openclaw-channel": {
       "command": "uv",
-      "args": ["run", "python3", "feishu/channel.py"]
+      "args": ["run", "python3", "channel_server/adapters/cc/channel.py"]
     }
   }
 }

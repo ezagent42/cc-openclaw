@@ -3,5 +3,31 @@
   "channelsEnabled": true,
   "enabledPlugins": {
     "agent-setup@agent-setup": true
+  },
+  "hooks": {
+    "PreToolUse": [
+      {
+        "matcher": "Bash|Agent",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "/Users/h2oslabs/cc-openclaw/.claude/hooks/notify-channel.sh",
+            "timeout": 3000
+          }
+        ]
+      }
+    ],
+    "PostToolUse": [
+      {
+        "matcher": "Bash|Agent",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "/Users/h2oslabs/cc-openclaw/.claude/hooks/notify-channel.sh",
+            "timeout": 3000
+          }
+        ]
+      }
+    ]
   }
 }

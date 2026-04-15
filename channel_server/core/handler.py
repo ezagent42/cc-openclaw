@@ -50,60 +50,44 @@ class CCSessionHandler:
     """Bridge between actor messages and a Claude Code session.
 
     - External message (sender != actor.address): push to CC via TransportSend.
-    - CC command (sender == actor.address): dispatch by command type.
+    - CC-originated (sender == actor.address): dispatch by payload action.
     """
 
     def handle(self, actor: Actor, msg: Message) -> list[Action]:
         if msg.sender != actor.address:
             # External message — forward to the CC session over its transport.
-            return [TransportSend(payload=msg.payload)]
+            return [TransportSend(payload={"method": "message", **msg.payload})]
 
-        # Message originated from CC itself — treat as a command.
-        command = msg.payload.get("command")
+        # Message originated from CC itself — dispatch on action.
+        action = msg.payload.get("action")
 
-        if command == "reply":
+        if action is None:
+            # Default reply behaviour — tag prefix if not root.
             text = msg.payload.get("text", "")
             if actor.tag != "root":
                 text = f"[{actor.tag}] {text}"
             reply_msg = Message(
                 sender=actor.address,
-                type=msg.type,
                 payload={**msg.payload, "text": text},
             )
             return [Send(to=addr, message=reply_msg) for addr in actor.downstream]
 
-        if command == "forward":
+        if action == "forward":
             target = msg.payload.get("target", "")
             return [Send(to=target, message=msg)]
 
-        if command == "send_summary":
+        if action == "send_summary":
             parent_feishu = msg.payload.get("parent_feishu", "")
             return [Send(to=parent_feishu, message=msg)]
 
-        if command == "send_file":
-            return [TransportSend(payload={
-                "type": "send_file",
-                "chat_id": msg.payload.get("chat_id", ""),
-                "file_path": msg.payload.get("file_path", ""),
-            })]
+        if action == "tool_notify":
+            # Route to the tool_card actor for this user session.
+            # Actor address is "cc:<user_session>", target is "tool_card:<user_session>".
+            user_session = actor.address.removeprefix("cc:")
+            return [Send(to=f"tool_card:{user_session}", message=msg)]
 
-        if command == "react":
-            return [TransportSend(payload={
-                "type": "react",
-                "message_id": msg.payload.get("message_id", ""),
-                "emoji_type": msg.payload.get("emoji_type", "THUMBSUP"),
-            })]
-
-        if command == "update_title":
-            update_msg = Message(
-                sender=actor.address,
-                type="update_title",
-                payload=msg.payload,
-            )
-            return [Send(to=addr, message=update_msg) for addr in actor.downstream]
-
-        # Unknown command.
-        return []
+        # Catch-all (react, send_file, update_title, etc.) → send to downstream.
+        return [Send(to=addr, message=msg) for addr in actor.downstream]
 
 
 # ---------------------------------------------------------------------------
@@ -133,7 +117,7 @@ class ToolCardHandler:
         display = "\n".join(history)
         return [
             UpdateActor(changes={"metadata": {"history": history}}),
-            TransportSend(payload={"type": "tool_card_update", "text": display}),
+            TransportSend(payload={"action": "tool_notify", "text": display}),
         ]
 
 
@@ -157,7 +141,7 @@ class AdminHandler:
         text = msg.payload.get("text", "").strip()
 
         # System notifications -> forward to downstream
-        if msg.type == "system":
+        if msg.payload.get("msg_type") == "system":
             return [Send(to=addr, message=msg) for addr in actor.downstream]
 
         # Session commands -> pass through to downstream CC actor
@@ -175,7 +159,6 @@ class AdminHandler:
                     to=addr,
                     message=Message(
                         sender=actor.address,
-                        type="text",
                         payload={"text": self._help_text()},
                     ),
                 )
@@ -189,8 +172,7 @@ class AdminHandler:
                 to=addr,
                 message=Message(
                     sender=actor.address,
-                    type="text",
-                    payload={"text": f"\u672a\u77e5\u547d\u4ee4: {cmd}\n\u53d1\u9001 /help \u67e5\u770b\u53ef\u7528\u547d\u4ee4"},
+                    payload={"text": f"未知命令: {cmd}\n发送 /help 查看可用命令"},
                 ),
             )
             for addr in actor.downstream
@@ -199,11 +181,11 @@ class AdminHandler:
     @staticmethod
     def _help_text() -> str:
         return (
-            "\u53ef\u7528\u547d\u4ee4:\n"
-            "/help \u2014 \u663e\u793a\u5e2e\u52a9\n"
-            "/spawn <name> \u2014 \u521b\u5efa\u5b50 session\n"
-            "/kill <name> \u2014 \u7ed3\u675f\u5b50 session\n"
-            "/sessions \u2014 \u5217\u51fa\u6d3b\u8dc3 sessions"
+            "可用命令:\n"
+            "/help — 显示帮助\n"
+            "/spawn <name> — 创建子 session\n"
+            "/kill <name> — 结束子 session\n"
+            "/sessions — 列出活跃 sessions"
         )
 
 

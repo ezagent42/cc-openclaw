@@ -173,7 +173,7 @@ class ChannelServerApp:
 
         self.runtime.send(
             "system:admin",
-            Message(sender="system:runtime", type="system", payload={"text": text}),
+            Message(sender="system:runtime", payload={"msg_type": "system", "text": text}),
         )
 
     async def _persist_loop(self) -> None:

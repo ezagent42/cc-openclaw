@@ -87,7 +87,7 @@ def test_stop_nonexistent_is_graceful():
 def test_send_delivers_to_mailbox():
     rt = make_runtime()
     rt.spawn("actor://a", "forward_all")
-    msg = Message(sender="actor://b", type="chat", payload={"text": "hi"})
+    msg = Message(sender="actor://b", payload={"text": "hi"})
     rt.send("actor://a", msg)
     assert not rt.mailboxes["actor://a"].empty()
     queued = rt.mailboxes["actor://a"].get_nowait()
@@ -100,7 +100,7 @@ def test_send_delivers_to_mailbox():
 
 def test_send_to_nonexistent_no_crash():
     rt = make_runtime()
-    msg = Message(sender="actor://b", type="chat")
+    msg = Message(sender="actor://b")
     # Should not raise.
     rt.send("actor://nowhere", msg)
 
@@ -109,7 +109,7 @@ def test_send_to_ended_actor_no_crash():
     rt = make_runtime()
     rt.spawn("actor://a", "forward_all")
     rt.stop("actor://a")
-    msg = Message(sender="actor://b", type="chat")
+    msg = Message(sender="actor://b")
     # Should not raise.
     rt.send("actor://a", msg)
 
@@ -179,7 +179,7 @@ async def test_actor_loop_forwards_messages():
     src = rt.spawn("actor://src", "forward_all", downstream=["actor://dst"])
     dst = rt.spawn("actor://dst", "tool_card", transport=transport)
 
-    msg = Message(sender="actor://ext", type="chat", payload={"text": "hello"})
+    msg = Message(sender="actor://ext", payload={"text": "hello"})
     rt.send("actor://src", msg)
 
     run_task = asyncio.create_task(rt.run())
@@ -189,7 +189,7 @@ async def test_actor_loop_forwards_messages():
 
     # tool_card handler emits TransportSend, which our capture handler receives.
     assert len(received) == 1
-    assert received[0]["type"] == "tool_card_update"
+    assert received[0]["action"] == "tool_notify"
     assert "hello" in received[0]["text"]
 
 
@@ -229,7 +229,7 @@ async def test_actor_loop_handles_handler_error():
         parent = rt.spawn("actor://parent", "collector")
         child = rt.spawn("actor://child", "broken", parent="actor://parent")
 
-        rt.send("actor://child", Message(sender="actor://ext", type="chat"))
+        rt.send("actor://child", Message(sender="actor://ext"))
 
         run_task = asyncio.create_task(rt.run())
         await asyncio.sleep(0.15)
@@ -238,7 +238,7 @@ async def test_actor_loop_handles_handler_error():
 
         # Parent's collector handler should have received the error message.
         assert len(received) == 1
-        assert received[0].type == "error"
+        assert received[0].payload.get("msg_type") == "error"
         assert "boom" in received[0].payload["error"]
     finally:
         del HANDLER_REGISTRY["broken"]
@@ -260,7 +260,7 @@ async def test_actor_loop_ends_after_max_errors():
 
         # Send more than max_errors messages.
         for _ in range(12):
-            rt.send("actor://bad", Message(sender="actor://ext", type="chat"))
+            rt.send("actor://bad", Message(sender="actor://ext"))
 
         run_task = asyncio.create_task(rt.run())
         await asyncio.sleep(0.5)
@@ -288,7 +288,7 @@ async def test_transport_send_dispatches():
     transport = Transport(type="websocket", config={"url": "ws://localhost"})
     actor = rt.spawn("actor://tc", "tool_card", transport=transport)
 
-    msg = Message(sender="actor://ext", type="chat", payload={"text": "ping"})
+    msg = Message(sender="actor://ext", payload={"text": "ping"})
     rt.send("actor://tc", msg)
 
     run_task = asyncio.create_task(rt.run())
@@ -297,7 +297,7 @@ async def test_transport_send_dispatches():
     await run_task
 
     assert len(sent_payloads) == 1
-    assert sent_payloads[0]["type"] == "tool_card_update"
+    assert sent_payloads[0]["action"] == "tool_notify"
 
 
 # ---------------------------------------------------------------------------
@@ -367,7 +367,7 @@ async def test_handler_error_notifies_parent():
         rt.spawn("actor://parent", "collector_notify")
         rt.spawn("actor://child", "broken_notify", parent="actor://parent")
 
-        rt.send("actor://child", Message(sender="actor://ext", type="chat"))
+        rt.send("actor://child", Message(sender="actor://ext"))
 
         run_task = asyncio.create_task(rt.run())
         await asyncio.sleep(0.15)
@@ -375,7 +375,7 @@ async def test_handler_error_notifies_parent():
         await run_task
 
         assert len(received) == 1
-        assert received[0].type == "error"
+        assert received[0].payload.get("msg_type") == "error"
         assert "test-error" in received[0].payload["error"]
     finally:
         del HANDLER_REGISTRY["broken_notify"]
@@ -401,7 +401,7 @@ async def test_max_errors_stops_actor():
 
         # Send 15 messages (more than max_errors=10)
         for _ in range(15):
-            rt.send("actor://fail", Message(sender="actor://ext", type="chat"))
+            rt.send("actor://fail", Message(sender="actor://ext"))
 
         run_task = asyncio.create_task(rt.run())
         await asyncio.sleep(0.5)

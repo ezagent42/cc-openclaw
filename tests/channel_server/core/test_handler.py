@@ -36,10 +36,9 @@ def make_actor(
 
 def make_msg(
     sender: str = "actor://sender",
-    type: str = "chat",
     payload: dict | None = None,
 ) -> Message:
-    return Message(sender=sender, type=type, payload=payload or {})
+    return Message(sender=sender, payload=payload or {})
 
 
 # ---------------------------------------------------------------------------
@@ -73,20 +72,21 @@ def test_feishu_inbound_multiple_downstream():
 
 
 # ---------------------------------------------------------------------------
-# 3. CCSessionHandler — external message → TransportSend
+# 3. CCSessionHandler — external message → TransportSend with method
 # ---------------------------------------------------------------------------
 
 def test_cc_session_external_message():
     actor = make_actor(address="actor://cc", tag="session")
-    msg = make_msg(sender="actor://feishu", type="chat", payload={"text": "hello"})
+    msg = make_msg(sender="actor://feishu", payload={"text": "hello"})
     actions = CCSessionHandler().handle(actor, msg)
     assert len(actions) == 1
     assert isinstance(actions[0], TransportSend)
-    assert actions[0].payload == msg.payload
+    assert actions[0].payload["method"] == "message"
+    assert actions[0].payload["text"] == "hello"
 
 
 # ---------------------------------------------------------------------------
-# 4. CCSessionHandler — reply with tag prefix
+# 4. CCSessionHandler — reply with tag prefix (no action = default reply)
 # ---------------------------------------------------------------------------
 
 def test_cc_session_reply_with_tag():
@@ -97,8 +97,7 @@ def test_cc_session_reply_with_tag():
     )
     msg = make_msg(
         sender="actor://cc",
-        type="command",
-        payload={"command": "reply", "text": "Hello world"},
+        payload={"text": "Hello world"},
     )
     actions = CCSessionHandler().handle(actor, msg)
     assert len(actions) == 1
@@ -116,8 +115,7 @@ def test_cc_session_reply_skips_tag_for_root():
     )
     msg = make_msg(
         sender="actor://cc",
-        type="command",
-        payload={"command": "reply", "text": "Hello world"},
+        payload={"text": "Hello world"},
     )
     actions = CCSessionHandler().handle(actor, msg)
     assert len(actions) == 1
@@ -134,8 +132,7 @@ def test_cc_session_forward():
     actor = make_actor(address="actor://cc", tag="session-1")
     msg = make_msg(
         sender="actor://cc",
-        type="command",
-        payload={"command": "forward", "target": "actor://other", "text": "forwarded"},
+        payload={"action": "forward", "target": "actor://other", "text": "forwarded"},
     )
     actions = CCSessionHandler().handle(actor, msg)
     assert len(actions) == 1
@@ -153,9 +150,8 @@ def test_cc_session_send_summary():
     actor = make_actor(address="actor://cc", tag="session-1")
     msg = make_msg(
         sender="actor://cc",
-        type="command",
         payload={
-            "command": "send_summary",
+            "action": "send_summary",
             "parent_feishu": "actor://parent-feishu",
             "text": "Summary text",
         },
@@ -169,7 +165,47 @@ def test_cc_session_send_summary():
 
 
 # ---------------------------------------------------------------------------
-# 7. CCSessionHandler — update_title → Send update_title to downstream
+# 7. CCSessionHandler — send_file → Send to downstream (catch-all)
+# ---------------------------------------------------------------------------
+
+def test_cc_session_send_file():
+    actor = make_actor(
+        address="actor://cc",
+        tag="session-1",
+        downstream=["actor://feishu1"],
+    )
+    msg = make_msg(
+        sender="actor://cc",
+        payload={"action": "send_file", "chat_id": "c1", "file_path": "/tmp/test.pdf"},
+    )
+    actions = CCSessionHandler().handle(actor, msg)
+    assert len(actions) == 1
+    assert isinstance(actions[0], Send)
+    assert actions[0].to == "actor://feishu1"
+
+
+# ---------------------------------------------------------------------------
+# 8. CCSessionHandler — react → Send to downstream (catch-all)
+# ---------------------------------------------------------------------------
+
+def test_cc_session_react():
+    actor = make_actor(
+        address="actor://cc",
+        tag="session-1",
+        downstream=["actor://feishu1"],
+    )
+    msg = make_msg(
+        sender="actor://cc",
+        payload={"action": "react", "message_id": "m1", "emoji_type": "HEART"},
+    )
+    actions = CCSessionHandler().handle(actor, msg)
+    assert len(actions) == 1
+    assert isinstance(actions[0], Send)
+    assert actions[0].to == "actor://feishu1"
+
+
+# ---------------------------------------------------------------------------
+# 9. CCSessionHandler — update_title → Send to downstream (catch-all)
 # ---------------------------------------------------------------------------
 
 def test_cc_session_update_title():
@@ -180,31 +216,55 @@ def test_cc_session_update_title():
     )
     msg = make_msg(
         sender="actor://cc",
-        type="command",
-        payload={"command": "update_title", "title": "New Title"},
+        payload={"action": "update_title", "title": "New Title"},
     )
     actions = CCSessionHandler().handle(actor, msg)
     assert len(actions) == 2
     for action in actions:
         assert isinstance(action, Send)
-        assert action.message.type == "update_title"
     targets = {a.to for a in actions}
     assert targets == {"actor://feishu1", "actor://feishu2"}
 
 
-def test_cc_session_unknown_command_returns_empty():
-    actor = make_actor(address="actor://cc", tag="session-1")
+# ---------------------------------------------------------------------------
+# 10. CCSessionHandler — tool_notify → Send to tool_card:*
+# ---------------------------------------------------------------------------
+
+def test_cc_session_tool_notify():
+    actor = make_actor(address="cc:user.dev", tag="root")
     msg = make_msg(
-        sender="actor://cc",
-        type="command",
-        payload={"command": "nonexistent"},
+        sender="cc:user.dev",
+        payload={"action": "tool_notify", "text": "Running tests..."},
     )
     actions = CCSessionHandler().handle(actor, msg)
-    assert actions == []
+    assert len(actions) == 1
+    assert isinstance(actions[0], Send)
+    assert actions[0].to == "tool_card:user.dev"
+    assert actions[0].message is msg
 
 
 # ---------------------------------------------------------------------------
-# 8. ForwardAllHandler — broadcasts to all downstream
+# 11. CCSessionHandler — unknown action sends to downstream
+# ---------------------------------------------------------------------------
+
+def test_cc_session_unknown_action_sends_downstream():
+    actor = make_actor(
+        address="actor://cc",
+        tag="session-1",
+        downstream=["actor://feishu1"],
+    )
+    msg = make_msg(
+        sender="actor://cc",
+        payload={"action": "nonexistent"},
+    )
+    actions = CCSessionHandler().handle(actor, msg)
+    assert len(actions) == 1
+    assert isinstance(actions[0], Send)
+    assert actions[0].to == "actor://feishu1"
+
+
+# ---------------------------------------------------------------------------
+# 12. ForwardAllHandler — broadcasts to all downstream
 # ---------------------------------------------------------------------------
 
 def test_forward_all_broadcasts():
@@ -220,7 +280,7 @@ def test_forward_all_broadcasts():
 
 
 # ---------------------------------------------------------------------------
-# 9. ToolCardHandler — accumulates history (max 5)
+# 13. ToolCardHandler — accumulates history (max 5), emits tool_notify
 # ---------------------------------------------------------------------------
 
 def test_tool_card_accumulates_history():
@@ -233,7 +293,7 @@ def test_tool_card_accumulates_history():
 
     # history trimmed to last 5
     assert update.changes["metadata"]["history"] == ["b", "c", "d", "e", "f"]
-    assert transport.payload["type"] == "tool_card_update"
+    assert transport.payload["action"] == "tool_notify"
     assert "f" in transport.payload["text"]
     # oldest entry dropped
     assert "a" not in transport.payload["text"]
@@ -249,7 +309,7 @@ def test_tool_card_starts_empty():
 
 
 # ---------------------------------------------------------------------------
-# 10 & 11. get_handler — returns correct types / raises on unknown
+# 14 & 15. get_handler — returns correct types / raises on unknown
 # ---------------------------------------------------------------------------
 
 def test_get_handler_returns_correct_types():
@@ -265,56 +325,7 @@ def test_get_handler_raises_on_unknown():
 
 
 # ---------------------------------------------------------------------------
-# 12. CCSessionHandler — send_file
-# ---------------------------------------------------------------------------
-
-def test_cc_session_send_file():
-    actor = make_actor(address="actor://cc", tag="session-1")
-    msg = make_msg(
-        sender="actor://cc",
-        type="command",
-        payload={"command": "send_file", "chat_id": "c1", "file_path": "/tmp/test.pdf"},
-    )
-    actions = CCSessionHandler().handle(actor, msg)
-    assert len(actions) == 1
-    assert isinstance(actions[0], TransportSend)
-    assert actions[0].payload["type"] == "send_file"
-    assert actions[0].payload["chat_id"] == "c1"
-    assert actions[0].payload["file_path"] == "/tmp/test.pdf"
-
-
-# ---------------------------------------------------------------------------
-# 13. CCSessionHandler — react
-# ---------------------------------------------------------------------------
-
-def test_cc_session_react():
-    actor = make_actor(address="actor://cc", tag="session-1")
-    msg = make_msg(
-        sender="actor://cc",
-        type="command",
-        payload={"command": "react", "message_id": "m1", "emoji_type": "HEART"},
-    )
-    actions = CCSessionHandler().handle(actor, msg)
-    assert len(actions) == 1
-    assert isinstance(actions[0], TransportSend)
-    assert actions[0].payload["type"] == "react"
-    assert actions[0].payload["message_id"] == "m1"
-    assert actions[0].payload["emoji_type"] == "HEART"
-
-
-def test_cc_session_react_default_emoji():
-    actor = make_actor(address="actor://cc", tag="session-1")
-    msg = make_msg(
-        sender="actor://cc",
-        type="command",
-        payload={"command": "react", "message_id": "m1"},
-    )
-    actions = CCSessionHandler().handle(actor, msg)
-    assert actions[0].payload["emoji_type"] == "THUMBSUP"
-
-
-# ---------------------------------------------------------------------------
-# 14. AdminHandler — /help
+# 16. AdminHandler — /help
 # ---------------------------------------------------------------------------
 
 def test_admin_help_command():
@@ -333,7 +344,7 @@ def test_admin_help_command():
 
 
 # ---------------------------------------------------------------------------
-# 15. AdminHandler — unknown command
+# 17. AdminHandler — unknown command
 # ---------------------------------------------------------------------------
 
 def test_admin_unknown_command():
@@ -350,7 +361,7 @@ def test_admin_unknown_command():
 
 
 # ---------------------------------------------------------------------------
-# 16. AdminHandler — session command passthrough
+# 18. AdminHandler — session command passthrough
 # ---------------------------------------------------------------------------
 
 def test_admin_session_command_passthrough():
@@ -369,7 +380,7 @@ def test_admin_session_command_passthrough():
 
 
 # ---------------------------------------------------------------------------
-# 17. AdminHandler — system notification forward
+# 19. AdminHandler — system notification forward (msg_type in payload)
 # ---------------------------------------------------------------------------
 
 def test_admin_system_notification_forward():
@@ -378,7 +389,10 @@ def test_admin_system_notification_forward():
         handler="admin",
         downstream=["cc:user.root", "feishu:chat1"],
     )
-    msg = make_msg(sender="system:runtime", type="system", payload={"text": "server online"})
+    msg = make_msg(
+        sender="system:runtime",
+        payload={"msg_type": "system", "text": "server online"},
+    )
     actions = AdminHandler().handle(actor, msg)
     assert len(actions) == 2
     targets = {a.to for a in actions}
@@ -389,7 +403,7 @@ def test_admin_system_notification_forward():
 
 
 # ---------------------------------------------------------------------------
-# 18. AdminHandler — non-slash message passthrough
+# 20. AdminHandler — non-slash message passthrough
 # ---------------------------------------------------------------------------
 
 def test_admin_non_slash_passthrough():
@@ -406,7 +420,7 @@ def test_admin_non_slash_passthrough():
 
 
 # ---------------------------------------------------------------------------
-# 19. get_handler returns admin handler
+# 21. get_handler returns admin handler
 # ---------------------------------------------------------------------------
 
 def test_get_handler_returns_admin():

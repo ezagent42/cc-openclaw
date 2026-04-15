@@ -150,7 +150,7 @@ class ActorRuntime:
                 except asyncio.TimeoutError:
                     continue
                 try:
-                    log.info("Actor %s processing msg from %s type=%s", actor.address, msg.sender, msg.type)
+                    log.info("Actor %s processing msg from %s action=%s", actor.address, msg.sender, msg.payload.get("action") or msg.payload.get("msg_type", "message"))
                     actions = handler.handle(actor, msg)
                     log.info("Actor %s produced %d actions: %s", actor.address, len(actions), [type(a).__name__ for a in actions])
                     for action in actions:
@@ -170,8 +170,7 @@ class ActorRuntime:
                             actor.parent,
                             Message(
                                 sender=actor.address,
-                                type="error",
-                                payload={"error": str(e)},
+                                payload={"msg_type": "error", "error": str(e)},
                             ),
                         )
                     if error_count >= max_errors:

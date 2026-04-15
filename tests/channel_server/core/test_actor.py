@@ -2,6 +2,7 @@
 import pytest
 from channel_server.core.actor import (
     Actor,
+    Delivery,
     Transport,
     Message,
     Send,
@@ -58,29 +59,42 @@ class TestActorCreation:
 
 
 class TestMessageCreation:
-    def test_message_creation(self):
-        """Message with required fields uses correct defaults."""
-        msg = Message(sender="user://alice", type="chat")
+    def test_message_defaults(self):
+        """Message with only sender uses correct defaults."""
+        msg = Message(sender="user://alice")
         assert msg.sender == "user://alice"
-        assert msg.type == "chat"
         assert msg.payload == {}
         assert msg.metadata == {}
+        assert msg.delivery == Delivery.ONESHOT
+
+    def test_message_delivery_stream(self):
+        """Message can be created with STREAM delivery."""
+        msg = Message(sender="user://alice", delivery=Delivery.STREAM)
+        assert msg.delivery == Delivery.STREAM
 
     def test_message_with_payload(self):
         """Message stores payload and metadata correctly."""
         msg = Message(
             sender="bot://bot1",
-            type="command",
             payload={"text": "hello"},
             metadata={"timestamp": "2026-01-01T00:00:00Z"},
         )
         assert msg.payload == {"text": "hello"}
         assert msg.metadata == {"timestamp": "2026-01-01T00:00:00Z"}
 
+    def test_delivery_enum_serializes_as_string(self):
+        """Delivery enum values serialize as plain strings."""
+        assert str(Delivery.ONESHOT) == "Delivery.ONESHOT"
+        assert Delivery.ONESHOT.value == "oneshot"
+        assert Delivery.STREAM.value == "stream"
+        # str(Enum) works for JSON-like contexts
+        assert Delivery.ONESHOT == "oneshot"
+        assert Delivery.STREAM == "stream"
+
 
 class TestActionTypes:
     def test_send_action(self):
-        msg = Message(sender="a://1", type="ping")
+        msg = Message(sender="a://1")
         action = Send(to="b://2", message=msg)
         assert action.to == "b://2"
         assert action.message is msg
@@ -113,7 +127,7 @@ class TestActionTypes:
 
     def test_action_union_isinstance(self):
         """All action types are valid Action instances (type alias check via isinstance)."""
-        msg = Message(sender="a://1", type="t")
+        msg = Message(sender="a://1")
         actions = [
             Send(to="b://2", message=msg),
             TransportSend(payload={}),

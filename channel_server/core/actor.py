@@ -3,7 +3,14 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
+from enum import Enum
 from typing import Union
+
+
+class Delivery(str, Enum):
+    """How a message should be delivered."""
+    ONESHOT = "oneshot"
+    STREAM = "stream"
 
 
 @dataclass
@@ -75,9 +82,9 @@ class Actor:
 class Message:
     """A message routed between actors."""
     sender: str
-    type: str
     payload: dict = field(default_factory=dict)
     metadata: dict = field(default_factory=dict)
+    delivery: Delivery = Delivery.ONESHOT
 
 
 # ---------------------------------------------------------------------------

@@ -336,3 +336,78 @@ async def test_shutdown_cancels_all_tasks():
 
     # After shutdown, all actors should have loops cancelled / runtime stopped.
     assert rt._stop_event.is_set()
+
+
+# ---------------------------------------------------------------------------
+# 13. handler error notifies parent
+# ---------------------------------------------------------------------------
+
+async def test_handler_error_notifies_parent():
+    """A broken child handler should send an error message to its parent."""
+    rt = make_runtime()
+    from channel_server.core.handler import HANDLER_REGISTRY
+
+    class BrokenHandler:
+        def handle(self, actor, msg):
+            raise RuntimeError("test-error")
+
+    received: list = []
+
+    class CollectorHandler:
+        def __init__(self, sink):
+            self._sink = sink
+
+        def handle(self, actor, msg):
+            self._sink.append(msg)
+            return []
+
+    HANDLER_REGISTRY["broken_notify"] = BrokenHandler()
+    HANDLER_REGISTRY["collector_notify"] = CollectorHandler(received)
+    try:
+        rt.spawn("actor://parent", "collector_notify")
+        rt.spawn("actor://child", "broken_notify", parent="actor://parent")
+
+        rt.send("actor://child", Message(sender="actor://ext", type="chat"))
+
+        run_task = asyncio.create_task(rt.run())
+        await asyncio.sleep(0.15)
+        await rt.shutdown()
+        await run_task
+
+        assert len(received) == 1
+        assert received[0].type == "error"
+        assert "test-error" in received[0].payload["error"]
+    finally:
+        del HANDLER_REGISTRY["broken_notify"]
+        del HANDLER_REGISTRY["collector_notify"]
+
+
+# ---------------------------------------------------------------------------
+# 14. max errors stops actor
+# ---------------------------------------------------------------------------
+
+async def test_max_errors_stops_actor():
+    """After 10 consecutive handler errors the actor state becomes ended."""
+    rt = make_runtime()
+    from channel_server.core.handler import HANDLER_REGISTRY
+
+    class BrokenHandler:
+        def handle(self, actor, msg):
+            raise RuntimeError("always-broken")
+
+    HANDLER_REGISTRY["broken_max"] = BrokenHandler()
+    try:
+        actor = rt.spawn("actor://fail", "broken_max")
+
+        # Send 15 messages (more than max_errors=10)
+        for _ in range(15):
+            rt.send("actor://fail", Message(sender="actor://ext", type="chat"))
+
+        run_task = asyncio.create_task(rt.run())
+        await asyncio.sleep(0.5)
+        await rt.shutdown()
+        await run_task
+
+        assert actor.state == "ended"
+    finally:
+        del HANDLER_REGISTRY["broken_max"]

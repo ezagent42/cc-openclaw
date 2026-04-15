@@ -108,12 +108,13 @@ class ChannelServerApp:
                     downstream=[admin_actor_addr],
                 )
 
-            # Spawn admin actor between feishu and CC
-            self.runtime.spawn(
-                admin_actor_addr,
-                "admin",
-                tag="admin",
-            )
+            # Spawn admin actor between feishu and CC (if not already restored from persistence)
+            if self.runtime.lookup(admin_actor_addr) is None:
+                self.runtime.spawn(
+                    admin_actor_addr,
+                    "admin",
+                    tag="admin",
+                )
             log.info("Spawned admin actor: %s", admin_actor_addr)
 
             # Send startup notification

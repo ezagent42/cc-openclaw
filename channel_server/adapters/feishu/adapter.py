@@ -1,10 +1,12 @@
 """Feishu adapter — bridges Feishu events/API to the actor runtime."""
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import os
 import threading
+import time
 from pathlib import Path
 
 from channel_server.core.actor import Actor, Message, Transport
@@ -16,6 +18,9 @@ PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent.parent
 
 # Max size for dedup set before clearing old entries
 _SEEN_MAX = 10_000
+
+# Path for persisting open_id -> chat_id mapping
+_CHAT_ID_MAP_PATH = PROJECT_ROOT / ".openclaw" / "chat_id_map.json"
 
 
 class FeishuAdapter:
@@ -31,6 +36,8 @@ class FeishuAdapter:
         self._recent_sent: set[str] = set()  # echo prevention — message_ids we sent
         self._seen: set[str] = set()          # dedup — message_ids already processed
         self._ack_reactions: dict[str, str] = {}  # message_id -> reaction_id
+        self._last_msg_id: dict[str, str] = {}  # chat_id -> last inbound message_id
+        self._chat_id_map: dict[str, str] = self._load_chat_id_map()
 
         # Register transport handlers
         runtime.register_transport_handler("feishu_chat", self._handle_chat_transport)
@@ -50,11 +57,112 @@ class FeishuAdapter:
             return f"feishu:{chat_id}:{root_id}"
         return f"feishu:{chat_id}"
 
+    def start_feishu_ws(self, app_id: str, app_secret: str) -> None:
+        """Start Feishu WS listener in a background daemon thread.
+
+        1. Create lark_oapi EventDispatcher with on_message callback
+        2. Create WS client
+        3. Start WS client in daemon thread with its own event loop
+        """
+        try:
+            import lark_oapi as lark
+            from lark_oapi.api.im.v1 import P2ImMessageReceiveV1
+        except ImportError:
+            log.warning("lark_oapi not installed — Feishu WS listener disabled")
+            return
+
+        loop = asyncio.get_running_loop()
+
+        def on_message(data: P2ImMessageReceiveV1) -> None:
+            """Callback from Feishu WS thread — parse message and route to actor."""
+            try:
+                event = data.event
+                sender = event.sender
+                message = event.message
+
+                sender_id = sender.sender_id.open_id if sender.sender_id else ""
+                sender_type = sender.sender_type or "user"
+
+                # Skip bot's own messages
+                if sender_type == "app":
+                    return
+
+                msg_id = message.message_id or ""
+                if msg_id in self._recent_sent:
+                    return
+
+                # Parse content via parsers registry
+                from channel_server.adapters.feishu.parsers import parse_message
+                msg_type = message.message_type or "text"
+                try:
+                    content_json = json.loads(message.content or "{}")
+                except Exception:
+                    content_json = {}
+                text, file_path = parse_message(msg_type, content_json, message, self)
+
+                chat_id = message.chat_id or ""
+                root_id = message.root_id or ""
+                chat_type = message.chat_type or ""
+
+                # Get sender name
+                sender_name = ""
+                if sender.sender_id:
+                    sender_name = getattr(sender, "tenant_key", "") or sender_id
+
+                evt = {
+                    "message_id": msg_id,
+                    "chat_id": chat_id,
+                    "root_id": root_id,
+                    "msg_type": msg_type,
+                    "text": text,
+                    "file_path": file_path,
+                    "user": sender_name,
+                    "user_id": sender_id,
+                    "chat_type": chat_type,
+                }
+
+                # Route to on_feishu_event from the main asyncio loop
+                loop.call_soon_threadsafe(self.on_feishu_event, evt)
+            except Exception as e:
+                log.error("on_message callback error: %s", e, exc_info=True)
+
+        handler = (
+            lark.EventDispatcherHandler.builder("", "")
+            .register_p2_im_message_receive_v1(on_message)
+            .build()
+        )
+        ws_client = lark.ws.Client(
+            app_id=app_id,
+            app_secret=app_secret,
+            event_handler=handler,
+            log_level=lark.LogLevel.ERROR,
+        )
+        # Suppress noisy Lark logger for unhandled event types
+        logging.getLogger("Lark").setLevel(logging.CRITICAL)
+
+        def ws_thread() -> None:
+            # lark_oapi.ws.client captures asyncio.get_event_loop() at import time.
+            # We need a fresh loop for this thread.
+            import lark_oapi.ws.client as _ws_mod
+            new_loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(new_loop)
+            _ws_mod.loop = new_loop
+            try:
+                ws_client.start()
+            except Exception as e:
+                log.error("Feishu WS error: %s", e)
+
+        t = threading.Thread(target=ws_thread, daemon=True)
+        t.start()
+        log.info("Feishu WS thread started")
+
     def on_feishu_event(self, event: dict) -> None:
         """Route a parsed Feishu message event to the appropriate actor.
 
         - Dedup by message_id
         - Skip own messages (_recent_sent)
+        - ACK reaction
+        - Record chat_id mapping
         - Auto-spawn feishu actor if not exists
         - Build Message with full metadata
         - runtime.send() to the feishu actor
@@ -70,10 +178,27 @@ class FeishuAdapter:
         if message_id:
             if message_id in self._seen:
                 return
-            # Bound the set size
-            if len(self._seen) >= _SEEN_MAX:
-                self._seen.clear()
             self._seen.add(message_id)
+            if len(self._seen) > _SEEN_MAX:
+                # Remove oldest half
+                to_remove = list(self._seen)[:5000]
+                self._seen -= set(to_remove)
+
+        # ACK reaction
+        if message_id:
+            threading.Thread(
+                target=self._send_reaction,
+                args=(message_id,),
+                kwargs={"track": True},
+                daemon=True,
+            ).start()
+            self._last_msg_id[chat_id] = message_id
+
+        # Record chat_id mapping for DMs
+        open_id = event.get("user_id", "")
+        chat_type = event.get("chat_type", "")
+        if open_id and chat_id and chat_type == "p2p":
+            self._record_chat_id(open_id, chat_id)
 
         root_id = event.get("root_id") or None
         address = self.resolve_actor_address(chat_id, root_id)
@@ -129,6 +254,11 @@ class FeishuAdapter:
         ptype = payload.get("type", "text")
         chat_id = actor.transport.config["chat_id"] if actor.transport else ""
 
+        # Remove ACK reaction for the last inbound message in this chat
+        last_msg = self._last_msg_id.pop(chat_id, "")
+        if last_msg:
+            threading.Thread(target=self._remove_reaction, args=(last_msg,), daemon=True).start()
+
         if ptype == "text":
             text = payload.get("text", "")
             threading.Thread(
@@ -170,6 +300,11 @@ class FeishuAdapter:
         chat_id = config.get("chat_id", "")
         root_id = config.get("root_id", "")
         ptype = payload.get("type", "text")
+
+        # Remove ACK reaction for the last inbound message in this chat
+        last_msg = self._last_msg_id.pop(chat_id, "")
+        if last_msg:
+            threading.Thread(target=self._remove_reaction, args=(last_msg,), daemon=True).start()
 
         if ptype == "text":
             text = payload.get("text", "")
@@ -588,6 +723,63 @@ class FeishuAdapter:
         except Exception as e:
             log.error("Inline image download error: %s", e, exc_info=True)
             return ""
+
+    # ------------------------------------------------------------------
+    # Chat ID map — maps open_id to DM chat_id for user routing
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _load_chat_id_map() -> dict[str, str]:
+        """Read chat_id map from disk. Returns {} if file doesn't exist."""
+        try:
+            if _CHAT_ID_MAP_PATH.exists():
+                return json.loads(_CHAT_ID_MAP_PATH.read_text())
+        except Exception as e:
+            log.warning("Failed to load chat_id map: %s", e)
+        return {}
+
+    def _save_chat_id_map(self) -> None:
+        """Write chat_id map to disk."""
+        try:
+            _CHAT_ID_MAP_PATH.parent.mkdir(parents=True, exist_ok=True)
+            _CHAT_ID_MAP_PATH.write_text(json.dumps(self._chat_id_map, indent=2, ensure_ascii=False))
+        except Exception as e:
+            log.warning("Failed to save chat_id map: %s", e)
+
+    def _record_chat_id(self, open_id: str, chat_id: str) -> None:
+        """Record a user's DM chat_id if not already known."""
+        if open_id not in self._chat_id_map:
+            self._chat_id_map[open_id] = chat_id
+            self._save_chat_id_map()
+            log.info("Recorded chat_id mapping: %s -> %s", open_id[:16], chat_id)
+
+    # ------------------------------------------------------------------
+    # Startup notification
+    # ------------------------------------------------------------------
+
+    def send_startup_notification(self, admin_chat_id: str) -> None:
+        """Send a startup notification to the admin chat. Blocking — run in thread."""
+        if not self.feishu_client or not admin_chat_id:
+            return
+        try:
+            from lark_oapi.api.im.v1 import CreateMessageRequest, CreateMessageRequestBody
+
+            body = (
+                CreateMessageRequestBody.builder()
+                .receive_id(admin_chat_id)
+                .msg_type("text")
+                .content(json.dumps({"text": "Channel-Server online"}))
+                .build()
+            )
+            req = CreateMessageRequest.builder().receive_id_type("chat_id").request_body(body).build()
+            resp = self.feishu_client.im.v1.message.create(req)
+            if resp.success() and resp.data and resp.data.message_id:
+                self._recent_sent.add(resp.data.message_id)
+                log.info("Sent startup notification to %s", admin_chat_id)
+            else:
+                log.warning("Startup notification failed: %s", resp.msg if resp else "no response")
+        except Exception as e:
+            log.warning("Startup notification error: %s", e)
 
     # ------------------------------------------------------------------
     # Internal helpers

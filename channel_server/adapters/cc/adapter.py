@@ -83,24 +83,24 @@ class CCAdapter:
             self.handle_disconnect(ws)
 
     async def handle_message(self, ws, msg: dict) -> None:
-        """Route incoming WS messages by type."""
-        msg_type = msg.get("type", "")
+        """Route incoming WS messages by method."""
+        method = msg.get("method", "")
 
-        if msg_type == "register":
+        if method == "register":
             await self._handle_register(ws, msg)
-        elif msg_type in ("reply", "forward", "send_summary", "update_title",
+        elif method in ("reply", "forward", "send_summary", "update_title",
                           "send_file", "react", "tool_notify"):
             self._route_to_actor(ws, msg)
-        elif msg_type == "spawn_session":
+        elif method == "spawn_session":
             await self._handle_spawn(ws, msg)
-        elif msg_type == "kill_session":
+        elif method == "kill_session":
             await self._handle_kill(ws, msg)
-        elif msg_type == "list_sessions":
+        elif method == "list_sessions":
             await self._handle_list(ws, msg)
-        elif msg_type == "pong":
+        elif method == "pong":
             pass  # ignore keepalive pongs
         else:
-            log.debug("Unknown WS message type: %s", msg_type)
+            log.debug("Unknown WS message method: %s", method)
 
     # ------------------------------------------------------------------
     # Registration
@@ -115,7 +115,7 @@ class CCAdapter:
         """
         instance_id = msg.get("instance_id", "")
         if not instance_id:
-            await ws.send(json.dumps({"type": "error", "message": "Missing instance_id"}))
+            await ws.send(json.dumps({"method": "error", "message": "Missing instance_id"}))
             return
 
         # Actor address for CC sessions
@@ -164,7 +164,7 @@ class CCAdapter:
                     admin.downstream.append(address)
                     log.info("Wired system:admin → %s", address)
 
-        await ws.send(json.dumps({"type": "registered", "address": address}))
+        await ws.send(json.dumps({"method": "registered", "address": address}))
 
     # ------------------------------------------------------------------
     # Disconnect
@@ -206,14 +206,21 @@ class CCAdapter:
         if not address:
             log.warning("_route_to_actor: unregistered WebSocket")
             return
-        log.info("CC message from %s: type=%s text=%s", address, msg.get("type"), str(msg.get("text", ""))[:60])
 
-        msg_type = msg.get("type", "")
-        payload = dict(msg)
-        payload["command"] = msg_type  # CCSessionHandler dispatches on 'command'
+        method = msg.get("method", "")
+        payload = {k: v for k, v in msg.items() if k != "method"}
 
-        # Inject parent_feishu for send_summary so the handler can route correctly
-        if msg_type == "send_summary":
+        # --- action (transport-specific operation) ---
+        # reply -> no action (default = send text)
+        # all other methods -> set as action
+        if method != "reply":
+            payload["action"] = method
+
+        log.info("CC message from %s: method=%s text=%s", address, method, str(payload.get("text", ""))[:60])
+
+        # --- addressing (routing metadata) ---
+        # send_summary needs parent_feishu injected for handler routing
+        if method == "send_summary":
             actor = self.runtime.lookup(address)
             if actor and actor.parent:
                 parent = self.runtime.lookup(actor.parent)
@@ -224,11 +231,7 @@ class CCAdapter:
                     if parent_feishu:
                         payload["parent_feishu"] = parent_feishu
 
-        actor_msg = Message(
-            sender=address,
-            type=msg_type,
-            payload=payload,
-        )
+        actor_msg = Message(sender=address, payload=payload)
         self.runtime.send(address, actor_msg)
 
     # ------------------------------------------------------------------
@@ -248,7 +251,7 @@ class CCAdapter:
         """
         address = self._ws_to_address.get(id(ws))
         if not address:
-            await ws.send(json.dumps({"type": "error", "message": "Not registered"}))
+            await ws.send(json.dumps({"method": "error", "message": "Not registered"}))
             return
 
         session_name = msg.get("session_name", "")
@@ -256,7 +259,7 @@ class CCAdapter:
 
         if not session_name:
             await ws.send(json.dumps({
-                "type": "spawn_result", "ok": False,
+                "method": "spawn_result", "ok": False,
                 "text": "Missing session_name",
             }))
             return
@@ -268,7 +271,7 @@ class CCAdapter:
         # Only root can spawn
         if len(parts) < 2 or parts[1] != "root":
             await ws.send(json.dumps({
-                "type": "spawn_result", "ok": False,
+                "method": "spawn_result", "ok": False,
                 "text": "Only root session can spawn children",
             }))
             return
@@ -277,7 +280,7 @@ class CCAdapter:
         if self.runtime.lookup(child_cc_addr) is not None and \
                 self.runtime.lookup(child_cc_addr).state != "ended":
             await ws.send(json.dumps({
-                "type": "spawn_result", "ok": False,
+                "method": "spawn_result", "ok": False,
                 "text": f"Session '{session_name}' already exists",
             }))
             return
@@ -292,7 +295,7 @@ class CCAdapter:
         )
         if active >= _MAX_CHILDREN:
             await ws.send(json.dumps({
-                "type": "spawn_result", "ok": False,
+                "method": "spawn_result", "ok": False,
                 "text": f"Max sessions ({_MAX_CHILDREN}) reached",
             }))
             return
@@ -366,7 +369,7 @@ class CCAdapter:
         self.spawn_cc_process(user, session_name, tag=tag)
 
         await ws.send(json.dumps({
-            "type": "spawn_result", "ok": True,
+            "method": "spawn_result", "ok": True,
             "text": f"Session '{session_name}' spawned",
             "session_name": session_name,
             "address": child_cc_addr,
@@ -382,13 +385,13 @@ class CCAdapter:
         """
         address = self._ws_to_address.get(id(ws))
         if not address:
-            await ws.send(json.dumps({"type": "error", "message": "Not registered"}))
+            await ws.send(json.dumps({"method": "error", "message": "Not registered"}))
             return
 
         session_name = msg.get("session_name", "") or msg.get("name", "")
         if not session_name:
             await ws.send(json.dumps({
-                "type": "kill_result", "ok": False,
+                "method": "kill_result", "ok": False,
                 "text": "Missing session_name",
             }))
             return
@@ -400,7 +403,7 @@ class CCAdapter:
         child = self.runtime.lookup(child_cc_addr)
         if child is None or child.state == "ended":
             await ws.send(json.dumps({
-                "type": "kill_result", "ok": False,
+                "method": "kill_result", "ok": False,
                 "text": f"Session '{session_name}' not found or already ended",
             }))
             return
@@ -433,7 +436,7 @@ class CCAdapter:
         self.kill_cc_process(user, session_name)
 
         await ws.send(json.dumps({
-            "type": "kill_result", "ok": True,
+            "method": "kill_result", "ok": True,
             "text": f"Session '{session_name}' killed",
             "session_name": session_name,
         }))
@@ -442,7 +445,7 @@ class CCAdapter:
         """List active sessions for the requesting user."""
         address = self._ws_to_address.get(id(ws))
         if not address:
-            await ws.send(json.dumps({"type": "error", "message": "Not registered"}))
+            await ws.send(json.dumps({"method": "error", "message": "Not registered"}))
             return
 
         parts = address.replace("cc:", "").split(".")
@@ -465,7 +468,7 @@ class CCAdapter:
             text += f"  - {s['name']} [{s['state']}] tag={s['tag']}\n"
 
         await ws.send(json.dumps({
-            "type": "sessions_list",
+            "method": "sessions_list",
             "sessions": sessions,
             "text": text.strip(),
         }))

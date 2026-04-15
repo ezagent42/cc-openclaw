@@ -47,7 +47,7 @@ async def test_handle_register_attaches_transport():
     )
 
     await adapter._handle_register(ws, {
-        "type": "register",
+        "method": "register",
         "instance_id": "alice.root",
         "tag_name": "root",
     })
@@ -62,7 +62,7 @@ async def test_handle_register_attaches_transport():
     # Verify registered ack was sent
     ws.send.assert_called_once()
     ack = json.loads(ws.send.call_args[0][0])
-    assert ack["type"] == "registered"
+    assert ack["method"] == "registered"
     assert ack["address"] == "cc:alice.root"
 
 
@@ -77,13 +77,13 @@ async def test_handle_reply_sends_to_actor():
 
     # Register a CC actor
     await adapter._handle_register(ws, {
-        "type": "register",
+        "method": "register",
         "instance_id": "alice.root",
     })
 
     # Send a reply message
     await adapter.handle_message(ws, {
-        "type": "reply",
+        "method": "reply",
         "chat_id": "oc_abc",
         "text": "hello world",
     })
@@ -93,9 +93,8 @@ async def test_handle_reply_sends_to_actor():
     assert not mailbox.empty()
     msg = mailbox.get_nowait()
     assert isinstance(msg, Message)
-    assert msg.type == "reply"
-    assert msg.payload["command"] == "reply"
-    assert msg.payload["text"] == "hello world"
+    assert msg.payload.get("text") == "hello world"
+    assert msg.payload.get("action") is None  # reply -> no action (default send text)
 
 
 # ---------------------------------------------------------------------------
@@ -108,7 +107,7 @@ async def test_handle_disconnect_detaches():
     ws = make_ws()
 
     await adapter._handle_register(ws, {
-        "type": "register",
+        "method": "register",
         "instance_id": "alice.root",
     })
 
@@ -136,7 +135,7 @@ async def test_push_to_cc_sends_via_ws():
     ws = make_ws()
 
     await adapter._handle_register(ws, {
-        "type": "register",
+        "method": "register",
         "instance_id": "alice.root",
     })
 
@@ -146,7 +145,7 @@ async def test_push_to_cc_sends_via_ws():
     # Reset send mock after registration ack
     ws.send.reset_mock()
 
-    payload = {"type": "message", "text": "incoming from feishu", "chat_id": "oc_abc"}
+    payload = {"method": "message", "text": "incoming from feishu", "chat_id": "oc_abc"}
     adapter.push_to_cc(actor, payload)
 
     # push_to_cc uses asyncio.ensure_future(ws.send(...))
@@ -155,7 +154,7 @@ async def test_push_to_cc_sends_via_ws():
 
     ws.send.assert_called_once()
     sent = json.loads(ws.send.call_args[0][0])
-    assert sent["type"] == "message"
+    assert sent["method"] == "message"
     assert sent["text"] == "incoming from feishu"
 
 
@@ -172,7 +171,7 @@ async def test_handle_register_auto_spawns():
     assert rt.lookup("cc:bob.root") is None
 
     await adapter._handle_register(ws, {
-        "type": "register",
+        "method": "register",
         "instance_id": "bob.root",
         "tag_name": "root",
     })
@@ -195,11 +194,11 @@ async def test_handle_register_rejects_missing_instance_id():
     adapter, rt = make_adapter()
     ws = make_ws()
 
-    await adapter._handle_register(ws, {"type": "register"})
+    await adapter._handle_register(ws, {"method": "register"})
 
     ws.send.assert_called_once()
     resp = json.loads(ws.send.call_args[0][0])
-    assert resp["type"] == "error"
+    assert resp["method"] == "error"
     assert "instance_id" in resp["message"].lower()
 
 
@@ -214,7 +213,7 @@ async def test_handle_list_returns_sessions():
 
     # Register root
     await adapter._handle_register(ws, {
-        "type": "register",
+        "method": "register",
         "instance_id": "alice.root",
     })
 
@@ -222,11 +221,11 @@ async def test_handle_list_returns_sessions():
     rt.spawn("cc:alice.dev", "cc_session", tag="dev", state="suspended")
 
     ws.send.reset_mock()
-    await adapter._handle_list(ws, {"type": "list_sessions"})
+    await adapter._handle_list(ws, {"method": "list_sessions"})
 
     ws.send.assert_called_once()
     resp = json.loads(ws.send.call_args[0][0])
-    assert resp["type"] == "sessions_list"
+    assert resp["method"] == "sessions_list"
     names = [s["name"] for s in resp["sessions"]]
     assert "root" in names
     assert "dev" in names
@@ -242,5 +241,5 @@ async def test_handle_message_ignores_pong():
     ws = make_ws()
 
     # This should not raise or send anything
-    await adapter.handle_message(ws, {"type": "pong"})
+    await adapter.handle_message(ws, {"method": "pong"})
     ws.send.assert_not_called()

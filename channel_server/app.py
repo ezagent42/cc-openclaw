@@ -82,15 +82,18 @@ class ChannelServerApp:
                 self.feishu_adapter.start_feishu_ws(creds["app_id"], creds["app_secret"])
                 log.info("Feishu WS listener started")
 
-                # 4. Reactivate feishu actors (their transport is always available)
+                # 4. Reactivate actors that don't need external transport
                 for actor in self.runtime.actors.values():
-                    if (
-                        actor.state == "suspended"
-                        and actor.transport is not None
-                        and actor.transport.type in ("feishu_chat", "feishu_thread")
-                    ):
+                    if actor.state != "suspended":
+                        continue
+                    # Feishu actors: transport is the API, always available
+                    if actor.transport and actor.transport.type in ("feishu_chat", "feishu_thread"):
                         actor.state = "active"
                         log.info("Reactivated feishu actor: %s", actor.address)
+                    # System actors: no transport needed, always active
+                    elif actor.transport is None and actor.address.startswith("system:"):
+                        actor.state = "active"
+                        log.info("Reactivated system actor: %s", actor.address)
 
         # 5. Spawn admin actor if admin_chat_id is set
         if self.admin_chat_id and self.feishu_adapter:

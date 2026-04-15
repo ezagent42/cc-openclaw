@@ -7,6 +7,7 @@ import logging
 import os
 import signal
 import sys
+import threading
 from pathlib import Path
 
 from channel_server.adapters.cc.adapter import CCAdapter
@@ -86,10 +87,41 @@ class ChannelServerApp:
                         actor.state = "active"
                         log.info("Reactivated feishu actor: %s", actor.address)
 
-        # 5. Start runtime message loops
+        # 5. Spawn admin actor if admin_chat_id is set
+        if self.admin_chat_id and self.feishu_adapter:
+            admin_feishu_addr = f"feishu:{self.admin_chat_id}"
+            admin_actor_addr = "system:admin"
+
+            # Ensure feishu actor exists for admin chat
+            if self.runtime.lookup(admin_feishu_addr) is None:
+                from channel_server.core.actor import Transport
+                self.runtime.spawn(
+                    admin_feishu_addr,
+                    "feishu_inbound",
+                    tag="admin",
+                    transport=Transport(type="feishu_chat", config={"chat_id": self.admin_chat_id}),
+                    downstream=[admin_actor_addr],
+                )
+
+            # Spawn admin actor between feishu and CC
+            self.runtime.spawn(
+                admin_actor_addr,
+                "admin",
+                tag="admin",
+            )
+            log.info("Spawned admin actor: %s", admin_actor_addr)
+
+            # Send startup notification
+            threading.Thread(
+                target=self.feishu_adapter.send_startup_notification,
+                args=(self.admin_chat_id,),
+                daemon=True,
+            ).start()
+
+        # 6. Start runtime message loops
         self._runtime_task = asyncio.create_task(self.runtime.run())
 
-        # 6. Start periodic persistence
+        # 7. Start periodic persistence
         self._persist_task = asyncio.create_task(self._persist_loop())
 
     async def stop(self) -> None:
@@ -125,6 +157,15 @@ class ChannelServerApp:
             log.info("Removed pidfile")
         except Exception:
             pass
+
+    def notify_admin(self, text: str) -> None:
+        """Send a system notification to the admin actor."""
+        from channel_server.core.actor import Message
+
+        self.runtime.send(
+            "system:admin",
+            Message(sender="system:runtime", type="system", payload={"text": text}),
+        )
 
     async def _persist_loop(self) -> None:
         """Save actors every 30 seconds. Handles cancellation gracefully."""

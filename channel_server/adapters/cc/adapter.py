@@ -206,6 +206,7 @@ class CCAdapter:
         if not address:
             log.warning("_route_to_actor: unregistered WebSocket")
             return
+        log.info("CC message from %s: type=%s text=%s", address, msg.get("type"), str(msg.get("text", ""))[:60])
 
         msg_type = msg.get("type", "")
         payload = dict(msg)

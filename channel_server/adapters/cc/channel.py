@@ -29,7 +29,7 @@ from mcp.types import JSONRPCMessage, JSONRPCNotification, Tool, TextContent
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent.parent
 LOG_FILE = PROJECT_ROOT / ".openclaw" / "logs" / "channel.log"
-INSTRUCTIONS_PATH = PROJECT_ROOT / "feishu" / "channel-instructions.md"
+INSTRUCTIONS_PATH = Path(__file__).resolve().parent / "channel-instructions.md"
 IDENTITY_PATH = PROJECT_ROOT / ".openclaw" / "identity.yaml"
 
 LOG_FILE.parent.mkdir(parents=True, exist_ok=True)

@@ -150,7 +150,9 @@ class ActorRuntime:
                 except asyncio.TimeoutError:
                     continue
                 try:
+                    log.info("Actor %s processing msg from %s type=%s", actor.address, msg.sender, msg.type)
                     actions = handler.handle(actor, msg)
+                    log.info("Actor %s produced %d actions: %s", actor.address, len(actions), [type(a).__name__ for a in actions])
                     for action in actions:
                         self._execute(actor, action)
                     error_count = 0
@@ -184,6 +186,7 @@ class ActorRuntime:
 
     def _execute(self, actor: Actor, action: Action) -> None:
         if isinstance(action, Send):
+            log.info("Execute Send: %s → %s", actor.address, action.to)
             self.send(action.to, action.message)
         elif isinstance(action, TransportSend):
             self._execute_transport_send(actor, action)

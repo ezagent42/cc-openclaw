@@ -100,24 +100,37 @@ class CCAdapter:
             self.handle_disconnect(ws)
 
     async def handle_message(self, ws, msg: dict) -> None:
-        """Route incoming WS messages by method."""
-        method = msg.get("method", "")
+        """Route incoming WS messages by action.
 
-        if method == "register":
+        WS messages use `action` for all routing. The action field serves
+        double duty: control actions (register, spawn_session, etc.) are
+        handled by the adapter; actor payload actions (reply, react, etc.)
+        are forwarded to the actor's mailbox as-is.
+        """
+        action = msg.get("action", "")
+
+        # -- Control actions (adapter-level, not forwarded to actors) --
+        if action == "register":
             await self._handle_register(ws, msg)
-        elif method in ("reply", "forward", "send_summary", "update_title",
-                          "send_file", "react", "tool_notify"):
-            self._route_to_actor(ws, msg)
-        elif method == "spawn_session":
+        elif action == "spawn_session":
             await self._handle_spawn(ws, msg)
-        elif method == "kill_session":
+        elif action == "kill_session":
             await self._handle_kill(ws, msg)
-        elif method == "list_sessions":
+        elif action == "list_sessions":
             await self._handle_list(ws, msg)
-        elif method == "pong":
+        elif action == "pong":
             pass  # ignore keepalive pongs
+        elif action == "tool_notify":
+            # tool_notify can come from anonymous hook connections (no register).
+            if self._ws_to_address.get(id(ws)):
+                self._route_to_actor(ws, msg)
+            else:
+                self._route_anonymous_tool_notify(msg)
         else:
-            log.debug("Unknown WS message method: %s", method)
+            # -- Actor payload actions (forwarded to actor mailbox) --
+            # No action = default reply; named actions (react, send_file, etc.)
+            # are passed through as payload["action"].
+            self._route_to_actor(ws, msg)
 
     # ------------------------------------------------------------------
     # Registration
@@ -132,7 +145,7 @@ class CCAdapter:
         """
         instance_id = msg.get("instance_id", "")
         if not instance_id:
-            await ws.send(json.dumps({"method": "error", "message": "Missing instance_id"}))
+            await ws.send(json.dumps({"action": "error", "message": "Missing instance_id"}))
             return
 
         # Actor address for CC sessions
@@ -181,7 +194,7 @@ class CCAdapter:
                     admin.downstream.append(address)
                     log.info("Wired system:admin → %s", address)
 
-        await ws.send(json.dumps({"method": "registered", "address": address}))
+        await ws.send(json.dumps({"action": "registered", "address": address}))
 
     # ------------------------------------------------------------------
     # Disconnect
@@ -218,26 +231,22 @@ class CCAdapter:
     # ------------------------------------------------------------------
 
     def _route_to_actor(self, ws, msg: dict) -> None:
-        """Convert a WS message to an actor Message and send to the CC actor."""
+        """Forward a WS message to the CC actor's mailbox as-is.
+
+        The WS payload is the actor payload — no translation needed.
+        `action` in the payload matches the actor model convention directly.
+        """
         address = self._ws_to_address.get(id(ws))
         if not address:
             log.warning("_route_to_actor: unregistered WebSocket")
             return
 
-        method = msg.get("method", "")
-        payload = {k: v for k, v in msg.items() if k != "method"}
-
-        # --- action (transport-specific operation) ---
-        # reply -> no action (default = send text)
-        # all other methods -> set as action
-        if method != "reply":
-            payload["action"] = method
-
-        log.info("CC message from %s: method=%s text=%s", address, method, str(payload.get("text", ""))[:60])
+        action = msg.get("action", "")
+        log.info("CC message from %s: action=%s text=%s", address, action or "(reply)", str(msg.get("text", ""))[:60])
 
         # --- addressing (routing metadata) ---
         # send_summary needs parent_feishu injected for handler routing
-        if method == "send_summary":
+        if action == "send_summary":
             actor = self.runtime.lookup(address)
             if actor and actor.parent:
                 parent = self.runtime.lookup(actor.parent)
@@ -246,10 +255,36 @@ class CCAdapter:
                         (d for d in parent.downstream if d.startswith("feishu:")), ""
                     )
                     if parent_feishu:
-                        payload["parent_feishu"] = parent_feishu
+                        msg["parent_feishu"] = parent_feishu
 
-        actor_msg = Message(sender=address, payload=payload)
+        actor_msg = Message(sender=address, payload=msg)
         self.runtime.send(address, actor_msg)
+
+    def _route_anonymous_tool_notify(self, msg: dict) -> None:
+        """Route a tool_notify from an anonymous WS connection (e.g. hook).
+
+        Looks up the tool_card actor by matching chat_id against registered
+        CC actors' metadata, then delivers the message directly.
+        """
+        chat_id = msg.get("chat_id", "")
+        text = msg.get("text", "")
+        if not chat_id or not text:
+            log.warning("_route_anonymous_tool_notify: missing chat_id or text")
+            return
+
+        # Find tool_card actor whose parent CC actor serves this chat_id
+        for addr, actor in self.runtime.actors.items():
+            if not addr.startswith("tool_card:") or actor.state == "ended":
+                continue
+            if actor.transport and actor.transport.config.get("chat_id") == chat_id:
+                actor_msg = Message(
+                    sender="hook:tool_notify",
+                    payload={"action": "tool_notify", "text": text},
+                )
+                self.runtime.send(addr, actor_msg)
+                return
+
+        log.debug("_route_anonymous_tool_notify: no tool_card actor for chat_id=%s", chat_id)
 
     # ------------------------------------------------------------------
     # Session management — spawn / kill / list
@@ -268,7 +303,7 @@ class CCAdapter:
         """
         address = self._ws_to_address.get(id(ws))
         if not address:
-            await ws.send(json.dumps({"method": "error", "message": "Not registered"}))
+            await ws.send(json.dumps({"action": "error", "message": "Not registered"}))
             return
 
         session_name = msg.get("session_name", "")
@@ -276,7 +311,7 @@ class CCAdapter:
 
         if not session_name:
             await ws.send(json.dumps({
-                "method": "spawn_result", "ok": False,
+                "action": "spawn_result", "ok": False,
                 "text": "Missing session_name",
             }))
             return
@@ -288,7 +323,7 @@ class CCAdapter:
         # Only root can spawn
         if len(parts) < 2 or parts[1] != "root":
             await ws.send(json.dumps({
-                "method": "spawn_result", "ok": False,
+                "action": "spawn_result", "ok": False,
                 "text": "Only root session can spawn children",
             }))
             return
@@ -297,7 +332,7 @@ class CCAdapter:
         if self.runtime.lookup(child_cc_addr) is not None and \
                 self.runtime.lookup(child_cc_addr).state != "ended":
             await ws.send(json.dumps({
-                "method": "spawn_result", "ok": False,
+                "action": "spawn_result", "ok": False,
                 "text": f"Session '{session_name}' already exists",
             }))
             return
@@ -312,7 +347,7 @@ class CCAdapter:
         )
         if active >= _MAX_CHILDREN:
             await ws.send(json.dumps({
-                "method": "spawn_result", "ok": False,
+                "action": "spawn_result", "ok": False,
                 "text": f"Max sessions ({_MAX_CHILDREN}) reached",
             }))
             return
@@ -385,7 +420,7 @@ class CCAdapter:
         # Start CC process via tmux
         if self.spawn_cc_process(user, session_name, tag=tag):
             await ws.send(json.dumps({
-                "method": "spawn_result", "ok": True,
+                "action": "spawn_result", "ok": True,
                 "text": f"Session '{session_name}' spawned",
                 "session_name": session_name,
                 "address": child_cc_addr,
@@ -398,7 +433,7 @@ class CCAdapter:
                 if addr:
                     self.runtime.stop(addr)
             await ws.send(json.dumps({
-                "method": "spawn_result", "ok": False,
+                "action": "spawn_result", "ok": False,
                 "text": f"Session '{session_name}' failed: could not create tmux window (session={_TMUX_SESSION})",
             }))
 
@@ -412,13 +447,13 @@ class CCAdapter:
         """
         address = self._ws_to_address.get(id(ws))
         if not address:
-            await ws.send(json.dumps({"method": "error", "message": "Not registered"}))
+            await ws.send(json.dumps({"action": "error", "message": "Not registered"}))
             return
 
         session_name = msg.get("session_name", "") or msg.get("name", "")
         if not session_name:
             await ws.send(json.dumps({
-                "method": "kill_result", "ok": False,
+                "action": "kill_result", "ok": False,
                 "text": "Missing session_name",
             }))
             return
@@ -430,7 +465,7 @@ class CCAdapter:
         child = self.runtime.lookup(child_cc_addr)
         if child is None or child.state == "ended":
             await ws.send(json.dumps({
-                "method": "kill_result", "ok": False,
+                "action": "kill_result", "ok": False,
                 "text": f"Session '{session_name}' not found or already ended",
             }))
             return
@@ -463,7 +498,7 @@ class CCAdapter:
         self.kill_cc_process(user, session_name)
 
         await ws.send(json.dumps({
-            "method": "kill_result", "ok": True,
+            "action": "kill_result", "ok": True,
             "text": f"Session '{session_name}' killed",
             "session_name": session_name,
         }))
@@ -472,7 +507,7 @@ class CCAdapter:
         """List active sessions for the requesting user."""
         address = self._ws_to_address.get(id(ws))
         if not address:
-            await ws.send(json.dumps({"method": "error", "message": "Not registered"}))
+            await ws.send(json.dumps({"action": "error", "message": "Not registered"}))
             return
 
         parts = address.replace("cc:", "").split(".")
@@ -495,7 +530,7 @@ class CCAdapter:
             text += f"  - {s['name']} [{s['state']}] tag={s['tag']}\n"
 
         await ws.send(json.dumps({
-            "method": "sessions_list",
+            "action": "sessions_list",
             "sessions": sessions,
             "text": text.strip(),
         }))

@@ -47,7 +47,7 @@ async def test_handle_register_attaches_transport():
     )
 
     await adapter._handle_register(ws, {
-        "method": "register",
+        "action": "register",
         "instance_id": "alice.root",
         "tag_name": "root",
     })
@@ -62,7 +62,7 @@ async def test_handle_register_attaches_transport():
     # Verify registered ack was sent
     ws.send.assert_called_once()
     ack = json.loads(ws.send.call_args[0][0])
-    assert ack["method"] == "registered"
+    assert ack["action"] == "registered"
     assert ack["address"] == "cc:alice.root"
 
 
@@ -77,13 +77,12 @@ async def test_handle_reply_sends_to_actor():
 
     # Register a CC actor
     await adapter._handle_register(ws, {
-        "method": "register",
+        "action": "register",
         "instance_id": "alice.root",
     })
 
-    # Send a reply message
+    # Send a reply message (no action = default text reply)
     await adapter.handle_message(ws, {
-        "method": "reply",
         "chat_id": "oc_abc",
         "text": "hello world",
     })
@@ -94,7 +93,7 @@ async def test_handle_reply_sends_to_actor():
     msg = mailbox.get_nowait()
     assert isinstance(msg, Message)
     assert msg.payload.get("text") == "hello world"
-    assert msg.payload.get("action") is None  # reply -> no action (default send text)
+    assert msg.payload.get("action", "") == ""  # no action = default send text
 
 
 # ---------------------------------------------------------------------------
@@ -107,7 +106,7 @@ async def test_handle_disconnect_detaches():
     ws = make_ws()
 
     await adapter._handle_register(ws, {
-        "method": "register",
+        "action": "register",
         "instance_id": "alice.root",
     })
 
@@ -135,7 +134,7 @@ async def test_push_to_cc_sends_via_ws():
     ws = make_ws()
 
     await adapter._handle_register(ws, {
-        "method": "register",
+        "action": "register",
         "instance_id": "alice.root",
     })
 
@@ -145,7 +144,7 @@ async def test_push_to_cc_sends_via_ws():
     # Reset send mock after registration ack
     ws.send.reset_mock()
 
-    payload = {"method": "message", "text": "incoming from feishu", "chat_id": "oc_abc"}
+    payload = {"action": "message", "text": "incoming from feishu", "chat_id": "oc_abc"}
     adapter.push_to_cc(actor, payload)
 
     # push_to_cc uses asyncio.ensure_future(ws.send(...))
@@ -154,7 +153,7 @@ async def test_push_to_cc_sends_via_ws():
 
     ws.send.assert_called_once()
     sent = json.loads(ws.send.call_args[0][0])
-    assert sent["method"] == "message"
+    assert sent["action"] == "message"
     assert sent["text"] == "incoming from feishu"
 
 
@@ -171,7 +170,7 @@ async def test_handle_register_auto_spawns():
     assert rt.lookup("cc:bob.root") is None
 
     await adapter._handle_register(ws, {
-        "method": "register",
+        "action": "register",
         "instance_id": "bob.root",
         "tag_name": "root",
     })
@@ -194,11 +193,11 @@ async def test_handle_register_rejects_missing_instance_id():
     adapter, rt = make_adapter()
     ws = make_ws()
 
-    await adapter._handle_register(ws, {"method": "register"})
+    await adapter._handle_register(ws, {"action": "register"})
 
     ws.send.assert_called_once()
     resp = json.loads(ws.send.call_args[0][0])
-    assert resp["method"] == "error"
+    assert resp["action"] == "error"
     assert "instance_id" in resp["message"].lower()
 
 
@@ -213,7 +212,7 @@ async def test_handle_list_returns_sessions():
 
     # Register root
     await adapter._handle_register(ws, {
-        "method": "register",
+        "action": "register",
         "instance_id": "alice.root",
     })
 
@@ -221,11 +220,11 @@ async def test_handle_list_returns_sessions():
     rt.spawn("cc:alice.dev", "cc_session", tag="dev", state="suspended")
 
     ws.send.reset_mock()
-    await adapter._handle_list(ws, {"method": "list_sessions"})
+    await adapter._handle_list(ws, {"action": "list_sessions"})
 
     ws.send.assert_called_once()
     resp = json.loads(ws.send.call_args[0][0])
-    assert resp["method"] == "sessions_list"
+    assert resp["action"] == "sessions_list"
     names = [s["name"] for s in resp["sessions"]]
     assert "root" in names
     assert "dev" in names
@@ -241,7 +240,7 @@ async def test_handle_message_ignores_pong():
     ws = make_ws()
 
     # This should not raise or send anything
-    await adapter.handle_message(ws, {"method": "pong"})
+    await adapter.handle_message(ws, {"action": "pong"})
     ws.send.assert_not_called()
 
 
@@ -285,7 +284,7 @@ async def test_handle_spawn_rollback_on_failure():
 
     # Register root session
     await adapter._handle_register(ws, {
-        "method": "register",
+        "action": "register",
         "instance_id": "alice.root",
         "tag_name": "root",
     })
@@ -295,14 +294,14 @@ async def test_handle_spawn_rollback_on_failure():
     # Mock spawn_cc_process to fail
     with patch.object(adapter, "spawn_cc_process", return_value=False):
         await adapter._handle_spawn(ws, {
-            "method": "spawn",
+            "action": "spawn",
             "session_name": "broken-child",
         })
 
     # spawn_result should report failure
     ws.send.assert_called_once()
     resp = json.loads(ws.send.call_args[0][0])
-    assert resp["method"] == "spawn_result"
+    assert resp["action"] == "spawn_result"
     assert resp["ok"] is False
     assert "failed" in resp["text"].lower()
 
@@ -317,7 +316,7 @@ async def test_handle_spawn_success():
     ws = make_ws()
 
     await adapter._handle_register(ws, {
-        "method": "register",
+        "action": "register",
         "instance_id": "alice.root",
         "tag_name": "root",
     })
@@ -326,15 +325,57 @@ async def test_handle_spawn_success():
 
     with patch.object(adapter, "spawn_cc_process", return_value=True):
         await adapter._handle_spawn(ws, {
-            "method": "spawn",
+            "action": "spawn",
             "session_name": "good-child",
         })
 
     ws.send.assert_called_once()
     resp = json.loads(ws.send.call_args[0][0])
-    assert resp["method"] == "spawn_result"
+    assert resp["action"] == "spawn_result"
     assert resp["ok"] is True
 
     child = rt.lookup("cc:alice.good-child")
     assert child is not None
     assert child.state == "suspended"
+
+
+# ---------------------------------------------------------------------------
+# 12. _route_anonymous_tool_notify routes by chat_id
+# ---------------------------------------------------------------------------
+
+def test_route_anonymous_tool_notify():
+    adapter, rt = make_adapter()
+
+    # Create a tool_card actor with matching chat_id
+    rt.spawn(
+        "tool_card:alice.root",
+        "tool_card",
+        tag="root",
+        transport=Transport(type="feishu_chat", config={"chat_id": "oc_test123"}),
+        metadata={"card_msg_id": "om_card_1"},
+    )
+
+    adapter._route_anonymous_tool_notify({
+        "action": "tool_notify",
+        "chat_id": "oc_test123",
+        "text": "Running tests...",
+    })
+
+    mailbox = rt.mailboxes.get("tool_card:alice.root")
+    assert mailbox is not None
+    assert not mailbox.empty()
+    msg = mailbox.get_nowait()
+    assert msg.payload["action"] == "tool_notify"
+    assert msg.payload["text"] == "Running tests..."
+    assert msg.sender == "hook:tool_notify"
+
+
+def test_route_anonymous_tool_notify_no_match():
+    adapter, rt = make_adapter()
+
+    # No tool_card actor for this chat_id — should not raise
+    adapter._route_anonymous_tool_notify({
+        "action": "tool_notify",
+        "chat_id": "oc_nonexistent",
+        "text": "Running tests...",
+    })

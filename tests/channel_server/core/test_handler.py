@@ -81,7 +81,7 @@ def test_cc_session_external_message():
     actions = CCSessionHandler().handle(actor, msg)
     assert len(actions) == 1
     assert isinstance(actions[0], TransportSend)
-    assert actions[0].payload["method"] == "message"
+    assert actions[0].payload["action"] == "message"
     assert actions[0].payload["text"] == "hello"
 
 
@@ -306,6 +306,24 @@ def test_tool_card_starts_empty():
 
     update = next(a for a in actions if isinstance(a, UpdateActor))
     assert update.changes["metadata"]["history"] == ["first"]
+
+
+def test_tool_card_includes_card_msg_id():
+    actor = make_actor(metadata={"card_msg_id": "om_card_123"})
+    msg = make_msg(payload={"text": "Running tests"})
+    actions = ToolCardHandler().handle(actor, msg)
+
+    transport = next(a for a in actions if isinstance(a, TransportSend))
+    assert transport.payload["card_msg_id"] == "om_card_123"
+
+
+def test_tool_card_empty_card_msg_id():
+    actor = make_actor(metadata={})
+    msg = make_msg(payload={"text": "Running tests"})
+    actions = ToolCardHandler().handle(actor, msg)
+
+    transport = next(a for a in actions if isinstance(a, TransportSend))
+    assert transport.payload["card_msg_id"] == ""
 
 
 # ---------------------------------------------------------------------------

@@ -54,7 +54,7 @@ async def test_end_to_end_feishu_to_cc():
 
     assert len(transport_log) == 1
     assert transport_log[0]["text"] == "hello"
-    assert transport_log[0]["method"] == "message"
+    assert transport_log[0]["action"] == "message"
 
     await runtime.shutdown()
     await task

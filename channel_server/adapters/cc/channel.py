@@ -110,7 +110,7 @@ class ChannelClient:
 
     async def _register(self, ws):
         payload = {
-            "method": "register",
+            "action": "register",
             "role": "developer" if ("*" in self.chat_ids or not self.chat_ids) else "production",
             "chat_ids": self.chat_ids,
             "instance_id": self.instance_id,
@@ -120,7 +120,7 @@ class ChannelClient:
             payload["tag_name"] = self.tag_name
         await ws.send(json.dumps(payload))
         resp = json.loads(await ws.recv())
-        if resp.get("method") == "error":
+        if resp.get("action") == "error":
             log.error(f"Registration failed: {resp}")
             raise RuntimeError(resp.get("message", "Registration failed"))
         log.info(f"Registered with channel-server: chat_ids={self.chat_ids}")
@@ -128,14 +128,14 @@ class ChannelClient:
     async def _message_loop(self, ws):
         async for raw in ws:
             msg = json.loads(raw)
-            method = msg.get("method")
-            if method == "message":
+            action = msg.get("action")
+            if action == "message":
                 await self._message_queue.put(msg)
-            elif method == "forwarded_message":
+            elif action == "forwarded_message":
                 from_id = msg.get("from", "unknown")
                 text = msg.get("text", "")
                 await self._message_queue.put({
-                    "method": "message",
+                    "action": "message",
                     "text": f"[from {from_id}] {text}",
                     "user": from_id,
                     "user_id": from_id,
@@ -143,10 +143,10 @@ class ChannelClient:
                     "source": "forward",
                     "ts": datetime.now(tz=timezone.utc).isoformat(),
                 })
-            elif method in ("spawn_result", "kill_result", "sessions_list"):
+            elif action in ("spawn_result", "kill_result", "sessions_list"):
                 # Session management responses -- inject as channel notification
                 await self._message_queue.put({
-                    "method": "message",
+                    "action": "message",
                     "text": msg.get("text", json.dumps(msg)),
                     "user": "channel-server",
                     "user_id": "system",
@@ -154,55 +154,55 @@ class ChannelClient:
                     "source": "system",
                     "ts": datetime.now(tz=timezone.utc).isoformat(),
                 })
-            elif method == "ping":
-                await ws.send(json.dumps({"method": "pong"}))
-            elif method == "error":
+            elif action == "ping":
+                await ws.send(json.dumps({"action": "pong"}))
+            elif action == "error":
                 log.error(f"Server error: {msg}")
             else:
-                log.warning(f"_message_loop: unhandled method={method!r} keys={list(msg.keys())}")
+                log.warning(f"_message_loop: unhandled action={action!r} keys={list(msg.keys())}")
 
     async def send_reply(self, chat_id, text):
         if self.ws:
             await self.ws.send(json.dumps({
-                "method": "reply", "chat_id": chat_id, "text": text,
+                "chat_id": chat_id, "text": text,
             }))
 
     async def send_react(self, message_id, emoji_type):
         if self.ws:
             await self.ws.send(json.dumps({
-                "method": "react", "message_id": message_id, "emoji_type": emoji_type,
+                "action": "react", "message_id": message_id, "emoji_type": emoji_type,
             }))
 
     async def send_file(self, chat_id, file_path):
         if self.ws:
             await self.ws.send(json.dumps({
-                "method": "send_file", "chat_id": chat_id, "file_path": file_path,
+                "action": "send_file", "chat_id": chat_id, "file_path": file_path,
             }))
 
     async def send_forward(self, target_instance, text):
         if self.ws:
             await self.ws.send(json.dumps({
-                "method": "forward", "target_instance": target_instance, "text": text,
+                "action": "forward", "target_instance": target_instance, "text": text,
             }))
 
     async def send_summary(self, text):
         """Send summary to notify root session main chat."""
         if self.ws:
             await self.ws.send(json.dumps({
-                "method": "send_summary", "text": text,
+                "action": "send_summary", "text": text,
             }))
 
     async def update_title(self, title):
         """Update this session's thread anchor card title."""
         if self.ws:
             await self.ws.send(json.dumps({
-                "method": "update_title", "title": title,
+                "action": "update_title", "title": title,
             }))
 
     async def send_spawn(self, session_name, tag=None):
         """Request channel_server to spawn a child session."""
         if self.ws:
-            payload = {"method": "spawn_session", "session_name": session_name}
+            payload = {"action": "spawn_session", "session_name": session_name}
             if tag:
                 payload["tag"] = tag
             await self.ws.send(json.dumps(payload))
@@ -211,18 +211,18 @@ class ChannelClient:
         """Request channel_server to kill a child session."""
         if self.ws:
             await self.ws.send(json.dumps({
-                "method": "kill_session", "session_name": session_name,
+                "action": "kill_session", "session_name": session_name,
             }))
 
     async def send_list_sessions(self):
         """Request channel_server to list active sessions for this user."""
         if self.ws:
-            await self.ws.send(json.dumps({"method": "list_sessions"}))
+            await self.ws.send(json.dumps({"action": "list_sessions"}))
 
     async def send_ux_event(self, chat_id, event, data=None):
         if self.ws:
             await self.ws.send(json.dumps({
-                "method": "ux_event", "chat_id": chat_id, "event": event,
+                "action": "ux_event", "chat_id": chat_id, "event": event,
                 "data": data or {},
             }))
 
@@ -640,7 +640,7 @@ async def main():
         async def consume_messages():
             while True:
                 msg = await _channel_client._message_queue.get()
-                log.info(f"consume_messages: got msg method={msg.get('method')} chat_id={msg.get('chat_id')} source={msg.get('source')} text={msg.get('text','')[:40]}")
+                log.info(f"consume_messages: got msg action={msg.get('action')} chat_id={msg.get('chat_id')} source={msg.get('source')} text={msg.get('text','')[:40]}")
                 try:
                     _refresh_instructions(server)
                     await inject_message(write_stream, msg)

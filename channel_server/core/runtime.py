@@ -102,6 +102,13 @@ class ActorRuntime:
         mailbox = self.mailboxes.get(to)
         if mailbox is not None:
             mailbox.put_nowait(message)
+            # Debug: check if actor loop task is still alive
+            task = self._tasks.get(to)
+            if task is None or task.done():
+                log.warning("send: actor %s has no running loop task (state=%s, task=%s)",
+                            to, actor.state, "done" if task and task.done() else "missing")
+        else:
+            log.warning("send: no mailbox for %s", to)
 
     def lookup(self, address: str) -> Actor | None:
         """Look up an actor by address."""

@@ -278,7 +278,22 @@ class FeishuAdapter:
             self._record_chat_id(open_id, chat_id)
 
         root_id = event.get("root_id") or None
-        address = self.resolve_actor_address(chat_id, root_id)
+
+        # For thread messages (root_id set), check if a thread actor exists
+        # and has downstream. If not, route to the main chat actor instead —
+        # this handles feishu "reply" messages in DMs which set root_id but
+        # aren't part of a spawned thread session.
+        if root_id:
+            thread_addr = self.resolve_actor_address(chat_id, root_id)
+            thread_actor = self.runtime.lookup(thread_addr)
+            if thread_actor and thread_actor.state != "ended" and thread_actor.downstream:
+                address = thread_addr
+            else:
+                # No active thread session — fall back to main chat
+                address = self.resolve_actor_address(chat_id, None)
+                root_id = None
+        else:
+            address = self.resolve_actor_address(chat_id, None)
 
         # Auto-spawn actor if not present
         actor = self.runtime.lookup(address)

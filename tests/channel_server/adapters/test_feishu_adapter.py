@@ -6,7 +6,7 @@ import json
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
-from channel_server.core.actor import Message
+from channel_server.core.actor import Message, Transport
 from channel_server.core.runtime import ActorRuntime
 from channel_server.adapters.feishu.adapter import FeishuAdapter
 
@@ -148,18 +148,43 @@ def test_on_feishu_event_skip_own_messages():
 # 7. on_feishu_event — thread events spawn with feishu_thread transport
 # ---------------------------------------------------------------------------
 
-def test_on_feishu_event_thread_transport():
+def test_on_feishu_event_thread_without_session_falls_back_to_chat():
+    """Thread messages without an active thread session go to main chat actor."""
     adapter, rt = make_adapter()
     evt = feishu_event(root_id="om_root789")
     adapter.on_feishu_event(evt)
 
-    addr = "feishu:oc_abc123:om_root789"
+    # Should route to main chat, not create a thread actor
+    addr = "feishu:oc_abc123"
     actor = rt.lookup(addr)
     assert actor is not None
-    assert actor.transport is not None
-    assert actor.transport.type == "feishu_thread"
-    assert actor.transport.config["chat_id"] == "oc_abc123"
-    assert actor.transport.config["root_id"] == "om_root789"
+    assert actor.transport.type == "feishu_chat"
+
+    # Thread actor should NOT be created
+    thread_addr = "feishu:oc_abc123:om_root789"
+    assert rt.lookup(thread_addr) is None
+
+
+def test_on_feishu_event_thread_with_session_routes_to_thread():
+    """Thread messages with an active thread session go to that thread actor."""
+    adapter, rt = make_adapter()
+
+    # Pre-spawn a thread actor with downstream (simulating a spawned session)
+    rt.spawn(
+        "feishu:oc_abc123:om_root789",
+        "feishu_inbound",
+        tag="session",
+        transport=Transport(type="feishu_thread", config={"chat_id": "oc_abc123", "root_id": "om_root789"}),
+        downstream=["cc:user.child"],
+    )
+
+    evt = feishu_event(root_id="om_root789")
+    adapter.on_feishu_event(evt)
+
+    # Message should go to thread actor
+    mailbox = rt.mailboxes.get("feishu:oc_abc123:om_root789")
+    assert mailbox is not None
+    assert not mailbox.empty()
 
 
 # ---------------------------------------------------------------------------

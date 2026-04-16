@@ -13,10 +13,11 @@ Two issues remain after the actor model remediation:
    `_handle_register` only attaches a WebSocket transport and auto-spawns a minimal actor — no tool card, no unified init path.
    Result: root session has no tool card; child session resume logic is incomplete.
 
-2. **`/spawn`, `/kill`, `/sessions` flow through the LLM (Feishu path).**
-   User sends `/spawn voice-widget` in Feishu → admin actor → cc:user.root → Claude interprets → calls MCP tool → channel server executes.
-   These are deterministic commands that waste tokens and add latency.
-   Note: the CC WebSocket protocol also has direct `spawn_session`/`kill_session`/`list_sessions` actions (adapter.py:116-119) which already short-circuit. The Feishu text path is the one that needs fixing.
+2. **`/spawn`, `/kill`, `/sessions` have two divergent entry points.**
+   - **Feishu text path:** User sends `/spawn voice-widget` → admin actor → cc:user.root → Claude interprets → calls MCP tool → channel server executes. Wasteful: deterministic commands flow through LLM.
+   - **CC WebSocket path:** CC process sends `{"action": "spawn_session", ...}` → adapter._handle_spawn() executes directly. Short-circuits LLM, but business logic lives in the adapter.
+   
+   Both paths must be unified: session-mgr becomes the single entry point for session lifecycle, regardless of origin (Feishu text or CC MCP tool).
 
 3. **Tool cards are created in the wrong place.**
    All child session tool cards appear in the main chat window instead of inside their respective threads.
@@ -37,19 +38,24 @@ Two issues remain after the actor model remediation:
 ### New Actor Topology
 
 ```
-User message → feishu adapter
-                    ↓
-            feishu:{chat_id}  (main chat actor)
-                    ↓
-            system:admin  (AdminHandler — pure router)
-               ├── normal messages → cc:user.root → feishu:{chat_id}
-               └── /spawn /kill /sessions → system:session-mgr
-                                                ↓
-                                        SessionMgrHandler (orchestration)
-                                          ├── SpawnActor (feishu thread)
-                                          ├── SpawnActor (cc session)
-                                          └── reply → feishu:{chat_id}
+Entry point 1: Feishu text
+  User message → feishu adapter → feishu:{chat_id} → system:admin
+     ├── normal messages → cc:user.root → feishu:{chat_id}
+     └── /spawn /kill /sessions → system:session-mgr
+
+Entry point 2: CC MCP tool
+  CC process → WebSocket → CC adapter
+     └── spawn_session/kill_session/list_sessions → system:session-mgr
+
+                                    system:session-mgr
+                                        ↓
+                                SessionMgrHandler (orchestration)
+                                  ├── SpawnActor (feishu thread)
+                                  ├── SpawnActor (cc session)
+                                  └── reply → feishu:{chat_id}
 ```
+
+Both entry points converge on `system:session-mgr`. The CC adapter no longer handles session lifecycle business logic — it forwards session commands to session-mgr as messages.
 
 ### New Components
 
@@ -63,7 +69,9 @@ User message → feishu adapter
 
 **Feishu adapter** — injects `chat_id`, `user_id`, `user` into message payload on every forwarded message. Eliminates runtime.lookup dependency from handlers.
 
-**`_handle_register`** (`adapters/cc/adapter.py`) — stripped to pure transport duties: WebSocket mapping + transport attach. New root actors trigger `init_session` message to session-mgr for tool card creation.
+**CC adapter `_handle_register`** (`adapters/cc/adapter.py`) — stripped to pure transport duties: WebSocket mapping + transport attach. New root actors trigger `init_session` message to session-mgr for tool card creation.
+
+**CC adapter `_handle_spawn`/`_handle_kill`/`_handle_sessions`** (`adapters/cc/adapter.py`) — no longer execute business logic. Forward session commands to `system:session-mgr` as messages, receive results back, relay to CC process via WebSocket.
 
 **`feishu_adapter.create_tool_card`** — accepts optional `root_id` parameter so cards can be created inside a thread.
 
@@ -425,7 +433,8 @@ This refactoring can be done incrementally:
 7. **Simplify `_handle_register`** — remove business init, delegate to session-mgr.
 8. **Fix tool card location** — add `root_id` to `create_tool_card`, pass in feishu_thread on_spawn.
 9. **Fix MCP reply/send_file routing** — route through actor downstream instead of direct feishu API.
-10. **Remove dead code** from `_handle_spawn` in CCAdapter (business logic moved to handlers).
+10. **Unify CC adapter session commands** — `_handle_spawn`/`_handle_kill`/`_handle_sessions` forward to session-mgr instead of executing business logic directly.
+11. **Remove dead code** from CCAdapter (business logic moved to handlers and session-mgr).
 
 ## Testing
 

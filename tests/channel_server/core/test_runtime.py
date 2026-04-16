@@ -486,3 +486,42 @@ async def test_stop_idempotent():
     await rt.stop("actor://x")
     await rt.stop("actor://x")  # should not raise
     assert rt.lookup("actor://x").state == "ended"
+
+
+# ---------------------------------------------------------------------------
+# 16. on_spawn lifecycle hook
+# ---------------------------------------------------------------------------
+
+@pytest.mark.asyncio
+async def test_spawn_calls_on_spawn_hook():
+    """on_spawn hook actions are executed when actor is spawned."""
+    from channel_server.core.actor import TransportSend
+    from channel_server.core.handler import HANDLER_REGISTRY
+
+    class SpawnHookHandler:
+        def handle(self, actor, msg, runtime=None):
+            return []
+        def on_spawn(self, actor):
+            return [TransportSend(payload={"action": "init", "tag": actor.tag})]
+        def on_stop(self, actor):
+            return []
+
+    rt = ActorRuntime()
+    HANDLER_REGISTRY["test_spawn_hook"] = SpawnHookHandler()
+    transport_calls = []
+
+    async def mock_transport(actor, payload):
+        transport_calls.append(payload)
+        return None
+
+    rt.register_transport_handler("test", mock_transport)
+
+    try:
+        rt.spawn("test:actor", "test_spawn_hook", tag="mytag",
+                 transport=Transport(type="test", config={}))
+        await asyncio.sleep(0.2)
+        assert len(transport_calls) == 1
+        assert transport_calls[0]["action"] == "init"
+        assert transport_calls[0]["tag"] == "mytag"
+    finally:
+        del HANDLER_REGISTRY["test_spawn_hook"]

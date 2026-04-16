@@ -18,6 +18,10 @@ class Handler(Protocol):
 
     def handle(self, actor: Actor, msg: Message) -> list[Action]: ...
 
+    def on_spawn(self, actor: Actor) -> list[Action]:
+        """Lifecycle callback invoked when an actor is spawned."""
+        return []
+
     def on_stop(self, actor: Actor) -> list[Action]:
         """Lifecycle callback invoked when an actor is stopped.
 

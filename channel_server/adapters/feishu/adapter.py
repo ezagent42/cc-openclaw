@@ -301,12 +301,17 @@ class FeishuAdapter:
             )
 
         # Build and deliver — dedup by runtime
+        sender_id = event.get("user_id", "") or "unknown"
+        user_name = event.get("user", "")
         msg = Message(
-            sender=f"feishu_user:{event.get('user_id', '') or 'unknown'}",
+            sender=f"feishu_user:{sender_id}",
             payload={
                 "text": event.get("text", ""),
                 "file_path": event.get("file_path", ""),
                 "chat_id": chat_id,
+                "app_id": self.app_id,
+                "user_id": sender_id,
+                "user": user_name,
                 "message_id": message_id,
                 "msg_type": event.get("msg_type", "text"),
             },

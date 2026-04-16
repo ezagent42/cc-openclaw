@@ -129,6 +129,27 @@ class FeishuAdapter:
                     content_json = {}
                 text, file_path = parse_message(msg_type, content_json, message, self)
 
+                # Fetch quoted message content if this is a reply
+                parent_id = message.parent_id or ""
+                if parent_id and self.feishu_client:
+                    try:
+                        from lark_oapi.api.im.v1 import GetMessageRequest
+                        req = GetMessageRequest.builder().message_id(parent_id).build()
+                        resp = self.feishu_client.im.v1.message.get(req)
+                        if resp.success() and resp.data and resp.data.items:
+                            parent_msg = resp.data.items[0]
+                            parent_type = parent_msg.msg_type or ""
+                            parent_raw = parent_msg.body.content if parent_msg.body and parent_msg.body.content else ""
+                            try:
+                                parent_content = json.loads(parent_raw) if parent_raw else {}
+                            except Exception:
+                                parent_content = {}
+                            parent_text, _ = parse_message(parent_type, parent_content, parent_msg, self)
+                            if parent_text:
+                                text = f"> {parent_text[:200]}\n{text}"
+                    except Exception as e:
+                        log.warning("Failed to fetch quoted message %s: %s", parent_id, e)
+
                 chat_id = message.chat_id or ""
                 root_id = message.root_id or ""
                 chat_type = message.chat_type or ""

@@ -525,24 +525,20 @@ class CCAdapter:
 
         window_name = f"{user}.{session_name}"
 
-        env_vars = {
-            "OC_USER": user,
-            "OC_SESSION": session_name,
-            "OC_TAG": tag or session_name,
-        }
+        env = os.environ.copy()
+        env["OC_USER"] = user
+        env["OC_SESSION"] = session_name
+        env["OC_TAG"] = tag or session_name
         if chat_id:
-            env_vars["OC_CHAT_ID"] = chat_id
+            env["OC_CHAT_ID"] = chat_id
 
-        # Build the full command: source local.sh for env, then run script with --user
-        env_prefix = " ".join(f"{k}={v}" for k, v in env_vars.items())
-        cmd = [
-            "tmux", "new-window", "-t", _TMUX_SESSION,
-            "-n", window_name,
-            f"{env_prefix} {script} --user {user} --session {session_name}" + (f" --tag {tag}" if tag else ""),
-        ]
+        # Run cc-openclaw.sh directly — it creates the tmux window itself
+        cmd = [str(script), "--user", user, "--session", session_name]
+        if tag:
+            cmd.extend(["--tag", tag])
 
         try:
-            subprocess.run(cmd, check=True, capture_output=True, timeout=10)
+            subprocess.run(cmd, check=True, capture_output=True, timeout=15, env=env)
             log.info("Spawned CC process: %s in tmux window %s", session_name, window_name)
             return True
         except Exception as e:

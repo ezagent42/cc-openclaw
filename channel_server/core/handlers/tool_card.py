@@ -7,7 +7,7 @@ from channel_server.core.actor import Action, Actor, Message, TransportSend, Upd
 class ToolCardHandler:
     """Accumulate a rolling history window (max 5) and emit a tool-card update."""
 
-    def handle(self, actor: Actor, msg: Message) -> list[Action]:
+    def handle(self, actor: Actor, msg: Message, runtime=None) -> list[Action]:
         text = msg.payload.get("text", "")
         history: list[str] = list(actor.metadata.get("history", []))
         history.append(text)

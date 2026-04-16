@@ -18,7 +18,7 @@ class CCSessionHandler:
         """Inject the actor runtime after construction."""
         self._runtime = runtime
 
-    def handle(self, actor: Actor, msg: Message) -> list[Action]:
+    def handle(self, actor: Actor, msg: Message, runtime=None) -> list[Action]:
         if msg.sender != actor.address:
             # External message — forward to the CC session over its transport.
             # Merge metadata (user, user_id, etc.) into payload so channel.py

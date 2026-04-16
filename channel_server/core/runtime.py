@@ -187,7 +187,7 @@ class ActorRuntime:
                     continue
                 try:
                     log.info("Actor %s processing msg from %s action=%s", actor.address, msg.sender, msg.payload.get("action") or msg.payload.get("msg_type", "message"))
-                    actions = handler.handle(actor, msg)
+                    actions = handler.handle(actor, msg, self)
                     log.info("Actor %s produced %d actions: %s", actor.address, len(actions), [type(a).__name__ for a in actions])
                     for action in actions:
                         await self._execute(actor, action)

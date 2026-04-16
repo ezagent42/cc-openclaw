@@ -16,7 +16,7 @@ from channel_server.core.handlers import (
 class Handler(Protocol):
     """Protocol that all actor message handlers must satisfy."""
 
-    def handle(self, actor: Actor, msg: Message) -> list[Action]: ...
+    def handle(self, actor: Actor, msg: Message, runtime: "ActorRuntime | None" = None) -> list[Action]: ...
 
     def on_spawn(self, actor: Actor) -> list[Action]:
         """Lifecycle callback invoked when an actor is spawned."""

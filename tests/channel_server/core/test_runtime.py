@@ -206,7 +206,7 @@ async def test_actor_loop_handles_handler_error():
     from channel_server.core.handler import HANDLER_REGISTRY
 
     class BrokenHandler:
-        def handle(self, actor, msg):
+        def handle(self, actor, msg, runtime=None):
             raise RuntimeError("boom")
 
     received: list[dict] = []
@@ -219,7 +219,7 @@ async def test_actor_loop_handles_handler_error():
         def __init__(self, sink: list):
             self._sink = sink
 
-        def handle(self, actor, msg):
+        def handle(self, actor, msg, runtime=None):
             self._sink.append(msg)
             return []
 
@@ -251,7 +251,7 @@ async def test_actor_loop_ends_after_max_errors():
     from channel_server.core.handler import HANDLER_REGISTRY
 
     class BrokenHandler:
-        def handle(self, actor, msg):
+        def handle(self, actor, msg, runtime=None):
             raise RuntimeError("boom")
 
     HANDLER_REGISTRY["broken2"] = BrokenHandler()
@@ -348,7 +348,7 @@ async def test_handler_error_notifies_parent():
     from channel_server.core.handler import HANDLER_REGISTRY
 
     class BrokenHandler:
-        def handle(self, actor, msg):
+        def handle(self, actor, msg, runtime=None):
             raise RuntimeError("test-error")
 
     received: list = []
@@ -357,7 +357,7 @@ async def test_handler_error_notifies_parent():
         def __init__(self, sink):
             self._sink = sink
 
-        def handle(self, actor, msg):
+        def handle(self, actor, msg, runtime=None):
             self._sink.append(msg)
             return []
 
@@ -392,7 +392,7 @@ async def test_max_errors_stops_actor():
     from channel_server.core.handler import HANDLER_REGISTRY
 
     class BrokenHandler:
-        def handle(self, actor, msg):
+        def handle(self, actor, msg, runtime=None):
             raise RuntimeError("always-broken")
 
     HANDLER_REGISTRY["broken_max"] = BrokenHandler()
@@ -425,7 +425,7 @@ async def test_stop_calls_on_stop():
     on_stop_called = []
 
     class LifecycleHandler:
-        def handle(self, actor, msg):
+        def handle(self, actor, msg, runtime=None):
             return []
 
         def on_stop(self, actor):
@@ -451,14 +451,14 @@ async def test_stop_on_stop_cascades():
     from channel_server.core.handler import HANDLER_REGISTRY
 
     class ParentHandler:
-        def handle(self, actor, msg):
+        def handle(self, actor, msg, runtime=None):
             return []
 
         def on_stop(self, actor):
             return [StopActor(address="actor://child")]
 
     class ChildHandler:
-        def handle(self, actor, msg):
+        def handle(self, actor, msg, runtime=None):
             return []
 
         def on_stop(self, actor):

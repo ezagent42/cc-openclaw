@@ -16,7 +16,7 @@ class AdminHandler:
 
     SESSION_COMMANDS = ("/spawn", "/kill", "/sessions")
 
-    def handle(self, actor: Actor, msg: Message) -> list[Action]:
+    def handle(self, actor: Actor, msg: Message, runtime=None) -> list[Action]:
         text = msg.payload.get("text", "").strip()
 
         # System notifications -> forward to downstream

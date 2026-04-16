@@ -18,7 +18,7 @@ class FeishuInboundHandler:
       - Push to Feishu transport
     """
 
-    def handle(self, actor: Actor, msg: Message) -> list[Action]:
+    def handle(self, actor: Actor, msg: Message, runtime=None) -> list[Action]:
         if msg.sender.startswith("feishu_user:"):
             return self._handle_inbound(actor, msg)
         return self._handle_outbound(actor, msg)

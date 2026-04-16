@@ -570,3 +570,20 @@ def test_tool_card_on_stop_no_transport_noop():
     actor = make_actor(handler="tool_card", metadata={"card_msg_id": "om_card_999"})
     actions = ToolCardHandler().on_stop(actor)
     assert actions == []
+
+
+# ---------------------------------------------------------------------------
+# 25. All handlers accept runtime as third argument
+# ---------------------------------------------------------------------------
+
+def test_handler_receives_runtime_arg():
+    """All handlers accept runtime as third argument."""
+    runtime = MagicMock()
+    actor = make_actor(address="system:admin", handler="admin", downstream=["cc:user.root"])
+    msg = make_msg(sender="feishu_user:u1", payload={"text": "hello"})
+
+    AdminHandler().handle(actor, msg, runtime)
+    FeishuInboundHandler().handle(actor, msg, runtime)
+    CCSessionHandler().handle(actor, msg, runtime)
+    ForwardAllHandler().handle(actor, msg, runtime)
+    ToolCardHandler().handle(actor, msg, runtime)

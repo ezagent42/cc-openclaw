@@ -279,18 +279,23 @@ class FeishuAdapter:
         log.info("on_feishu_event: msg_id=%s chat_id=%s text=%s",
                  message_id[:20], chat_id[:20], event.get("text", "")[:40])
 
-        # Thread routing
+        # Thread routing — find thread actor by root_id in transport config
         root_id = event.get("root_id") or None
         address = self.resolve_actor_address(chat_id, None)
         if root_id:
-            thread_addr = self.resolve_actor_address(chat_id, root_id)
-            thread_actor = self.runtime.lookup(thread_addr)
-            if thread_actor and thread_actor.state != "ended":
-                for ds_addr in thread_actor.downstream:
-                    ds = self.runtime.lookup(ds_addr)
-                    if ds and ds.state == "active" and ds.transport is not None:
-                        address = thread_addr
-                        break
+            # Search all actors for a thread actor matching this root_id
+            for addr, actor in self.runtime.actors.items():
+                if actor.state == "ended":
+                    continue
+                if (actor.transport and actor.transport.type == "feishu_thread"
+                        and actor.transport.config.get("root_id") == root_id):
+                    # Found thread actor — check if downstream CC is active
+                    for ds_addr in actor.downstream:
+                        ds = self.runtime.lookup(ds_addr)
+                        if ds and ds.state == "active" and ds.transport is not None:
+                            address = addr
+                            break
+                    break
 
         # Auto-spawn main chat actor if needed
         actor = self.runtime.lookup(address)

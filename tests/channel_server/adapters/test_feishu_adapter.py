@@ -326,4 +326,4 @@ def test_ack_reaction_uses_onit():
     import inspect
     sig = inspect.signature(adapter._send_reaction)
     emoji_default = sig.parameters["emoji_type"].default
-    assert emoji_default == "ONIT"
+    assert emoji_default == "Typing"

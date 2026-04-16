@@ -20,12 +20,16 @@ Two issues remain after the actor model remediation:
 3. **Tool cards are created in the wrong place.**
    All child session tool cards appear in the main chat window instead of inside their respective threads.
 
+4. **MCP reply/send_file bypass actor routing.**
+   `reply` and `send_file` MCP tools call the feishu API directly with `chat_id`, bypassing the actor's downstream routing. This means child session replies and file sends always appear in the main chat instead of their thread.
+
 ## Goals
 
 1. All sessions (including root) get a tool card on initialization.
 2. `/spawn`, `/kill`, `/sessions` are intercepted by AdminHandler and never reach the CC session.
 3. Child session tool cards are created inside their thread, not in the main chat.
 4. Initialization logic is unified: root and child sessions share the same path through `session-mgr`.
+5. MCP reply/send_file route through actor downstream so messages land in the correct thread.
 
 ## Architecture
 
@@ -346,11 +350,44 @@ Recommendation: pragmatic approach — `handle(actor, msg, runtime)`. The runtim
 
 **Duplicate `/spawn` for the same session name:** Between `runtime.lookup()` in the handler and `SpawnActor` execution, a second `/spawn` could pass the same check. Mitigation: `runtime.spawn()` raises `ValueError` on duplicate address. The action executor should catch this and send an error reply to the feishu actor rather than crashing the session-mgr loop. Add a try/except in `_execute` around `SpawnActor` handling.
 
+## 7. MCP Reply/Send_file Thread Routing Fix
+
+### Problem
+
+MCP tools `reply` and `send_file` (in `adapters/cc/channel.py`) bypass actor routing. They call `_channel_client.send_reply(chat_id, text)` directly, which always sends to the main chat — even when the CC session is a child session that should reply in its thread.
+
+The correct path is: CC session actor → Send to downstream feishu_thread actor → feishu_thread transport has `root_id` → message appears in thread.
+
+### Current Flow (broken)
+
+```
+CC session receives reply action → channel.py _handle_reply()
+  → channel_client.send_reply(chat_id, text)  ← direct feishu API call
+  → message appears in main chat (no root_id)
+```
+
+### New Flow
+
+```
+CC session receives reply action → CCSessionHandler.handle()
+  → TransportSend or Send(to=downstream feishu actor)
+  → feishu actor's transport handler sends with root_id if present
+  → message appears in correct location (main chat or thread)
+```
+
+### Changes
+
+1. **`_handle_reply` and `_handle_send_file` in channel.py** — instead of calling feishu API directly, emit a message/action through the actor's downstream routing.
+2. **CCSessionHandler** — catch-all action handler already routes to downstream (cc.py:64-65). Ensure `reply` and `send_file` actions go through this path instead of bypassing it.
+3. **feishu adapter transport handler** — already handles `root_id` from transport config (adapter.py:399-403). No changes needed on the receiving end.
+
+This ensures child sessions reply in their thread and root sessions reply in the main chat, with zero explicit `root_id` management in the MCP tools.
+
 ## Migration Strategy
 
 This refactoring can be done incrementally:
 
-1. **Add lifecycle hooks to runtime** (on_spawn, on_stop) — no behavior change, hooks are empty.
+1. **Add lifecycle hooks to runtime** — add `on_spawn` to Handler protocol and `spawn()`. `on_stop` already exists.
 2. **Add `chat_id` injection in feishu adapter** — backward compatible, extra field in payload.
 3. **Create `SessionMgrHandler` and `system:session-mgr` actor** — new code, no existing behavior changed.
 4. **Update `AdminHandler`** to intercept session commands → session-mgr. This is the switch-over point.
@@ -358,7 +395,8 @@ This refactoring can be done incrementally:
 6. **Add on_spawn to cc_session handler** — tmux spawn moves from adapter to handler.
 7. **Simplify `_handle_register`** — remove business init, delegate to session-mgr.
 8. **Fix tool card location** — add `root_id` to `create_tool_card`, pass in feishu_thread on_spawn.
-9. **Remove dead code** from `_handle_spawn` in CCAdapter (business logic moved to handlers).
+9. **Fix MCP reply/send_file routing** — route through actor downstream instead of direct feishu API.
+10. **Remove dead code** from `_handle_spawn` in CCAdapter (business logic moved to handlers).
 
 ## Testing
 
@@ -366,3 +404,4 @@ This refactoring can be done incrementally:
 - **AdminHandler**: unit test — verify session commands route to session-mgr, others route downstream.
 - **Lifecycle hooks**: integration test — spawn actor, verify on_spawn actions executed.
 - **Tool card location**: manual verification in Feishu — child card inside thread, root card in main chat.
+- **Reply/send_file routing**: manual verification — child session replies appear in thread, root replies in main chat. File sends same.

@@ -56,7 +56,7 @@ class CCSessionHandler:
     def handle(self, actor: Actor, msg: Message) -> list[Action]:
         if msg.sender != actor.address:
             # External message — forward to the CC session over its transport.
-            return [TransportSend(payload={"method": "message", **msg.payload})]
+            return [TransportSend(payload={"action": "message", **msg.payload})]
 
         # Message originated from CC itself — dispatch on action.
         action = msg.payload.get("action")
@@ -117,7 +117,11 @@ class ToolCardHandler:
         display = "\n".join(history)
         return [
             UpdateActor(changes={"metadata": {"history": history}}),
-            TransportSend(payload={"action": "tool_notify", "text": display}),
+            TransportSend(payload={
+                "action": "tool_notify",
+                "text": display,
+                "card_msg_id": actor.metadata.get("card_msg_id", ""),
+            }),
         ]
 
 

@@ -57,6 +57,9 @@ class AdminHandler:
             for addr in actor.downstream
         ]
 
+    def on_spawn(self, actor: Actor) -> list[Action]:
+        return []
+
     def on_stop(self, actor: Actor) -> list[Action]:
         return []
 

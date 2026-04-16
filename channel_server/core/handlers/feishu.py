@@ -62,6 +62,9 @@ class FeishuInboundHandler:
             actions.append(TransportSend(payload=msg.payload))
         return actions
 
+    def on_spawn(self, actor: Actor) -> list[Action]:
+        return []
+
     def on_stop(self, actor: Actor) -> list[Action]:
         actions: list[Action] = []
         if actor.transport is None or actor.transport.type != "feishu_thread":

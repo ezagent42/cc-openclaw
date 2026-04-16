@@ -23,6 +23,9 @@ class ToolCardHandler:
             }),
         ]
 
+    def on_spawn(self, actor: Actor) -> list[Action]:
+        return []
+
     def on_stop(self, actor: Actor) -> list[Action]:
         """Clear the tool card on session end."""
         card_msg_id = actor.metadata.get("card_msg_id", "")

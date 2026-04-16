@@ -64,6 +64,9 @@ class CCSessionHandler:
         # Catch-all (react, send_file, update_title, etc.) → send to downstream.
         return [Send(to=addr, message=msg) for addr in actor.downstream]
 
+    def on_spawn(self, actor: Actor) -> list[Action]:
+        return []
+
     def on_stop(self, actor: Actor) -> list[Action]:
         """Stop child actors (feishu_thread, tool_card) when CC session ends."""
         actions: list[Action] = []

@@ -10,5 +10,8 @@ class ForwardAllHandler:
     def handle(self, actor: Actor, msg: Message, runtime=None) -> list[Action]:
         return [Send(to=addr, message=msg) for addr in actor.downstream]
 
+    def on_spawn(self, actor: Actor) -> list[Action]:
+        return []
+
     def on_stop(self, actor: Actor) -> list[Action]:
         return []

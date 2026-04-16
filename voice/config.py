@@ -14,12 +14,8 @@ class VoiceConfig:
     livekit_api_key: str
     livekit_api_secret: str
 
-    # Deepgram STT
-    deepgram_api_key: str
-
-    # FishAudio TTS
-    fish_api_key: str
-    fish_model_id: str = "default"
+    # ElevenLabs (STT + TTS)
+    elevenlabs_api_key: str
 
     # Feishu app (for JSSDK config + auth code verification)
     feishu_app_id: str = ""
@@ -35,7 +31,7 @@ class VoiceConfig:
         """Load from environment. Raises ValueError for missing required vars."""
         required = [
             "LIVEKIT_URL", "LIVEKIT_API_KEY", "LIVEKIT_API_SECRET",
-            "DEEPGRAM_API_KEY", "FISH_API_KEY",
+            "ELEVENLABS_API_KEY",
         ]
         missing = [k for k in required if not os.environ.get(k)]
         if missing:
@@ -45,9 +41,7 @@ class VoiceConfig:
             livekit_url=os.environ["LIVEKIT_URL"],
             livekit_api_key=os.environ["LIVEKIT_API_KEY"],
             livekit_api_secret=os.environ["LIVEKIT_API_SECRET"],
-            deepgram_api_key=os.environ["DEEPGRAM_API_KEY"],
-            fish_api_key=os.environ["FISH_API_KEY"],
-            fish_model_id=os.environ.get("FISH_MODEL_ID", "default"),
+            elevenlabs_api_key=os.environ["ELEVENLABS_API_KEY"],
             feishu_app_id=os.environ.get("FEISHU_APP_ID", ""),
             feishu_app_secret=os.environ.get("FEISHU_APP_SECRET", ""),
             host=os.environ.get("VOICE_HOST", "0.0.0.0"),

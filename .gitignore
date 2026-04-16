@@ -10,3 +10,4 @@ sidecar-config.yaml
 .workspace/
 .claude/worktrees/
 node_modules/
+.env

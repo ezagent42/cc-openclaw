@@ -24,8 +24,7 @@ test = [
 ]
 voice = [
     "livekit-agents>=1.0",
-    "livekit-plugins-deepgram",
-    "livekit-plugins-fishaudio",
+    "livekit-plugins-elevenlabs",
     "livekit-plugins-silero",
     "httpx",
     "aiohttp",

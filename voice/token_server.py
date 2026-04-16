@@ -143,10 +143,12 @@ def create_token_app(config: VoiceConfig) -> web.Application:
         room = f"voice-{open_id}"
 
         from livekit.api import AccessToken, VideoGrants  # noqa: PLC0415
-        token = AccessToken(api_key=config.livekit_api_key, api_secret=config.livekit_api_secret)
-        token.identity = open_id
-        token.name = name
-        token.add_grant(VideoGrants(room_join=True, room=room))
+        token = (
+            AccessToken(api_key=config.livekit_api_key, api_secret=config.livekit_api_secret)
+            .with_identity(open_id)
+            .with_name(name)
+            .with_grants(VideoGrants(room_join=True, room=room))
+        )
 
         return web.json_response(
             {"token": token.to_jwt(), "room": room, "user": name},
@@ -154,17 +156,39 @@ def create_token_app(config: VoiceConfig) -> web.Application:
         )
 
     async def handle_options(request: web.Request) -> web.Response:
+        origin = request.headers.get("Origin", CORS_ORIGIN)
         return web.Response(status=200, headers={
-            "Access-Control-Allow-Origin": CORS_ORIGIN,
+            "Access-Control-Allow-Origin": origin,
             "Access-Control-Allow-Methods": "POST, OPTIONS",
             "Access-Control-Allow-Headers": "Content-Type",
         })
+
+    async def handle_dev_token(request: web.Request) -> web.Response:
+        """Dev-only: issue LiveKit token without Feishu auth."""
+        body = await request.json()
+        user = body.get("user", "dev-user")
+        room = f"voice-{user}"
+
+        from livekit.api import AccessToken, VideoGrants  # noqa: PLC0415
+        token = (
+            AccessToken(api_key=config.livekit_api_key, api_secret=config.livekit_api_secret)
+            .with_identity(user)
+            .with_name(user)
+            .with_grants(VideoGrants(room_join=True, room=room))
+        )
+
+        return web.json_response(
+            {"token": token.to_jwt(), "room": room, "user": user},
+            headers={"Access-Control-Allow-Origin": "*"},
+        )
 
     app = web.Application()
     app.router.add_post("/api/jssdk-config", handle_jssdk_config)
     app.router.add_route("OPTIONS", "/api/jssdk-config", handle_options)
     app.router.add_post("/api/token", handle_token)
+    app.router.add_post("/api/dev-token", handle_dev_token)
     app.router.add_route("OPTIONS", "/api/token", handle_options)
+    app.router.add_route("OPTIONS", "/api/dev-token", handle_options)
     return app
 
 

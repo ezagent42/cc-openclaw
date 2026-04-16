@@ -45,6 +45,9 @@ export function useVoiceSession({ livekitUrl, token }: Options) {
     room.on(RoomEvent.Disconnected, () => setConnected(false));
 
     await room.connect(livekitUrl, token);
+
+    // Enable microphone — this triggers the browser permission prompt
+    await room.localParticipant.setMicrophoneEnabled(true);
   }, [livekitUrl, token]);
 
   const disconnect = useCallback(async () => {

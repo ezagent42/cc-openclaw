@@ -2,11 +2,10 @@
 from __future__ import annotations
 
 import logging
+import os
 
 from livekit.agents import Agent, AgentServer, AgentSession, JobContext, JobProcess, UserInputTranscribedEvent, cli
-from livekit.plugins import deepgram, fishaudio, silero
-
-from voice.config import VoiceConfig
+from livekit.plugins import elevenlabs, silero
 
 log = logging.getLogger("voice-agent")
 
@@ -28,43 +27,42 @@ class EchoAgent(Agent):
                 self.session.say(f"你说了：{ev.transcript}")
 
 
-def create_server(config: VoiceConfig) -> AgentServer:
-    """Create and configure the LiveKit AgentServer."""
+# Module-level functions so multiprocessing can pickle them
 
-    def prewarm(proc: JobProcess) -> None:
-        proc.userdata["vad"] = silero.VAD.load()
-        proc.userdata["config"] = config
+def prewarm(proc: JobProcess) -> None:
+    proc.userdata["vad"] = silero.VAD.load()
 
-    server = AgentServer(setup_fnc=prewarm)
 
-    @server.rtc_session()
-    async def entrypoint(ctx: JobContext) -> None:
-        cfg: VoiceConfig = ctx.proc.userdata["config"]
+async def entrypoint(ctx: JobContext) -> None:
+    api_key = os.environ.get("ELEVENLABS_API_KEY", "")
 
-        stt = deepgram.STT(
-            api_key=cfg.deepgram_api_key,
-            language=cfg.language,
-        )
-        tts = fishaudio.TTS(
-            api_key=cfg.fish_api_key,
-            model_id=cfg.fish_model_id,
-        )
+    stt = elevenlabs.STT(
+        api_key=api_key,
+        model_id="scribe_v2_realtime",
+        language_code="zh",
+    )
+    tts = elevenlabs.TTS(
+        api_key=api_key,
+        voice_id="Xb7hH8MSUJpSbSDYk0k2",  # Alice - Clear, Engaging Educator
+        model="eleven_multilingual_v2",
+        language="zh",
+    )
 
-        session = AgentSession(
-            stt=stt,
-            tts=tts,
-            vad=ctx.proc.userdata["vad"],
-        )
+    session = AgentSession(
+        stt=stt,
+        tts=tts,
+        vad=ctx.proc.userdata["vad"],
+    )
 
-        await session.start(agent=EchoAgent(), room=ctx.room)
+    await session.start(agent=EchoAgent(), room=ctx.room)
 
-    return server
+
+server = AgentServer(setup_fnc=prewarm)
+server.rtc_session()(entrypoint)
 
 
 def main() -> None:
     """CLI entry point."""
-    config = VoiceConfig.from_env()
-    server = create_server(config)
     cli.run_app(server)
 
 

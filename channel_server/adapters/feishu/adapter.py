@@ -45,6 +45,7 @@ class FeishuAdapter:
     def __init__(self, runtime: ActorRuntime, feishu_client) -> None:
         self.runtime = runtime
         self.feishu_client = feishu_client
+        self.app_id: str = ""  # Set by start_feishu_ws
         self._user_names: dict[str, str] = self._load_user_names()
 
         # Register transport handlers
@@ -78,12 +79,12 @@ class FeishuAdapter:
     def resolve_actor_address(self, chat_id: str, root_id: str | None) -> str:
         """Return the actor address for a Feishu chat or thread.
 
-        - Main chat: feishu:{chat_id}
-        - Thread:    feishu:{chat_id}:{root_id}
+        - Main chat: feishu:{app_id}:{chat_id}
+        - Thread:    feishu:{app_id}:{chat_id}:{root_id}
         """
         if root_id:
-            return f"feishu:{chat_id}:{root_id}"
-        return f"feishu:{chat_id}"
+            return f"feishu:{self.app_id}:{chat_id}:{root_id}"
+        return f"feishu:{self.app_id}:{chat_id}"
 
     def start_feishu_ws(self, app_id: str, app_secret: str) -> None:
         """Start Feishu WS listener in a background daemon thread.
@@ -92,6 +93,8 @@ class FeishuAdapter:
         2. Create WS client
         3. Start WS client in daemon thread with its own event loop
         """
+        self.app_id = app_id
+
         try:
             lark  # noqa: F841 — verify lark_oapi is importable
         except NameError:

@@ -15,10 +15,14 @@ from channel_server.adapters.feishu.adapter import FeishuAdapter
 # Helpers
 # ---------------------------------------------------------------------------
 
+TEST_APP_ID = "test_app"
+
+
 def make_adapter() -> tuple[FeishuAdapter, ActorRuntime]:
     rt = ActorRuntime()
     client = MagicMock()
     adapter = FeishuAdapter(rt, client)
+    adapter.app_id = TEST_APP_ID
     return adapter, rt
 
 
@@ -56,7 +60,7 @@ def feishu_event(
 def test_resolve_actor_address_main_chat():
     adapter, _ = make_adapter()
     addr = adapter.resolve_actor_address("oc_abc123", None)
-    assert addr == "feishu:oc_abc123"
+    assert addr == "feishu:test_app:oc_abc123"
 
 
 # ---------------------------------------------------------------------------
@@ -66,7 +70,7 @@ def test_resolve_actor_address_main_chat():
 def test_resolve_actor_address_thread():
     adapter, _ = make_adapter()
     addr = adapter.resolve_actor_address("oc_abc123", "om_root456")
-    assert addr == "feishu:oc_abc123:om_root456"
+    assert addr == "feishu:test_app:oc_abc123:om_root456"
 
 
 # ---------------------------------------------------------------------------
@@ -78,7 +82,7 @@ def test_on_feishu_event_auto_spawns_actor():
     evt = feishu_event()
     adapter.on_feishu_event(evt)
 
-    addr = "feishu:oc_abc123"
+    addr = "feishu:test_app:oc_abc123"
     actor = rt.lookup(addr)
     assert actor is not None
     assert actor.handler == "feishu_inbound"
@@ -95,7 +99,7 @@ def test_on_feishu_event_sends_message():
     evt = feishu_event()
     adapter.on_feishu_event(evt)
 
-    addr = "feishu:oc_abc123"
+    addr = "feishu:test_app:oc_abc123"
     mailbox = rt.mailboxes.get(addr)
     assert mailbox is not None
     assert not mailbox.empty()
@@ -122,7 +126,7 @@ def test_on_feishu_event_dedup():
     adapter.on_feishu_event(evt)
     adapter.on_feishu_event(evt)
 
-    addr = "feishu:oc_abc123"
+    addr = "feishu:test_app:oc_abc123"
     mailbox = rt.mailboxes[addr]
     # Only one message should have been delivered — runtime deduplicates by message_id
     assert mailbox.qsize() == 1
@@ -143,7 +147,7 @@ def test_on_feishu_event_skip_own_messages():
     evt = feishu_event(message_id="msg_self")
     adapter.on_feishu_event(evt)
 
-    addr = "feishu:oc_abc123"
+    addr = "feishu:test_app:oc_abc123"
     # Message IS delivered to the mailbox; handler will drop it if msg_id is in sent_msg_ids
     mailbox = rt.mailboxes.get(addr)
     assert mailbox is not None
@@ -161,13 +165,13 @@ def test_on_feishu_event_thread_without_session_falls_back_to_chat():
     adapter.on_feishu_event(evt)
 
     # Should route to main chat, not create a thread actor
-    addr = "feishu:oc_abc123"
+    addr = "feishu:test_app:oc_abc123"
     actor = rt.lookup(addr)
     assert actor is not None
     assert actor.transport.type == "feishu_chat"
 
     # Thread actor should NOT be created
-    thread_addr = "feishu:oc_abc123:om_root789"
+    thread_addr = "feishu:test_app:oc_abc123:om_root789"
     assert rt.lookup(thread_addr) is None
 
 
@@ -177,7 +181,7 @@ def test_on_feishu_event_thread_with_session_routes_to_thread():
 
     # Pre-spawn a thread actor with downstream (simulating a spawned session)
     rt.spawn(
-        "feishu:oc_abc123:om_root789",
+        "feishu:test_app:oc_abc123:om_root789",
         "feishu_inbound",
         tag="session",
         transport=Transport(type="feishu_thread", config={"chat_id": "oc_abc123", "root_id": "om_root789"}),
@@ -195,7 +199,7 @@ def test_on_feishu_event_thread_with_session_routes_to_thread():
     adapter.on_feishu_event(evt)
 
     # Message should go to thread actor
-    mailbox = rt.mailboxes.get("feishu:oc_abc123:om_root789")
+    mailbox = rt.mailboxes.get("feishu:test_app:oc_abc123:om_root789")
     assert mailbox is not None
     assert not mailbox.empty()
 
@@ -209,7 +213,7 @@ def test_on_feishu_event_includes_file_path():
     evt = feishu_event(msg_type="image", file_path="/tmp/downloads/photo.png")
     adapter.on_feishu_event(evt)
 
-    addr = "feishu:oc_abc123"
+    addr = "feishu:test_app:oc_abc123"
     msg = rt.mailboxes[addr].get_nowait()
     assert msg.payload["msg_type"] == "image"
     assert msg.payload["file_path"] == "/tmp/downloads/photo.png"

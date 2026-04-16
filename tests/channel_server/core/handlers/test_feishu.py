@@ -6,7 +6,7 @@ from channel_server.core.handlers.feishu import FeishuInboundHandler
 
 
 def make_actor(**kwargs) -> Actor:
-    defaults = dict(address="feishu:oc_test", tag="test", handler="feishu_inbound",
+    defaults = dict(address="feishu:test_app:oc_test", tag="test", handler="feishu_inbound",
                     downstream=["system:admin"], metadata={})
     defaults.update(kwargs)
     return Actor(**defaults)

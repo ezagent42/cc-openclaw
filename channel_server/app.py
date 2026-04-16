@@ -103,7 +103,7 @@ class ChannelServerApp:
 
         # 5. Spawn admin actor if admin_chat_id is set
         if self.admin_chat_id and self.feishu_adapter:
-            admin_feishu_addr = f"feishu:{self.admin_chat_id}"
+            admin_feishu_addr = f"feishu:{self.feishu_adapter.app_id}:{self.admin_chat_id}"
             admin_actor_addr = "system:admin"
 
             # Ensure feishu actor exists for admin chat

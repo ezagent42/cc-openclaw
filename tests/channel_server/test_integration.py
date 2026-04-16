@@ -25,7 +25,7 @@ async def test_end_to_end_feishu_to_cc():
     runtime.register_transport_handler("websocket", mock_ws_transport)
 
     runtime.spawn(
-        "feishu:oc_xxx",
+        "feishu:test_app:oc_xxx",
         handler="feishu_inbound",
         tag="DM",
         downstream=["cc:linyilun.root"],
@@ -34,7 +34,7 @@ async def test_end_to_end_feishu_to_cc():
         "cc:linyilun.root",
         handler="cc_session",
         tag="root",
-        downstream=["feishu:oc_xxx"],
+        downstream=["feishu:test_app:oc_xxx"],
     )
     runtime.attach(
         "cc:linyilun.root",
@@ -43,7 +43,7 @@ async def test_end_to_end_feishu_to_cc():
 
     task = asyncio.create_task(runtime.run())
     runtime.send(
-        "feishu:oc_xxx",
+        "feishu:test_app:oc_xxx",
         Message(
             sender="feishu_user:testuser",
             payload={"msg_type": "text", "text": "hello", "chat_id": "oc_xxx", "message_id": "om_1", "file_path": ""},
@@ -76,7 +76,7 @@ async def test_end_to_end_cc_reply():
     runtime.register_transport_handler("feishu_chat", mock_feishu_transport)
 
     runtime.spawn(
-        "feishu:oc_xxx",
+        "feishu:test_app:oc_xxx",
         handler="feishu_inbound",
         tag="DM",
         downstream=["cc:linyilun.root"],
@@ -86,7 +86,7 @@ async def test_end_to_end_cc_reply():
         "cc:linyilun.root",
         handler="cc_session",
         tag="root",
-        downstream=["feishu:oc_xxx"],
+        downstream=["feishu:test_app:oc_xxx"],
     )
 
     task = asyncio.create_task(runtime.run())
@@ -135,7 +135,7 @@ async def test_round_trip():
     runtime.register_transport_handler("feishu_chat", mock_feishu)
 
     runtime.spawn(
-        "feishu:oc_round",
+        "feishu:test_app:oc_round",
         handler="feishu_inbound",
         tag="DM",
         downstream=["cc:user.root"],
@@ -145,13 +145,13 @@ async def test_round_trip():
         "cc:user.root",
         handler="cc_session",
         tag="root",
-        downstream=["feishu:oc_round"],
+        downstream=["feishu:test_app:oc_round"],
         transport=Transport(type="websocket", config={}),
     )
 
     task = asyncio.create_task(runtime.run())
     runtime.send(
-        "feishu:oc_round",
+        "feishu:test_app:oc_round",
         Message(
             sender="feishu_user:testuser",
             payload={"msg_type": "text", "text": "ping", "chat_id": "oc_round", "message_id": "om_1", "file_path": ""},
@@ -191,7 +191,7 @@ async def test_suspended_actor_no_processing():
 
     # feishu actor active, cc actor starts suspended
     runtime.spawn(
-        "feishu:oc_sus",
+        "feishu:test_app:oc_sus",
         handler="feishu_inbound",
         tag="DM",
         downstream=["cc:user.suspended"],
@@ -201,14 +201,14 @@ async def test_suspended_actor_no_processing():
         handler="cc_session",
         tag="test",
         state="suspended",
-        downstream=["feishu:oc_sus"],
+        downstream=["feishu:test_app:oc_sus"],
     )
 
     task = asyncio.create_task(runtime.run())
 
     # Send a message — cc actor is suspended, so no transport push yet
     runtime.send(
-        "feishu:oc_sus",
+        "feishu:test_app:oc_sus",
         Message(
             sender="feishu_user:testuser",
             payload={"msg_type": "text", "text": "queued", "chat_id": "oc_sus", "message_id": "om_1", "file_path": ""},

@@ -176,13 +176,14 @@ class CCAdapter:
             log.info("Attached transport to existing CC actor: %s", address)
 
         # Wire topology for root sessions:
-        # system:admin → cc:user.root → feishu:chat_id
+        # system:admin → cc:user.root → feishu:{app_id}:{chat_id}
         chat_ids = msg.get("chat_ids", [])
         session = instance_id.split(".")[-1] if "." in instance_id else ""
         if session == "root" and chat_ids:
             chat_id = next((c for c in chat_ids if c != "*"), None)
             if chat_id:
-                feishu_addr = f"feishu:{chat_id}"
+                app_id = self.feishu_adapter.app_id if self.feishu_adapter else ""
+                feishu_addr = f"feishu:{app_id}:{chat_id}"
                 self.runtime.wire(address, feishu_addr)
                 log.info("Wired %s → %s", address, feishu_addr)
                 self.runtime.wire("system:admin", address)
@@ -379,7 +380,8 @@ class CCAdapter:
         # Spawn feishu thread actor (if we have anchor)
         feishu_thread_addr = ""
         if anchor_msg_id and chat_id:
-            feishu_thread_addr = f"feishu:{chat_id}:{anchor_msg_id}"
+            app_id = self.feishu_adapter.app_id if self.feishu_adapter else ""
+            feishu_thread_addr = f"feishu:{app_id}:{chat_id}:{anchor_msg_id}"
             self.runtime.spawn(
                 feishu_thread_addr,
                 "feishu_inbound",

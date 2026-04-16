@@ -152,7 +152,7 @@ def test_cc_session_send_summary():
     # Build a mock runtime with parent actor that has a feishu downstream
     parent_actor = make_actor(
         address="actor://cc-parent",
-        downstream=["feishu:oc_parent_chat", "other://something"],
+        downstream=["feishu:test_app:oc_parent_chat", "other://something"],
     )
     runtime = MagicMock()
     runtime.lookup.return_value = parent_actor
@@ -172,7 +172,7 @@ def test_cc_session_send_summary():
     assert len(actions) == 1
     action = actions[0]
     assert isinstance(action, Send)
-    assert action.to == "feishu:oc_parent_chat"
+    assert action.to == "feishu:test_app:oc_parent_chat"
     assert action.message is msg
 
 
@@ -443,7 +443,7 @@ def test_admin_system_notification_forward():
     actor = make_actor(
         address="system:admin",
         handler="admin",
-        downstream=["cc:user.root", "feishu:chat1"],
+        downstream=["cc:user.root", "feishu:test_app:chat1"],
     )
     msg = make_msg(
         sender="system:runtime",
@@ -452,7 +452,7 @@ def test_admin_system_notification_forward():
     actions = AdminHandler().handle(actor, msg)
     assert len(actions) == 2
     targets = {a.to for a in actions}
-    assert targets == {"cc:user.root", "feishu:chat1"}
+    assert targets == {"cc:user.root", "feishu:test_app:chat1"}
     for action in actions:
         assert isinstance(action, Send)
         assert action.message is msg
@@ -491,7 +491,7 @@ def test_feishu_inbound_on_stop_thread_actor():
     from channel_server.core.actor import Transport
 
     actor = make_actor(
-        address="feishu:oc_test:om_anchor123",
+        address="feishu:test_app:oc_test:om_anchor123",
         tag="dev-session",
         handler="feishu_inbound",
     )
@@ -537,13 +537,13 @@ def test_cc_session_on_stop_stops_children():
         address="cc:user.dev",
         tag="dev",
         handler="cc_session",
-        downstream=["feishu:oc_test:om_anchor"],
+        downstream=["feishu:test_app:oc_test:om_anchor"],
     )
 
     actions = CCSessionHandler().on_stop(actor)
     stop_addrs = {a.address for a in actions if isinstance(a, StopActor)}
     assert "tool_card:user.dev" in stop_addrs
-    assert "feishu:oc_test:om_anchor" in stop_addrs
+    assert "feishu:test_app:oc_test:om_anchor" in stop_addrs
 
 
 # ---------------------------------------------------------------------------

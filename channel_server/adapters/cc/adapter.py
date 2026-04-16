@@ -310,12 +310,28 @@ class CCAdapter:
             return
 
         child_cc_addr = f"cc:{user}.{session_name}"
-        if self.runtime.lookup(child_cc_addr) is not None and \
-                self.runtime.lookup(child_cc_addr).state != "ended":
+        existing = self.runtime.lookup(child_cc_addr)
+        if existing is not None and existing.state == "active":
             await ws.send(json.dumps({
                 "action": "spawn_result", "ok": False,
-                "text": f"Session '{session_name}' already exists",
+                "text": f"Session '{session_name}' is already active",
             }))
+            return
+
+        # Resume suspended actor — just start tmux, CC will reconnect
+        if existing is not None and existing.state == "suspended":
+            if self.spawn_cc_process(user, session_name, tag=tag):
+                await ws.send(json.dumps({
+                    "action": "spawn_result", "ok": True,
+                    "text": f"Session '{session_name}' resumed",
+                    "session_name": session_name,
+                    "address": child_cc_addr,
+                }))
+            else:
+                await ws.send(json.dumps({
+                    "action": "spawn_result", "ok": False,
+                    "text": f"Session '{session_name}' resume failed: could not create tmux window",
+                }))
             return
 
         # Count active children

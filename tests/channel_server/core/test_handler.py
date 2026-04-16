@@ -420,7 +420,7 @@ def test_admin_unknown_command():
 # 18. AdminHandler — session command passthrough
 # ---------------------------------------------------------------------------
 
-def test_admin_session_command_passthrough():
+def test_admin_session_command_routes_to_session_mgr():
     actor = make_actor(
         address="system:admin",
         handler="admin",
@@ -431,7 +431,7 @@ def test_admin_session_command_passthrough():
         actions = AdminHandler().handle(actor, msg)
         assert len(actions) == 1
         assert isinstance(actions[0], Send)
-        assert actions[0].to == "cc:user.root"
+        assert actions[0].to == "system:session-mgr"
         assert actions[0].message is msg
 
 

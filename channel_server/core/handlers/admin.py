@@ -23,9 +23,9 @@ class AdminHandler:
         if msg.payload.get("msg_type") == "system":
             return [Send(to=addr, message=msg) for addr in actor.downstream]
 
-        # Session commands -> pass through to downstream CC actor
+        # Session commands -> route to session-mgr (bypasses LLM)
         if text.startswith(self.SESSION_COMMANDS):
-            return [Send(to=addr, message=msg) for addr in actor.downstream]
+            return [Send(to="system:session-mgr", message=msg)]
 
         # Non-slash messages -> forward to downstream
         if not text.startswith("/"):

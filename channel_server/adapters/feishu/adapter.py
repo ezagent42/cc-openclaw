@@ -122,13 +122,19 @@ class FeishuAdapter:
 
                 sender_id = sender.sender_id.open_id if sender.sender_id else ""
                 sender_type = sender.sender_type or "user"
+                msg_id = message.message_id or ""
+                msg_type = message.message_type or "text"
+
+                log.info("Feishu WS recv: msg_id=%s type=%s sender=%s sender_type=%s",
+                         msg_id[:20], msg_type, sender_id[:16], sender_type)
 
                 # Skip bot's own messages
                 if sender_type == "app":
+                    log.info("Feishu WS skip: bot's own message %s", msg_id[:20])
                     return
 
-                msg_id = message.message_id or ""
                 if msg_id in self._recent_sent:
+                    log.info("Feishu WS skip: echo prevention %s", msg_id[:20])
                     return
 
                 # Parse content via parsers registry
@@ -267,13 +273,18 @@ class FeishuAdapter:
         message_id = event.get("message_id", "")
         chat_id = event.get("chat_id", "")
 
+        log.info("on_feishu_event: msg_id=%s chat_id=%s text=%s",
+                 message_id[:20], chat_id[:20], event.get("text", "")[:40])
+
         # Skip own messages
         if message_id and message_id in self._recent_sent:
+            log.info("on_feishu_event skip: echo prevention %s", message_id[:20])
             return
 
         # Dedup
         if message_id:
             if message_id in self._seen:
+                log.info("on_feishu_event skip: dedup %s", message_id[:20])
                 return
             self._seen.add(message_id)
             if len(self._seen) > _SEEN_MAX:

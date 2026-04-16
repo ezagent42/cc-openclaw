@@ -19,6 +19,8 @@ from lark_oapi.api.im.v1 import (
     CreatePinRequestBody,
     DeletePinRequest,
     GetMessageResourceRequest,
+    P2ImMessageReactionCreatedV1,
+    P2ImMessageReactionDeletedV1,
     P2ImMessageReceiveV1,
     PatchMessageRequest,
     PatchMessageRequestBody,
@@ -142,9 +144,68 @@ class FeishuAdapter:
             except Exception as e:
                 log.error("on_message callback error: %s", e, exc_info=True)
 
+        def on_reaction_created(data: P2ImMessageReactionCreatedV1) -> None:
+            """Callback for reaction added to a message."""
+            try:
+                event = data.event
+                message_id = event.message_id or ""
+                emoji_type = event.reaction_type.emoji_type if event.reaction_type else ""
+                user_id = event.user_id.open_id if event.user_id else ""
+                operator_type = event.operator_type or ""
+
+                # Skip bot's own reactions
+                if operator_type == "app":
+                    return
+
+                log.info("Reaction created: %s on %s by %s", emoji_type, message_id, user_id)
+
+                evt = {
+                    "message_id": message_id,
+                    "chat_id": "",  # reaction events don't include chat_id
+                    "msg_type": "reaction",
+                    "text": f"[reaction:{emoji_type}]",
+                    "file_path": "",
+                    "user": user_id,
+                    "user_id": user_id,
+                    "emoji_type": emoji_type,
+                    "reaction_action": "created",
+                }
+                loop.call_soon_threadsafe(self.on_feishu_reaction, evt)
+            except Exception as e:
+                log.error("on_reaction_created error: %s", e, exc_info=True)
+
+        def on_reaction_deleted(data: P2ImMessageReactionDeletedV1) -> None:
+            """Callback for reaction removed from a message."""
+            try:
+                event = data.event
+                message_id = event.message_id or ""
+                emoji_type = event.reaction_type.emoji_type if event.reaction_type else ""
+                user_id = event.user_id.open_id if event.user_id else ""
+                operator_type = event.operator_type or ""
+
+                if operator_type == "app":
+                    return
+
+                log.info("Reaction deleted: %s on %s by %s", emoji_type, message_id, user_id)
+
+                evt = {
+                    "message_id": message_id,
+                    "msg_type": "reaction",
+                    "text": f"[reaction_removed:{emoji_type}]",
+                    "user": user_id,
+                    "user_id": user_id,
+                    "emoji_type": emoji_type,
+                    "reaction_action": "deleted",
+                }
+                loop.call_soon_threadsafe(self.on_feishu_reaction, evt)
+            except Exception as e:
+                log.error("on_reaction_deleted error: %s", e, exc_info=True)
+
         handler = (
             lark.EventDispatcherHandler.builder("", "")
             .register_p2_im_message_receive_v1(on_message)
+            .register_p2_im_message_reaction_created_v1(on_reaction_created)
+            .register_p2_im_message_reaction_deleted_v1(on_reaction_deleted)
             .build()
         )
         ws_client = lark.ws.Client(
@@ -261,6 +322,42 @@ class FeishuAdapter:
             },
         )
         self.runtime.send(address, msg)
+
+    def on_feishu_reaction(self, event: dict) -> None:
+        """Route a reaction event to the appropriate actor.
+
+        Reaction events don't include chat_id, so we find the feishu actor
+        that has the message_id in context by broadcasting to all active
+        feishu chat actors.
+        """
+        message_id = event.get("message_id", "")
+        if not message_id:
+            return
+
+        emoji_type = event.get("emoji_type", "")
+        user_id = event.get("user_id", "")
+        action = event.get("reaction_action", "created")
+
+        msg = Message(
+            sender=f"feishu_user:{user_id}" if user_id else "feishu_user:unknown",
+            payload={
+                "text": event.get("text", ""),
+                "msg_type": "reaction",
+                "message_id": message_id,
+                "emoji_type": emoji_type,
+                "reaction_action": action,
+            },
+            metadata={
+                "user": user_id,
+                "user_id": user_id,
+            },
+        )
+
+        # Route to all active feishu chat actors (reaction events lack chat_id)
+        for addr, actor in self.runtime.actors.items():
+            if addr.startswith("feishu:") and actor.state != "ended":
+                self.runtime.send(addr, msg)
+                break  # typically only one main chat actor
 
     # ------------------------------------------------------------------
     # Outbound transport handlers
@@ -439,9 +536,10 @@ class FeishuAdapter:
         except Exception as e:
             log.warning("_send_file error: %s", e)
 
-    def _send_reaction(self, message_id: str, emoji_type: str = "ROCKET", *, track: bool = False) -> None:
+    def _send_reaction(self, message_id: str, emoji_type: str = "MUSCLE", *, track: bool = False) -> None:
         """Add emoji reaction to a Feishu message. Blocking."""
         if not self.feishu_client:
+            log.warning("_send_reaction: no feishu_client")
             return
         try:
             req = (
@@ -454,8 +552,9 @@ class FeishuAdapter:
             )
             resp = self.feishu_client.request(req)
             if not resp.success():
-                log.debug("Reaction failed: %s", resp.code)
+                log.warning("Reaction failed for %s: code=%s msg=%s", message_id, resp.code, resp.msg)
                 return
+            log.info("Reaction sent: %s %s", emoji_type, message_id)
             if track:
                 try:
                     data = json.loads(resp.raw.content)
@@ -465,7 +564,7 @@ class FeishuAdapter:
                 except Exception:
                     pass
         except Exception as e:
-            log.debug("Reaction error: %s", e)
+            log.warning("Reaction error for %s: %s", message_id, e)
 
     def _remove_reaction(self, message_id: str) -> None:
         """Remove an ACK reaction from a message. Blocking."""

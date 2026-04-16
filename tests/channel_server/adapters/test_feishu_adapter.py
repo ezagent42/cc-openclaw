@@ -278,10 +278,10 @@ def test_download_image_by_key_success(tmp_path):
 # 12. ACK reaction uses ROCKET emoji
 # ---------------------------------------------------------------------------
 
-def test_ack_reaction_uses_rocket():
+def test_ack_reaction_uses_muscle():
     adapter, _ = make_adapter()
     # Verify the default emoji_type parameter
     import inspect
     sig = inspect.signature(adapter._send_reaction)
     emoji_default = sig.parameters["emoji_type"].default
-    assert emoji_default == "ROCKET"
+    assert emoji_default == "MUSCLE"

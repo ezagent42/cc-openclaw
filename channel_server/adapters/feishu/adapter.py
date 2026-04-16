@@ -286,7 +286,16 @@ class FeishuAdapter:
         if root_id:
             thread_addr = self.resolve_actor_address(chat_id, root_id)
             thread_actor = self.runtime.lookup(thread_addr)
-            if thread_actor and thread_actor.state != "ended" and thread_actor.downstream:
+            # Only route to thread if it has a downstream CC actor that is active
+            # (has transport = WS connected). Otherwise fall back to main chat.
+            has_active_downstream = False
+            if thread_actor and thread_actor.state != "ended":
+                for ds_addr in thread_actor.downstream:
+                    ds = self.runtime.lookup(ds_addr)
+                    if ds and ds.state == "active" and ds.transport is not None:
+                        has_active_downstream = True
+                        break
+            if has_active_downstream:
                 address = thread_addr
             else:
                 # No active thread session — fall back to main chat

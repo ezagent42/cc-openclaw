@@ -166,7 +166,7 @@ def test_on_feishu_event_thread_without_session_falls_back_to_chat():
 
 
 def test_on_feishu_event_thread_with_session_routes_to_thread():
-    """Thread messages with an active thread session go to that thread actor."""
+    """Thread messages with an active thread session (downstream has transport) go to that thread actor."""
     adapter, rt = make_adapter()
 
     # Pre-spawn a thread actor with downstream (simulating a spawned session)
@@ -176,6 +176,13 @@ def test_on_feishu_event_thread_with_session_routes_to_thread():
         tag="session",
         transport=Transport(type="feishu_thread", config={"chat_id": "oc_abc123", "root_id": "om_root789"}),
         downstream=["cc:user.child"],
+    )
+    # The downstream CC actor must be active with transport
+    rt.spawn(
+        "cc:user.child",
+        "cc_session",
+        tag="child",
+        transport=Transport(type="websocket", config={"instance_id": "user.child"}),
     )
 
     evt = feishu_event(root_id="om_root789")

@@ -58,9 +58,31 @@ class FeishuAdapter:
         self._last_msg_id: dict[str, str] = {}  # chat_id -> last inbound message_id
         self._chat_id_map: dict[str, str] = self._load_chat_id_map()
 
+        self._user_names: dict[str, str] = self._load_user_names()
+
         # Register transport handlers
         runtime.register_transport_handler("feishu_chat", self._handle_chat_transport)
         runtime.register_transport_handler("feishu_thread", self._handle_thread_transport)
+
+    @staticmethod
+    def _load_user_names() -> dict[str, str]:
+        """Load open_id → display_name mapping from roles/roles.yaml."""
+        roles_file = PROJECT_ROOT / "roles" / "roles.yaml"
+        if not roles_file.exists():
+            return {}
+        try:
+            import yaml
+            with open(roles_file) as f:
+                data = yaml.safe_load(f) or {}
+            names: dict[str, str] = {}
+            for user_info in (data.get("users") or {}).values():
+                oid = user_info.get("open_id", "")
+                name = user_info.get("display_name", "")
+                if oid and name:
+                    names[oid] = name
+            return names
+        except Exception:
+            return {}
 
     # ------------------------------------------------------------------
     # Inbound
@@ -122,10 +144,8 @@ class FeishuAdapter:
                 root_id = message.root_id or ""
                 chat_type = message.chat_type or ""
 
-                # Get sender name
-                sender_name = ""
-                if sender.sender_id:
-                    sender_name = getattr(sender, "tenant_key", "") or sender_id
+                # Get sender display name from roles.yaml, fallback to open_id
+                sender_name = self._user_names.get(sender_id, sender_id)
 
                 evt = {
                     "message_id": msg_id,

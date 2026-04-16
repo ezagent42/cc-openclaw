@@ -1,0 +1,70 @@
+"""Standalone LiveKit voice agent — echo mode for validation."""
+from __future__ import annotations
+
+import logging
+import os
+
+from livekit.agents import Agent, AgentServer, AgentSession, JobContext, JobProcess, UserInputTranscribedEvent, cli
+from livekit.plugins import elevenlabs, silero
+
+log = logging.getLogger("voice-agent")
+
+
+class EchoAgent(Agent):
+    """Simple echo agent: repeats back what the user says via TTS (no LLM)."""
+
+    def __init__(self) -> None:
+        super().__init__(
+            instructions="Echo agent — no LLM required.",
+        )
+
+    async def on_enter(self) -> None:
+        await self.session.say("你好，我是语音测试助手，请说话")
+
+        @self.session.on("user_input_transcribed")
+        def _on_transcript(ev: UserInputTranscribedEvent) -> None:
+            if ev.is_final and ev.transcript.strip():
+                self.session.say(f"你说了：{ev.transcript}")
+
+
+# Module-level functions so multiprocessing can pickle them
+
+def prewarm(proc: JobProcess) -> None:
+    proc.userdata["vad"] = silero.VAD.load()
+
+
+async def entrypoint(ctx: JobContext) -> None:
+    api_key = os.environ.get("ELEVENLABS_API_KEY", "")
+
+    stt = elevenlabs.STT(
+        api_key=api_key,
+        model_id="scribe_v2_realtime",
+        language_code="zh",
+    )
+    tts = elevenlabs.TTS(
+        api_key=api_key,
+        voice_id="Xb7hH8MSUJpSbSDYk0k2",  # Alice - Clear, Engaging Educator
+        model="eleven_multilingual_v2",
+        language="zh",
+    )
+
+    session = AgentSession(
+        stt=stt,
+        tts=tts,
+        vad=ctx.proc.userdata["vad"],
+    )
+
+    await session.start(agent=EchoAgent(), room=ctx.room)
+
+
+server = AgentServer(setup_fnc=prewarm)
+server.rtc_session()(entrypoint)
+
+
+def main() -> None:
+    """CLI entry point."""
+    cli.run_app(server)
+
+
+if __name__ == "__main__":
+    main()

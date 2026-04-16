@@ -22,9 +22,17 @@ test = [
     "pytest>=8.0",
     "pytest-asyncio>=0.24",
 ]
+voice = [
+    "livekit-agents>=1.0",
+    "livekit-plugins-elevenlabs",
+    "livekit-plugins-silero",
+    "httpx",
+    "aiohttp",
+    "livekit-api>=1.1.0",
+]
 
 [tool.hatch.build.targets.wheel]
-packages = ["feishu", "sidecar", "channel_server"]
+packages = ["feishu", "sidecar", "channel_server", "voice"]
 
 [tool.pytest.ini_options]
 asyncio_mode = "auto"

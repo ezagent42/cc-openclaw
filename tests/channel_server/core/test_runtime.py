@@ -51,10 +51,10 @@ def test_spawn_duplicate_raises():
         rt.spawn("actor://a", "forward_all")
 
 
-def test_spawn_over_ended_actor_succeeds():
+async def test_spawn_over_ended_actor_succeeds():
     rt = make_runtime()
     rt.spawn("actor://a", "forward_all")
-    rt.stop("actor://a")
+    await rt.stop("actor://a")
     # Should succeed — old actor is ended.
     actor = rt.spawn("actor://a", "forward_all", tag="respawned")
     assert actor.tag == "respawned"
@@ -65,19 +65,19 @@ def test_spawn_over_ended_actor_succeeds():
 # 3. stop ends actor
 # ---------------------------------------------------------------------------
 
-def test_stop_ends_actor():
+async def test_stop_ends_actor():
     rt = make_runtime()
     rt.spawn("actor://a", "forward_all")
-    rt.stop("actor://a")
+    await rt.stop("actor://a")
     actor = rt.lookup("actor://a")
     assert actor is not None
     assert actor.state == "ended"
 
 
-def test_stop_nonexistent_is_graceful():
+async def test_stop_nonexistent_is_graceful():
     rt = make_runtime()
     # Should not raise.
-    rt.stop("actor://nonexistent")
+    await rt.stop("actor://nonexistent")
 
 
 # ---------------------------------------------------------------------------
@@ -105,10 +105,10 @@ def test_send_to_nonexistent_no_crash():
     rt.send("actor://nowhere", msg)
 
 
-def test_send_to_ended_actor_no_crash():
+async def test_send_to_ended_actor_no_crash():
     rt = make_runtime()
     rt.spawn("actor://a", "forward_all")
-    rt.stop("actor://a")
+    await rt.stop("actor://a")
     msg = Message(sender="actor://b")
     # Should not raise.
     rt.send("actor://a", msg)
@@ -304,19 +304,19 @@ async def test_transport_send_dispatches():
 # 11. UpdateActor merges metadata
 # ---------------------------------------------------------------------------
 
-def test_execute_update_actor_merges_metadata():
+async def test_execute_update_actor_merges_metadata():
     rt = make_runtime()
     actor = rt.spawn("actor://a", "forward_all", metadata={"key1": "val1"})
     action = UpdateActor(changes={"metadata": {"key2": "val2"}})
-    rt._execute(actor, action)
+    await rt._execute(actor, action)
     assert actor.metadata == {"key1": "val1", "key2": "val2"}
 
 
-def test_execute_update_actor_sets_fields():
+async def test_execute_update_actor_sets_fields():
     rt = make_runtime()
     actor = rt.spawn("actor://a", "forward_all", tag="old")
     action = UpdateActor(changes={"tag": "new"})
-    rt._execute(actor, action)
+    await rt._execute(actor, action)
     assert actor.tag == "new"
 
 
@@ -417,7 +417,7 @@ async def test_max_errors_stops_actor():
 # 15. runtime.stop calls on_stop lifecycle callback
 # ---------------------------------------------------------------------------
 
-def test_stop_calls_on_stop():
+async def test_stop_calls_on_stop():
     """runtime.stop() should invoke the handler's on_stop before ending the actor."""
     rt = make_runtime()
     from channel_server.core.handler import HANDLER_REGISTRY
@@ -437,7 +437,7 @@ def test_stop_calls_on_stop():
         rt.spawn("actor://lc", "lifecycle_test")
         assert rt.lookup("actor://lc").state == "active"
 
-        rt.stop("actor://lc")
+        await rt.stop("actor://lc")
 
         assert rt.lookup("actor://lc").state == "ended"
         assert on_stop_called == ["actor://lc"]
@@ -445,7 +445,7 @@ def test_stop_calls_on_stop():
         del HANDLER_REGISTRY["lifecycle_test"]
 
 
-def test_stop_on_stop_cascades():
+async def test_stop_on_stop_cascades():
     """on_stop can emit StopActor to cascade cleanup."""
     rt = make_runtime()
     from channel_server.core.handler import HANDLER_REGISTRY
@@ -470,7 +470,7 @@ def test_stop_on_stop_cascades():
         rt.spawn("actor://parent", "cascade_parent")
         rt.spawn("actor://child", "cascade_child")
 
-        rt.stop("actor://parent")
+        await rt.stop("actor://parent")
 
         assert rt.lookup("actor://parent").state == "ended"
         assert rt.lookup("actor://child").state == "ended"
@@ -479,10 +479,10 @@ def test_stop_on_stop_cascades():
         del HANDLER_REGISTRY["cascade_child"]
 
 
-def test_stop_idempotent():
+async def test_stop_idempotent():
     """Stopping an already-ended actor should be a no-op."""
     rt = make_runtime()
     rt.spawn("actor://x", "forward_all")
-    rt.stop("actor://x")
-    rt.stop("actor://x")  # should not raise
+    await rt.stop("actor://x")
+    await rt.stop("actor://x")  # should not raise
     assert rt.lookup("actor://x").state == "ended"

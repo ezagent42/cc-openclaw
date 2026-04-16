@@ -431,7 +431,7 @@ class CCAdapter:
             tool_card_addr = f"tool_card:{user}.{session_name}"
             for addr in [child_cc_addr, tool_card_addr, feishu_thread_addr]:
                 if addr:
-                    self.runtime.stop(addr)
+                    await self.runtime.stop(addr)
             await ws.send(json.dumps({
                 "action": "spawn_result", "ok": False,
                 "text": f"Session '{session_name}' failed: could not create tmux window (session={_TMUX_SESSION})",
@@ -470,7 +470,7 @@ class CCAdapter:
             return
 
         # Stop CC actor — lifecycle callbacks handle all cleanup
-        self.runtime.stop(child_cc_addr)
+        await self.runtime.stop(child_cc_addr)
 
         # Kill tmux window
         self.kill_cc_process(user, session_name)

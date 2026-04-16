@@ -31,6 +31,8 @@ class ActorRuntime:
         self._tasks: dict[str, asyncio.Task] = {}
         self._stop_event = asyncio.Event()
         self._transport_handlers: dict[str, Callable] = {}
+        self._dedup: set[str] = set()
+        self._dedup_max = 10_000
 
     # ------------------------------------------------------------------
     # Public API
@@ -72,7 +74,7 @@ class ActorRuntime:
 
         return actor
 
-    def stop(self, address: str) -> None:
+    async def stop(self, address: str) -> None:
         """Stop an actor — run on_stop lifecycle, set state to ended, cancel loop."""
         actor = self.actors.get(address)
         if actor is None:
@@ -86,15 +88,24 @@ class ActorRuntime:
             handler = get_handler(actor.handler)
             actions = handler.on_stop(actor)
             for action in actions:
-                self._execute(actor, action)
+                await self._execute(actor, action)
         except Exception as e:
             log.error("on_stop error for %s: %s", address, e)
 
         actor.state = "ended"
         self._cancel_task(address)
 
-    def send(self, to: str, message: Message) -> None:
+    def send(self, to: str, message: Message, *, message_id: str = "") -> None:
         """Deliver a message to an actor's mailbox. Drops silently if actor missing or ended."""
+        if message_id:
+            if message_id in self._dedup:
+                log.info("send: dedup skip %s → %s", message_id[:20], to)
+                return
+            self._dedup.add(message_id)
+            if len(self._dedup) > self._dedup_max:
+                to_remove = list(self._dedup)[: self._dedup_max // 2]
+                self._dedup -= set(to_remove)
+
         actor = self.actors.get(to)
         if actor is None or actor.state == "ended":
             log.warning("send: dropping message to %s (not found or ended)", to)
@@ -135,6 +146,12 @@ class ActorRuntime:
         actor.state = "suspended"
         self._cancel_task(address)
 
+    def wire(self, from_addr: str, to_addr: str) -> None:
+        """Append to_addr to from_addr's downstream if not already present."""
+        actor = self.actors.get(from_addr)
+        if actor and to_addr not in actor.downstream:
+            actor.downstream.append(to_addr)
+
     def register_transport_handler(self, transport_type: str, callback: Callable) -> None:
         """Register a callback for a given transport type (e.g. 'websocket')."""
         self._transport_handlers[transport_type] = callback
@@ -173,7 +190,7 @@ class ActorRuntime:
                     actions = handler.handle(actor, msg)
                     log.info("Actor %s produced %d actions: %s", actor.address, len(actions), [type(a).__name__ for a in actions])
                     for action in actions:
-                        self._execute(actor, action)
+                        await self._execute(actor, action)
                     error_count = 0
                 except Exception as e:
                     error_count += 1
@@ -206,20 +223,20 @@ class ActorRuntime:
     # Action execution
     # ------------------------------------------------------------------
 
-    def _execute(self, actor: Actor, action: Action) -> None:
+    async def _execute(self, actor: Actor, action: Action) -> None:
         if isinstance(action, Send):
             log.info("Execute Send: %s → %s", actor.address, action.to)
             self.send(action.to, action.message)
         elif isinstance(action, TransportSend):
-            self._execute_transport_send(actor, action)
+            await self._execute_transport_send(actor, action)
         elif isinstance(action, UpdateActor):
             self._execute_update(actor, action)
         elif isinstance(action, SpawnActor):
             self.spawn(action.address, action.handler, **action.kwargs)
         elif isinstance(action, StopActor):
-            self.stop(action.address)
+            await self.stop(action.address)
 
-    def _execute_transport_send(self, actor: Actor, action: TransportSend) -> None:
+    async def _execute_transport_send(self, actor: Actor, action: TransportSend) -> None:
         if actor.transport is None:
             log.warning("TransportSend on actor %s with no transport", actor.address)
             return
@@ -232,9 +249,18 @@ class ActorRuntime:
             )
             return
         result = callback(actor, action.payload)
-        # If the callback is a coroutine, schedule it.
         if inspect.isawaitable(result):
-            asyncio.ensure_future(result)
+            result = await result
+        if isinstance(result, dict):
+            actor.metadata.update(result)
+            # Auto-maintain sent_msg_ids ring buffer for echo prevention
+            sent_id = result.get("_sent_msg_id", "")
+            if sent_id:
+                sent_ids = list(actor.metadata.get("sent_msg_ids", []))
+                sent_ids.append(sent_id)
+                if len(sent_ids) > 100:
+                    sent_ids = sent_ids[-100:]
+                actor.metadata["sent_msg_ids"] = sent_ids
 
     def _execute_update(self, actor: Actor, action: UpdateActor) -> None:
         for key, value in action.changes.items():

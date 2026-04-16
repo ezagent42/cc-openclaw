@@ -512,7 +512,7 @@ class FeishuAdapter:
         except Exception as e:
             log.warning("_send_file error: %s", e)
 
-    async def _send_reaction(self, message_id: str, emoji_type: str = "ONIT") -> str:
+    async def _send_reaction(self, message_id: str, emoji_type: str = "Typing") -> str:
         """Add emoji reaction to a Feishu message. Returns reaction_id or ''."""
         if not self.feishu_client:
             log.warning("_send_reaction: no feishu_client")

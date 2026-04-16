@@ -322,6 +322,15 @@ class CCAdapter:
         if existing is not None and existing.state == "suspended":
             resume_chat_id = existing.metadata.get("chat_id", "")
             if self.spawn_cc_process(user, session_name, tag=tag, chat_id=resume_chat_id):
+                # Notify in the thread anchor that session resumed
+                anchor_msg_id = existing.metadata.get("anchor_msg_id", "")
+                if anchor_msg_id and resume_chat_id and self.feishu_adapter:
+                    await self.feishu_adapter._update_anchor_card(
+                        anchor_msg_id,
+                        f"\U0001f7e2 [{existing.tag}] resumed",
+                        body_text=f"Session [{existing.tag}] has been resumed",
+                        template="green",
+                    )
                 await ws.send(json.dumps({
                     "action": "spawn_result", "ok": True,
                     "text": f"Session '{session_name}' resumed",

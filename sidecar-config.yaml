@@ -1,0 +1,25 @@
+# Sidecar Config Manager — 内部小龙虾
+# Shared Feishu App: cli_a9563cc03d399cc9
+
+feishu:
+  app_id: "cli_a9563cc03d399cc9"
+  app_secret: "nKCtKpxgd6u9YBMfJHub2y2SJGrjWlPc"
+  user_group_chat_id: "oc_c3874513e147f0a48752fbe4c5c1ed45"    # OneSyn龙虾交流群
+  admin_group_chat_id: "oc_e75a27e1cb30a93a700014dd7d014b6c"  # 龙虾管理群
+
+openclaw:
+  gateway_url: "http://127.0.0.1:18789"
+  auth_token: "30dcd2bb258d4b0145edb2816a0d92b323ffbccad9250ff4"
+  default_model: "openrouter/google/gemini-3.1-flash-lite-preview"
+  account_id: "shared"                           # accountId in openclaw.json for the shared app
+
+sidecar:
+  api_port: 18791
+  db_path: "~/.openclaw/sidecar.sqlite"
+  reconcile_interval_minutes: 10
+  deny_rate_limit_minutes: 10
+  agents_dir: "~/.openclaw/agents"
+  archived_dir: "~/.openclaw/archived"
+
+templates:
+  user_agent_dir: "./sidecar/templates/"

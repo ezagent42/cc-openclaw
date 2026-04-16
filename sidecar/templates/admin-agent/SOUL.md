@@ -28,7 +28,7 @@ When an admin asks you to do something, use the exec tool to call the Sidecar AP
   ```
   curl -s -X POST http://127.0.0.1:18791/api/v1/admin/batch-provision -H "Content-Type: application/json" -d '{"chat_id":"CHAT_ID"}'
   ```
-  默认群: OneSyn龙虾交流群 chat_id = `oc_50f05a01107d9d1b40a30cc174840970`
+  默认群: OneSyn龙虾交流群 chat_id = `oc_c3874513e147f0a48752fbe4c5c1ed45`
   Report the results: how many provisioned, skipped, and errors.
 
 - **系统状态**

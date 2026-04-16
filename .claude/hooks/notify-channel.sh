@@ -11,7 +11,7 @@ command -v jq       &>/dev/null || exit 0
 # Read channel-server port from pidfile
 PIDFILE="${CLAUDE_PLUGIN_ROOT:-$(cd "$(dirname "$0")/../.." && pwd)}/.channel-server.pid"
 [ -f "$PIDFILE" ] || exit 0
-PORT=$(cut -d: -f2 < "$PIDFILE")
+PORT=$(python3 -c "import json; print(json.load(open('$PIDFILE'))['port'])" 2>/dev/null || cut -d: -f2 < "$PIDFILE")
 
 CHAT_ID="${OC_CHAT_ID:-}"
 [ -n "$CHAT_ID" ] || exit 0

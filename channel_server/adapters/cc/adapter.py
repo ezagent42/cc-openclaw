@@ -320,7 +320,8 @@ class CCAdapter:
 
         # Resume suspended actor — just start tmux, CC will reconnect
         if existing is not None and existing.state == "suspended":
-            if self.spawn_cc_process(user, session_name, tag=tag):
+            resume_chat_id = existing.metadata.get("chat_id", "")
+            if self.spawn_cc_process(user, session_name, tag=tag, chat_id=resume_chat_id):
                 await ws.send(json.dumps({
                     "action": "spawn_result", "ok": True,
                     "text": f"Session '{session_name}' resumed",
@@ -415,7 +416,7 @@ class CCAdapter:
                 thread_actor.downstream.append(child_cc_addr)
 
         # Start CC process via tmux
-        if self.spawn_cc_process(user, session_name, tag=tag):
+        if self.spawn_cc_process(user, session_name, tag=tag, chat_id=chat_id):
             await ws.send(json.dumps({
                 "action": "spawn_result", "ok": True,
                 "text": f"Session '{session_name}' spawned",
@@ -514,8 +515,9 @@ class CCAdapter:
     # Process management
     # ------------------------------------------------------------------
 
-    def spawn_cc_process(self, user: str, session_name: str, tag: str = "") -> bool:
-        """Start CC process via cc-openclaw.sh in tmux. Returns True on success."""
+    def spawn_cc_process(self, user: str, session_name: str, tag: str = "",
+                         chat_id: str = "") -> bool:
+        """Start CC process via cc-openclaw.sh --user in tmux. Returns True on success."""
         script = PROJECT_ROOT / "cc-openclaw.sh"
         if not script.exists():
             log.warning("cc-openclaw.sh not found at %s", script)
@@ -528,12 +530,15 @@ class CCAdapter:
             "OC_SESSION": session_name,
             "OC_TAG": tag or session_name,
         }
-        # Build the full command with env vars
+        if chat_id:
+            env_vars["OC_CHAT_ID"] = chat_id
+
+        # Build the full command: source local.sh for env, then run script with --user
         env_prefix = " ".join(f"{k}={v}" for k, v in env_vars.items())
         cmd = [
             "tmux", "new-window", "-t", _TMUX_SESSION,
             "-n", window_name,
-            f"{env_prefix} {script}",
+            f"{env_prefix} {script} --user {user} --session {session_name}" + (f" --tag {tag}" if tag else ""),
         ]
 
         try:

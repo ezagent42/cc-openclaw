@@ -244,10 +244,22 @@ async def main() -> None:
                     break
     service_name = service_name or "channel-server"
 
-    # Set process title for identification (avoids killing wrong process)
+    # Read app_id for process identification
+    app_id_short = ""
+    creds_file = PROJECT_ROOT / ".feishu-credentials.json"
+    if creds_file.exists():
+        try:
+            app_id_short = json.loads(creds_file.read_text()).get("app_id", "")[-8:]
+        except Exception:
+            pass
+
+    # Set process title: {service}-channel-server[{app_id_suffix}]
+    proc_title = f"{service_name}-channel-server"
+    if app_id_short:
+        proc_title += f"[{app_id_short}]"
     try:
         import setproctitle
-        setproctitle.setproctitle(f"{service_name}-channel-server")
+        setproctitle.setproctitle(proc_title)
     except ImportError:
         pass
 

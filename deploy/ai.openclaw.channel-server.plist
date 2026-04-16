@@ -9,7 +9,8 @@
         <string>/opt/homebrew/bin/uv</string>
         <string>run</string>
         <string>python3</string>
-        <string>feishu/channel_server.py</string>
+        <string>-m</string>
+        <string>channel_server.app</string>
     </array>
     <key>WorkingDirectory</key>
     <string>/Users/h2oslabs/cc-openclaw</string>
@@ -33,6 +34,8 @@
         <string>http://127.0.0.1:7897</string>
         <key>https_proxy</key>
         <string>http://127.0.0.1:7897</string>
+        <key>no_proxy</key>
+        <string>localhost,127.0.0.1,::1,.feishu.cn,.larksuite.com,open.feishu.cn</string>
     </dict>
 </dict>
 </plist>

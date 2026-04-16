@@ -13,9 +13,10 @@ Two issues remain after the actor model remediation:
    `_handle_register` only attaches a WebSocket transport and auto-spawns a minimal actor — no tool card, no unified init path.
    Result: root session has no tool card; child session resume logic is incomplete.
 
-2. **`/spawn`, `/kill`, `/sessions` flow through the LLM.**
+2. **`/spawn`, `/kill`, `/sessions` flow through the LLM (Feishu path).**
    User sends `/spawn voice-widget` in Feishu → admin actor → cc:user.root → Claude interprets → calls MCP tool → channel server executes.
    These are deterministic commands that waste tokens and add latency.
+   Note: the CC WebSocket protocol also has direct `spawn_session`/`kill_session`/`list_sessions` actions (adapter.py:116-119) which already short-circuit. The Feishu text path is the one that needs fixing.
 
 3. **Tool cards are created in the wrong place.**
    All child session tool cards appear in the main chat window instead of inside their respective threads.
@@ -112,11 +113,13 @@ def _handle_spawn(self, actor, msg):
                    parent=f"cc:{user}.root",
                    downstream=[thread_addr],
                    metadata={"chat_id": chat_id, "tag": tag}),
-        # Wire thread → cc. Current UpdateActor only targets self (the emitting actor).
-        # Need a new WireActor action type with a target field:
-        WireActor(target=thread_addr, downstream=[cc_addr]),
-        # Implementation: add WireActor dataclass to core/actor.py and
-        # handle it in runtime._execute() by updating the target actor's downstream.
+        # Wire thread → cc. Use existing runtime.wire() method (runtime.py:148).
+        # Since session-mgr handler receives runtime as 3rd arg (see "Handler
+        # Dependency on Runtime" section), it can call runtime.wire() directly
+        # for topology setup, keeping this as a side effect rather than an Action.
+        # Alternative: add a WireActor action type to the Action union if we want
+        # to keep handlers fully pure. For now, pragmatic: call runtime.wire().
+        # runtime.wire(thread_addr, cc_addr)  — called after actions are returned
         reply_ok(chat_id, f"Session '{session_name}' spawned"),
     ]
 ```
@@ -239,6 +242,8 @@ Step 2 depends on step 1's result: `create_thread_anchor` returns `anchor_msg_id
 
 **Error handling:** If step 1 fails (feishu API error), `anchor_msg_id` won't be in metadata. The transport handler for step 2 must check `actor.metadata.get("anchor_msg_id")` — if missing, skip tool card creation and log a warning. The session still functions (just without a tool card), so this is a degraded-but-operational state, not a fatal error.
 
+**Transport handler return values:** The current `_handle_thread_transport` in the feishu adapter returns `None` for most actions. New transport actions (`create_thread_anchor`, `create_tool_card`) must return a dict with the relevant IDs (e.g., `{"anchor_msg_id": msg_id}`) so `_execute_transport_send` can merge them into `actor.metadata`. This is a required change to the feishu adapter's transport handlers.
+
 ### 4. cc_session Handler Hooks
 
 ```python
@@ -280,9 +285,13 @@ async def _handle_register(self, ws, msg):
     actor = self.runtime.lookup(address)
     if actor is None or actor.state == "ended":
         self.runtime.spawn(address, handler="cc_session",
-                           state="active", transport=Transport(type="ws", ws=ws))
+                           state="active",
+                           transport=Transport(type="websocket",
+                                              config={"instance_id": instance_id}))
     elif actor.state in ("suspended", "disconnected"):
-        self.runtime.attach(address, transport=Transport(type="ws", ws=ws))
+        self.runtime.attach(address,
+                            transport=Transport(type="websocket",
+                                               config={"instance_id": instance_id}))
         actor.state = "active"
 
     # 3. If new root actor: notify session-mgr for init
@@ -305,13 +314,31 @@ Key change: register no longer does any business initialization. It attaches tra
 
 **Root cause:** `feishu_adapter.create_tool_card()` does not pass `root_id` to the Feishu API, so cards always appear in the main chat.
 
-**Fix:** Add optional `root_id` parameter:
+**Fix:** Add optional `root_id` parameter. When `root_id` is provided, use `ReplyMessageRequest` with `reply_in_thread=True` (same pattern as `create_thread_anchor` in adapter.py:627-635) instead of `CreateMessageRequest`:
 
 ```python
 async def create_tool_card(self, chat_id, label, root_id=None):
-    body = {"receive_id": chat_id, "msg_type": "interactive", "content": card_json}
+    card_json = build_tool_card(label)
     if root_id:
-        body["root_id"] = root_id   # card appears inside thread
+        # Thread mode: reply to anchor message, creating card inside thread
+        req = ReplyMessageRequest.builder()
+            .message_id(root_id)
+            .request_body(ReplyMessageRequestBody.builder()
+                .msg_type("interactive")
+                .content(card_json)
+                .reply_in_thread(True)
+                .build())
+            .build()
+    else:
+        # Main chat mode: create message directly
+        req = CreateMessageRequest.builder()
+            .receive_id_type("chat_id")
+            .request_body(CreateMessageRequestBody.builder()
+                .receive_id(chat_id)
+                .msg_type("interactive")
+                .content(card_json)
+                .build())
+            .build()
     # call feishu API...
 ```
 
@@ -344,7 +371,9 @@ Options:
 - **Pragmatic:** pass `runtime` as a third argument to `handle()` for handlers that need it. Keep the `handle(actor, msg)` signature for handlers that don't.
 - **Purist:** actor.metadata caches a session registry that session-mgr maintains. Adds complexity for little benefit.
 
-Recommendation: pragmatic approach — `handle(actor, msg, runtime)`. The runtime reference is read-only for validation/query; mutations still go through returned Actions. Existing handlers that don't need runtime keep the `handle(actor, msg)` signature — runtime passes the third arg only if the handler accepts it (inspect signature or use `**kwargs`).
+Recommendation: pragmatic approach — `handle(actor, msg, runtime)`. The runtime reference is read-only for validation/query; mutations still go through returned Actions.
+
+**Implementation:** Update `_actor_loop` in `runtime.py` (line 189) to always pass `runtime` as the third argument. Update the Handler Protocol in `handler.py` to include `runtime` as a parameter. All existing handlers gain the parameter but can ignore it. This is a one-time breaking change to the protocol, simpler than signature introspection.
 
 ## Race Conditions
 

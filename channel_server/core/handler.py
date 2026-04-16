@@ -89,7 +89,9 @@ class CCSessionHandler:
     def handle(self, actor: Actor, msg: Message) -> list[Action]:
         if msg.sender != actor.address:
             # External message — forward to the CC session over its transport.
-            return [TransportSend(payload={"action": "message", **msg.payload})]
+            # Spread payload first, then force action=message so channel.py
+            # recognizes it (payload may contain its own "action" like "reaction").
+            return [TransportSend(payload={**msg.payload, "action": "message"})]
 
         # Message originated from CC itself — dispatch on action.
         action = msg.payload.get("action")

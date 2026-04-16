@@ -214,7 +214,7 @@ class CCAdapter:
     # Outbound: push to CC
     # ------------------------------------------------------------------
 
-    def push_to_cc(self, actor: Actor, payload: dict) -> None:
+    async def push_to_cc(self, actor: Actor, payload: dict) -> None:
         """Transport callback: push message to CC session via WebSocket."""
         ws = self._address_to_ws.get(actor.address)
         if ws is None:
@@ -222,7 +222,7 @@ class CCAdapter:
             return
         try:
             data = json.dumps(payload)
-            asyncio.ensure_future(ws.send(data))
+            await ws.send(data)
         except Exception as e:
             log.warning("push_to_cc error for %s: %s", actor.address, e)
 
@@ -365,9 +365,9 @@ class CCAdapter:
                     break
 
         if self.feishu_adapter and chat_id:
-            anchor_msg_id = self.feishu_adapter.create_thread_anchor(chat_id, tag)
+            anchor_msg_id = await self.feishu_adapter.create_thread_anchor(chat_id, tag)
             if anchor_msg_id:
-                self.feishu_adapter.pin_message(anchor_msg_id)
+                await self.feishu_adapter.pin_message(anchor_msg_id)
 
         # Spawn feishu thread actor (if we have anchor)
         feishu_thread_addr = ""
@@ -397,7 +397,7 @@ class CCAdapter:
 
         # Spawn tool card actor
         if self.feishu_adapter and chat_id:
-            tool_card_msg_id = self.feishu_adapter.create_tool_card(chat_id, f"[{tag}] starting...")
+            tool_card_msg_id = await self.feishu_adapter.create_tool_card(chat_id, f"[{tag}] starting...")
             if tool_card_msg_id:
                 tool_card_addr = f"tool_card:{user}.{session_name}"
                 self.runtime.spawn(

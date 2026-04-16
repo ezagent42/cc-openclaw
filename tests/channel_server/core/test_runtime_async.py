@@ -45,7 +45,7 @@ async def test_transport_send_return_none_no_crash():
     """Transport handler returning None should not crash."""
     rt = make_runtime()
 
-    def sync_handler(actor: Actor, payload: dict) -> None:
+    async def sync_handler(actor: Actor, payload: dict) -> None:
         return None
 
     rt.register_transport_handler("test_none", sync_handler)
@@ -65,7 +65,7 @@ async def test_transport_send_return_sent_msg_id_ring_buffer():
     rt = make_runtime()
     call_count = [0]
 
-    def sync_handler(actor: Actor, payload: dict) -> dict:
+    async def sync_handler(actor: Actor, payload: dict) -> dict:
         call_count[0] += 1
         return {"_sent_msg_id": f"msg-{call_count[0]}"}
 

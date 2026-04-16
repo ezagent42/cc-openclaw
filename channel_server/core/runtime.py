@@ -2,7 +2,6 @@
 from __future__ import annotations
 
 import asyncio
-import inspect
 import logging
 from typing import Callable
 
@@ -248,9 +247,7 @@ class ActorRuntime:
                 actor.address,
             )
             return
-        result = callback(actor, action.payload)
-        if inspect.isawaitable(result):
-            result = await result
+        result = await callback(actor, action.payload)
         if isinstance(result, dict):
             actor.metadata.update(result)
             # Auto-maintain sent_msg_ids ring buffer for echo prevention

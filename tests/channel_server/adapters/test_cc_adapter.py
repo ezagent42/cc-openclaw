@@ -145,11 +145,7 @@ async def test_push_to_cc_sends_via_ws():
     ws.send.reset_mock()
 
     payload = {"action": "message", "text": "incoming from feishu", "chat_id": "oc_abc"}
-    adapter.push_to_cc(actor, payload)
-
-    # push_to_cc uses asyncio.ensure_future(ws.send(...))
-    # Give the event loop a tick to execute
-    await asyncio.sleep(0)
+    await adapter.push_to_cc(actor, payload)
 
     ws.send.assert_called_once()
     sent = json.loads(ws.send.call_args[0][0])

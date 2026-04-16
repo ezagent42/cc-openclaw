@@ -6,7 +6,6 @@ import json
 import logging
 import os
 import threading
-import time
 from pathlib import Path
 
 import lark_oapi as lark
@@ -255,7 +254,7 @@ class FeishuAdapter:
             except Exception as e:
                 log.error("Feishu WS error: %s", e)
 
-        t = threading.Thread(target=ws_thread, daemon=True)
+        t = threading.Thread(target=ws_thread, daemon=True)  # compliance-exempt: WS listener needs own event loop
         t.start()
         log.info("Feishu WS thread started")
 
@@ -292,14 +291,13 @@ class FeishuAdapter:
                 to_remove = list(self._seen)[:5000]
                 self._seen -= set(to_remove)
 
-        # ACK reaction
+        # ACK reaction — schedule coroutine on the running loop
         if message_id:
-            threading.Thread(
-                target=self._send_reaction,
-                args=(message_id,),
-                kwargs={"track": True},
-                daemon=True,
-            ).start()
+            try:
+                loop = asyncio.get_running_loop()
+                loop.create_task(self._ack_and_track(message_id))
+            except RuntimeError:
+                pass  # no running loop (e.g. tests)
             self._last_msg_id[chat_id] = message_id
 
         # Record chat_id mapping for DMs
@@ -364,6 +362,12 @@ class FeishuAdapter:
         )
         self.runtime.send(address, msg)
 
+    async def _ack_and_track(self, message_id: str) -> None:
+        """Send ACK reaction and track the reaction_id for later removal."""
+        reaction_id = await self._send_reaction(message_id, track=True)
+        if reaction_id:
+            self._ack_reactions[message_id] = reaction_id
+
     def on_feishu_reaction(self, event: dict) -> None:
         """Route a reaction event to the appropriate actor.
 
@@ -404,100 +408,91 @@ class FeishuAdapter:
     # Outbound transport handlers
     # ------------------------------------------------------------------
 
-    def _handle_chat_transport(self, actor: Actor, payload: dict) -> None:
+    async def _handle_chat_transport(self, actor: Actor, payload: dict) -> dict | None:
         action = payload.get("action")
         chat_id = actor.transport.config["chat_id"] if actor.transport else ""
 
         # Remove ACK reaction for the last inbound message in this chat
         last_msg = self._last_msg_id.pop(chat_id, "")
-        if last_msg:
-            threading.Thread(target=self._remove_reaction, args=(last_msg,), daemon=True).start()
+        reaction_id = self._ack_reactions.pop(last_msg, "") if last_msg else ""
+        if last_msg and reaction_id:
+            await self._remove_reaction(last_msg, reaction_id)
 
         if action is None:
-            # Default: send text message
             text = payload.get("text", "")
-            threading.Thread(target=self._send_message, args=(chat_id, text, None), daemon=True).start()
+            sent_id = await self._send_message(chat_id, text, None)
+            if sent_id:
+                return {"_sent_msg_id": sent_id}
+        elif action == "ack_react":
+            message_id = payload.get("message_id", "")
+            reaction_id = await self._send_reaction(message_id)
+            if reaction_id:
+                return {"ack_reaction_id": reaction_id}
+        elif action == "remove_ack":
+            await self._remove_reaction(payload.get("message_id", ""), payload.get("reaction_id", ""))
         elif action == "react":
-            message_id = payload.get("message_id", "")
-            emoji_type = payload.get("emoji_type", "THUMBSUP")
-            threading.Thread(target=self._send_reaction, args=(message_id, emoji_type), daemon=True).start()
+            await self._send_reaction(payload.get("message_id", ""), payload.get("emoji_type", "THUMBSUP"))
         elif action == "send_file":
-            file_path = payload.get("file_path", "")
-            threading.Thread(target=self._send_file, args=(payload.get("chat_id", chat_id), file_path), daemon=True).start()
+            await self._send_file(payload.get("chat_id", chat_id), payload.get("file_path", ""))
         elif action == "tool_notify":
-            msg_id = payload.get("card_msg_id", "")
-            text = payload.get("text", "")
-            threading.Thread(target=self._update_card, args=(msg_id, text), daemon=True).start()
+            await self._update_card(payload.get("card_msg_id", ""), payload.get("text", ""))
         elif action == "unpin":
-            message_id = payload.get("message_id", "")
-            threading.Thread(target=self.unpin_message, args=(message_id,), daemon=True).start()
+            await self.unpin_message(payload.get("message_id", ""))
         elif action == "update_anchor":
-            msg_id = payload.get("msg_id", "")
-            title = payload.get("title", "")
-            body_text = payload.get("body_text", "")
-            template = payload.get("template", "red")
-            threading.Thread(
-                target=self._update_anchor_card,
-                args=(msg_id, title),
-                kwargs={"body_text": body_text, "template": template},
-                daemon=True,
-            ).start()
+            await self._update_anchor_card(payload.get("msg_id", ""), payload.get("title", ""),
+                                           body_text=payload.get("body_text", ""), template=payload.get("template", "red"))
         else:
             log.warning("_handle_chat_transport: unhandled action=%s actor=%s", action, actor.address)
+        return None
 
-    def _handle_thread_transport(self, actor: Actor, payload: dict) -> None:
+    async def _handle_thread_transport(self, actor: Actor, payload: dict) -> dict | None:
         config = actor.transport.config if actor.transport else {}
         chat_id = config.get("chat_id", "")
         root_id = config.get("root_id", "")
         action = payload.get("action")
 
         last_msg = self._last_msg_id.pop(chat_id, "")
-        if last_msg:
-            threading.Thread(target=self._remove_reaction, args=(last_msg,), daemon=True).start()
+        reaction_id = self._ack_reactions.pop(last_msg, "") if last_msg else ""
+        if last_msg and reaction_id:
+            await self._remove_reaction(last_msg, reaction_id)
 
         if action is None:
             text = payload.get("text", "")
-            threading.Thread(target=self._send_message, args=(chat_id, text, root_id), daemon=True).start()
+            sent_id = await self._send_message(chat_id, text, root_id)
+            if sent_id:
+                return {"_sent_msg_id": sent_id}
+        elif action == "ack_react":
+            message_id = payload.get("message_id", "")
+            reaction_id = await self._send_reaction(message_id)
+            if reaction_id:
+                return {"ack_reaction_id": reaction_id}
+        elif action == "remove_ack":
+            await self._remove_reaction(payload.get("message_id", ""), payload.get("reaction_id", ""))
         elif action == "react":
-            message_id = payload.get("message_id", "")
-            emoji_type = payload.get("emoji_type", "THUMBSUP")
-            threading.Thread(target=self._send_reaction, args=(message_id, emoji_type), daemon=True).start()
+            await self._send_reaction(payload.get("message_id", ""), payload.get("emoji_type", "THUMBSUP"))
         elif action == "send_file":
-            file_path = payload.get("file_path", "")
-            threading.Thread(target=self._send_file, args=(payload.get("chat_id", chat_id), file_path), daemon=True).start()
+            await self._send_file(payload.get("chat_id", chat_id), payload.get("file_path", ""))
         elif action == "update_title":
-            msg_id = payload.get("msg_id", "")
-            title = payload.get("title", "")
-            threading.Thread(target=self._update_anchor_card, args=(msg_id, title), daemon=True).start()
+            await self._update_anchor_card(payload.get("msg_id", ""), payload.get("title", ""))
         elif action == "tool_notify":
-            msg_id = payload.get("card_msg_id", "")
-            text = payload.get("text", "")
-            threading.Thread(target=self._update_card, args=(msg_id, text), daemon=True).start()
+            await self._update_card(payload.get("card_msg_id", ""), payload.get("text", ""))
         elif action == "unpin":
-            message_id = payload.get("message_id", "")
-            threading.Thread(target=self.unpin_message, args=(message_id,), daemon=True).start()
+            await self.unpin_message(payload.get("message_id", ""))
         elif action == "update_anchor":
-            msg_id = payload.get("msg_id", "")
-            title = payload.get("title", "")
-            body_text = payload.get("body_text", "")
-            template = payload.get("template", "red")
-            threading.Thread(
-                target=self._update_anchor_card,
-                args=(msg_id, title),
-                kwargs={"body_text": body_text, "template": template},
-                daemon=True,
-            ).start()
+            await self._update_anchor_card(payload.get("msg_id", ""), payload.get("title", ""),
+                                           body_text=payload.get("body_text", ""), template=payload.get("template", "red"))
         else:
             log.warning("_handle_thread_transport: unhandled action=%s actor=%s", action, actor.address)
+        return None
 
     # ------------------------------------------------------------------
-    # Feishu API methods (blocking — run in threads)
+    # Feishu API methods (async)
     # ------------------------------------------------------------------
 
-    def _send_message(self, chat_id: str, text: str, thread_anchor: str | None = None) -> None:
-        """Send a text message to a Feishu chat or thread. Blocking."""
+    async def _send_message(self, chat_id: str, text: str, thread_anchor: str | None = None) -> str:
+        """Send a text message to a Feishu chat or thread. Returns sent message_id or ''."""
         if not self.feishu_client:
-            return
+            return ""
         try:
             if thread_anchor:
                 body = (
@@ -508,7 +503,7 @@ class FeishuAdapter:
                     .build()
                 )
                 req = ReplyMessageRequest.builder().message_id(thread_anchor).request_body(body).build()
-                resp = self.feishu_client.im.v1.message.reply(req)
+                resp = await self.feishu_client.im.v1.message.areply(req)
             else:
                 body = (
                     CreateMessageRequestBody.builder()
@@ -518,17 +513,19 @@ class FeishuAdapter:
                     .build()
                 )
                 req = CreateMessageRequest.builder().receive_id_type("chat_id").request_body(body).build()
-                resp = self.feishu_client.im.v1.message.create(req)
+                resp = await self.feishu_client.im.v1.message.acreate(req)
 
             if resp.success() and resp.data and resp.data.message_id:
                 self._recent_sent.add(resp.data.message_id)
+                return resp.data.message_id
             elif not resp.success():
                 log.warning("_send_message failed: code=%s msg=%s", resp.code, resp.msg)
         except Exception as e:
             log.warning("_send_message error: %s", e)
+        return ""
 
-    def _send_file(self, chat_id: str, file_path: str) -> None:
-        """Upload file to Feishu and send as file message. Blocking."""
+    async def _send_file(self, chat_id: str, file_path: str) -> None:
+        """Upload file to Feishu and send as file message."""
         if not self.feishu_client:
             return
         try:
@@ -547,7 +544,7 @@ class FeishuAdapter:
                     .build()
                 )
                 upload_req = CreateFileRequest.builder().request_body(upload_body).build()
-                upload_resp = self.feishu_client.im.v1.file.create(upload_req)
+                upload_resp = await self.feishu_client.im.v1.file.acreate(upload_req)
 
             if not upload_resp.success():
                 log.warning("_send_file upload failed: code=%s msg=%s", upload_resp.code, upload_resp.msg)
@@ -566,7 +563,7 @@ class FeishuAdapter:
                 .build()
             )
             send_req = CreateMessageRequest.builder().receive_id_type("chat_id").request_body(body).build()
-            send_resp = self.feishu_client.im.v1.message.create(send_req)
+            send_resp = await self.feishu_client.im.v1.message.acreate(send_req)
 
             if send_resp.success() and send_resp.data and send_resp.data.message_id:
                 self._recent_sent.add(send_resp.data.message_id)
@@ -577,11 +574,11 @@ class FeishuAdapter:
         except Exception as e:
             log.warning("_send_file error: %s", e)
 
-    def _send_reaction(self, message_id: str, emoji_type: str = "MUSCLE", *, track: bool = False) -> None:
-        """Add emoji reaction to a Feishu message. Blocking."""
+    async def _send_reaction(self, message_id: str, emoji_type: str = "MUSCLE", *, track: bool = False) -> str:
+        """Add emoji reaction to a Feishu message. Returns reaction_id or ''."""
         if not self.feishu_client:
             log.warning("_send_reaction: no feishu_client")
-            return
+            return ""
         try:
             req = (
                 lark.BaseRequest.builder()
@@ -591,25 +588,23 @@ class FeishuAdapter:
                 .body({"reaction_type": {"emoji_type": emoji_type}})
                 .build()
             )
-            resp = self.feishu_client.request(req)
+            resp = await self.feishu_client.arequest(req)
             if not resp.success():
                 log.warning("Reaction failed for %s: code=%s msg=%s", message_id, resp.code, resp.msg)
-                return
+                return ""
             log.info("Reaction sent: %s %s", emoji_type, message_id)
-            if track:
-                try:
-                    data = json.loads(resp.raw.content)
-                    reaction_id = data.get("data", {}).get("reaction_id", "")
-                    if reaction_id:
-                        self._ack_reactions[message_id] = reaction_id
-                except Exception:
-                    pass
+            try:
+                data = json.loads(resp.raw.content)
+                reaction_id = data.get("data", {}).get("reaction_id", "")
+                return reaction_id
+            except Exception:
+                return ""
         except Exception as e:
             log.warning("Reaction error for %s: %s", message_id, e)
+            return ""
 
-    def _remove_reaction(self, message_id: str) -> None:
-        """Remove an ACK reaction from a message. Blocking."""
-        reaction_id = self._ack_reactions.pop(message_id, "")
+    async def _remove_reaction(self, message_id: str, reaction_id: str) -> None:
+        """Remove a reaction from a message."""
         if not reaction_id or not self.feishu_client:
             return
         try:
@@ -620,7 +615,7 @@ class FeishuAdapter:
                 .token_types({lark.AccessTokenType.TENANT})
                 .build()
             )
-            resp = self.feishu_client.request(req)
+            resp = await self.feishu_client.arequest(req)
             if resp.success():
                 log.debug("Removed ACK reaction: msg=%s", message_id)
             else:
@@ -628,21 +623,21 @@ class FeishuAdapter:
         except Exception as e:
             log.debug("Remove reaction error: %s", e)
 
-    def _update_card(self, msg_id: str, text: str) -> bool:
-        """Update an existing tool notification card. Blocking."""
+    async def _update_card(self, msg_id: str, text: str) -> bool:
+        """Update an existing tool notification card."""
         if not self.feishu_client:
             return False
         try:
             card = self._build_tool_card(text)
             body = PatchMessageRequestBody.builder().content(json.dumps(card)).build()
             req = PatchMessageRequest.builder().message_id(msg_id).request_body(body).build()
-            resp = self.feishu_client.im.v1.message.patch(req)
+            resp = await self.feishu_client.im.v1.message.apatch(req)
             return resp.success()
         except Exception:
             return False
 
-    def _update_anchor_card(self, msg_id: str, title: str, body_text: str = "", template: str = "green") -> bool:
-        """Update the card content of a thread anchor message. Blocking."""
+    async def _update_anchor_card(self, msg_id: str, title: str, body_text: str = "", template: str = "green") -> bool:
+        """Update the card content of a thread anchor message."""
         if not self.feishu_client:
             return False
         try:
@@ -652,7 +647,7 @@ class FeishuAdapter:
             }
             body = PatchMessageRequestBody.builder().content(json.dumps(card)).build()
             req = PatchMessageRequest.builder().message_id(msg_id).request_body(body).build()
-            resp = self.feishu_client.im.v1.message.patch(req)
+            resp = await self.feishu_client.im.v1.message.apatch(req)
             if resp.success():
                 log.info("Updated anchor %s: %s", msg_id, title[:60])
                 return True
@@ -663,7 +658,7 @@ class FeishuAdapter:
             log.warning("Error updating anchor: %s", e)
             return False
 
-    def create_thread_anchor(self, chat_id: str, tag: str) -> str | None:
+    async def create_thread_anchor(self, chat_id: str, tag: str) -> str | None:
         """Send a thread anchor card to Feishu chat, auto-create the topic thread.
 
         Returns the anchor message_id or None.
@@ -683,7 +678,7 @@ class FeishuAdapter:
                 .build()
             )
             req = CreateMessageRequest.builder().receive_id_type("chat_id").request_body(body).build()
-            resp = self.feishu_client.im.v1.message.create(req)
+            resp = await self.feishu_client.im.v1.message.acreate(req)
             if not (resp.success() and resp.data and resp.data.message_id):
                 log.warning("Failed to create thread anchor: %s", resp.msg if resp else "no response")
                 return None
@@ -700,7 +695,7 @@ class FeishuAdapter:
                 .build()
             )
             reply_req = ReplyMessageRequest.builder().message_id(anchor_msg_id).request_body(reply_body).build()
-            reply_resp = self.feishu_client.im.v1.message.reply(reply_req)
+            reply_resp = await self.feishu_client.im.v1.message.areply(reply_req)
             if reply_resp.success() and reply_resp.data and reply_resp.data.message_id:
                 self._recent_sent.add(reply_resp.data.message_id)
                 log.info("Auto-created thread for anchor %s", anchor_msg_id)
@@ -713,7 +708,7 @@ class FeishuAdapter:
             log.warning("Error creating thread anchor: %s", e)
             return None
 
-    def create_tool_card(self, chat_id: str, text: str) -> str | None:
+    async def create_tool_card(self, chat_id: str, text: str) -> str | None:
         """Create an interactive card for tool notifications. Returns msg_id or None."""
         if not self.feishu_client:
             return None
@@ -727,7 +722,7 @@ class FeishuAdapter:
                 .build()
             )
             req = CreateMessageRequest.builder().receive_id_type("chat_id").request_body(body).build()
-            resp = self.feishu_client.im.v1.message.create(req)
+            resp = await self.feishu_client.im.v1.message.acreate(req)
             if resp.success() and resp.data and resp.data.message_id:
                 msg_id = resp.data.message_id
                 self._recent_sent.add(msg_id)
@@ -739,14 +734,14 @@ class FeishuAdapter:
             log.warning("Error creating tool card: %s", e)
             return None
 
-    def pin_message(self, message_id: str) -> bool:
-        """Pin a message in its chat. Blocking."""
+    async def pin_message(self, message_id: str) -> bool:
+        """Pin a message in its chat."""
         if not self.feishu_client:
             return False
         try:
             body = CreatePinRequestBody.builder().message_id(message_id).build()
             req = CreatePinRequest.builder().request_body(body).build()
-            resp = self.feishu_client.im.v1.pin.create(req)
+            resp = await self.feishu_client.im.v1.pin.acreate(req)
             if resp.success():
                 log.info("Pinned message %s", message_id)
                 return True
@@ -757,13 +752,13 @@ class FeishuAdapter:
             log.warning("Error pinning message: %s", e)
             return False
 
-    def unpin_message(self, message_id: str) -> bool:
-        """Unpin a message. Blocking."""
+    async def unpin_message(self, message_id: str) -> bool:
+        """Unpin a message."""
         if not self.feishu_client:
             return False
         try:
             req = DeletePinRequest.builder().message_id(message_id).build()
-            resp = self.feishu_client.im.v1.pin.delete(req)
+            resp = await self.feishu_client.im.v1.pin.adelete(req)
             if resp.success():
                 log.info("Unpinned message %s", message_id)
                 return True
@@ -823,7 +818,7 @@ class FeishuAdapter:
 
     def _download_resource(self, message_id: str, file_key: str, resource_type: str,
                            file_name: str, chat_id: str, label: str) -> str:
-        """Download a message resource using the typed SDK API.
+        """Download a message resource using the typed SDK API (sync — called from parsers).
 
         Returns the local file path on success, empty string on failure.
         """
@@ -893,8 +888,8 @@ class FeishuAdapter:
     # Startup notification
     # ------------------------------------------------------------------
 
-    def send_startup_notification(self, admin_chat_id: str) -> None:
-        """Send a startup notification to the admin chat. Blocking — run in thread."""
+    async def send_startup_notification(self, admin_chat_id: str) -> None:
+        """Send a startup notification to the admin chat."""
         if not self.feishu_client or not admin_chat_id:
             return
         try:
@@ -906,7 +901,7 @@ class FeishuAdapter:
                 .build()
             )
             req = CreateMessageRequest.builder().receive_id_type("chat_id").request_body(body).build()
-            resp = self.feishu_client.im.v1.message.create(req)
+            resp = await self.feishu_client.im.v1.message.acreate(req)
             if resp.success() and resp.data and resp.data.message_id:
                 self._recent_sent.add(resp.data.message_id)
                 log.info("Sent startup notification to %s", admin_chat_id)

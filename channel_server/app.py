@@ -7,7 +7,6 @@ import logging
 import os
 import signal
 import sys
-import threading
 from pathlib import Path
 
 from channel_server.adapters.cc.adapter import CCAdapter
@@ -121,11 +120,7 @@ class ChannelServerApp:
             log.info("Spawned admin actor: %s", admin_actor_addr)
 
             # Send startup notification
-            threading.Thread(
-                target=self.feishu_adapter.send_startup_notification,
-                args=(self.admin_chat_id,),
-                daemon=True,
-            ).start()
+            await self.feishu_adapter.send_startup_notification(self.admin_chat_id)
 
         # 6. Start runtime message loops
         self._runtime_task = asyncio.create_task(self.runtime.run())

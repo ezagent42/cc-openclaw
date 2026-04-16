@@ -4,6 +4,7 @@ from channel_server.core.handlers.cc import CCSessionHandler
 from channel_server.core.handlers.forward import ForwardAllHandler
 from channel_server.core.handlers.tool_card import ToolCardHandler
 from channel_server.core.handlers.admin import AdminHandler
+from channel_server.core.handlers.session_mgr import SessionMgrHandler
 
 __all__ = [
     "FeishuInboundHandler",
@@ -11,4 +12,5 @@ __all__ = [
     "ForwardAllHandler",
     "ToolCardHandler",
     "AdminHandler",
+    "SessionMgrHandler",
 ]

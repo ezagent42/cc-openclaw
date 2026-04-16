@@ -9,6 +9,7 @@ from channel_server.core.handlers import (
     CCSessionHandler,
     FeishuInboundHandler,
     ForwardAllHandler,
+    SessionMgrHandler,
     ToolCardHandler,
 )
 
@@ -41,6 +42,7 @@ HANDLER_REGISTRY: dict[str, Handler] = {
     "forward_all": ForwardAllHandler(),
     "tool_card": ToolCardHandler(),
     "admin": AdminHandler(),
+    "session_mgr": SessionMgrHandler(),
 }
 
 

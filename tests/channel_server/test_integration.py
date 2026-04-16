@@ -117,7 +117,7 @@ async def test_round_trip():
     ws_log: list[dict] = []
     feishu_log: list[dict] = []
 
-    def mock_ws(actor, payload):
+    async def mock_ws(actor, payload):
         ws_log.append(payload)
         # Simulate CC replying immediately after receiving a message
         runtime.send(
@@ -128,7 +128,7 @@ async def test_round_trip():
             ),
         )
 
-    def mock_feishu(actor, payload):
+    async def mock_feishu(actor, payload):
         feishu_log.append(payload)
 
     runtime.register_transport_handler("websocket", mock_ws)
@@ -164,9 +164,11 @@ async def test_round_trip():
     assert len(ws_log) == 1
     assert ws_log[0]["text"] == "ping"
 
-    # Feishu should have received the reply
-    assert len(feishu_log) == 1
-    assert "echo: ping" in feishu_log[0].get("text", "")
+    # Feishu transport receives: ack_react (inbound ACK) + remove_ack + reply text (outbound)
+    non_ack_sends = [p for p in feishu_log if p.get("action") != "ack_react"]
+    reply_sends = [p for p in non_ack_sends if p.get("action") != "remove_ack"]
+    assert len(reply_sends) >= 1
+    assert "echo: ping" in reply_sends[0].get("text", "")
 
     await runtime.shutdown()
     await task

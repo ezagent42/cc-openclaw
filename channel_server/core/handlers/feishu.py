@@ -1,45 +1,67 @@
-"""FeishuInboundHandler — routes messages for a Feishu chat/thread actor."""
+"""Feishu inbound message handler."""
 from __future__ import annotations
 
-from channel_server.core.actor import Action, Actor, Message, TransportSend, Send
+from channel_server.core.actor import Action, Actor, Message, Send, TransportSend, UpdateActor
 
 
 class FeishuInboundHandler:
     """Route messages for a Feishu chat/thread actor.
 
-    - Messages from external users (feishu_user:*) -> forward to downstream CC actors.
-    - Messages from CC actors (cc:* or others) -> push to Feishu transport (outbound reply).
+    Inbound (from feishu_user:*):
+      - Check echo prevention (skip if msg_id in sent_msg_ids)
+      - ACK react via TransportSend
+      - Update ack_msg_id in metadata
+      - Forward to downstream
+
+    Outbound (from cc:* or others):
+      - Remove ACK react for current ack_msg_id
+      - Push to Feishu transport
     """
 
     def handle(self, actor: Actor, msg: Message) -> list[Action]:
         if msg.sender.startswith("feishu_user:"):
-            # Inbound from Feishu user -> forward to downstream (CC actors)
-            return [Send(to=addr, message=msg) for addr in actor.downstream]
+            return self._handle_inbound(actor, msg)
+        return self._handle_outbound(actor, msg)
 
-        # Outbound reply from CC -> push via transport to Feishu chat/thread
+    def _handle_inbound(self, actor: Actor, msg: Message) -> list[Action]:
+        message_id = msg.payload.get("message_id", "")
+        sent_ids = actor.metadata.get("sent_msg_ids", [])
+        if message_id and message_id in sent_ids:
+            return []
         actions: list[Action] = []
+        if message_id:
+            actions.append(UpdateActor(changes={"metadata": {"ack_msg_id": message_id}}))
+            actions.append(TransportSend(payload={"action": "ack_react", "message_id": message_id}))
+        for addr in actor.downstream:
+            actions.append(Send(to=addr, message=msg))
+        return actions
+
+    def _handle_outbound(self, actor: Actor, msg: Message) -> list[Action]:
+        actions: list[Action] = []
+        ack_msg_id = actor.metadata.get("ack_msg_id", "")
+        ack_reaction_id = actor.metadata.get("ack_reaction_id", "")
+        if ack_msg_id:
+            actions.append(TransportSend(payload={
+                "action": "remove_ack",
+                "message_id": ack_msg_id,
+                "reaction_id": ack_reaction_id,
+            }))
+            actions.append(UpdateActor(changes={"metadata": {"ack_msg_id": "", "ack_reaction_id": ""}}))
         if actor.transport is not None:
             actions.append(TransportSend(payload=msg.payload))
         return actions
 
     def on_stop(self, actor: Actor) -> list[Action]:
-        """Cleanup: unpin anchor message and update card to 'ended'.
-
-        Only applies to thread actors (feishu_thread transport) that have
-        an anchor message (root_id in transport config).
-        """
         actions: list[Action] = []
         if actor.transport is None or actor.transport.type != "feishu_thread":
             return actions
         anchor_msg_id = actor.transport.config.get("root_id", "")
         if anchor_msg_id:
             actions.append(TransportSend(payload={
-                "action": "unpin",
-                "message_id": anchor_msg_id,
+                "action": "unpin", "message_id": anchor_msg_id,
             }))
             actions.append(TransportSend(payload={
-                "action": "update_anchor",
-                "msg_id": anchor_msg_id,
+                "action": "update_anchor", "msg_id": anchor_msg_id,
                 "title": f"\U0001f534 [{actor.tag}] ended",
                 "body_text": f"Session [{actor.tag}] has been terminated",
                 "template": "red",

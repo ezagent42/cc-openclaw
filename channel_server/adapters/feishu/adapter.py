@@ -53,8 +53,6 @@ class FeishuAdapter:
         self.feishu_client = feishu_client
         self._recent_sent: set[str] = set()  # echo prevention — message_ids we sent
         self._seen: set[str] = set()          # dedup — message_ids already processed
-        self._ack_reactions: dict[str, str] = {}  # message_id -> reaction_id
-        self._last_msg_id: dict[str, str] = {}  # chat_id -> last inbound message_id
         self._chat_id_map: dict[str, str] = self._load_chat_id_map()
 
         self._user_names: dict[str, str] = self._load_user_names()
@@ -291,15 +289,6 @@ class FeishuAdapter:
                 to_remove = list(self._seen)[:5000]
                 self._seen -= set(to_remove)
 
-        # ACK reaction — schedule coroutine on the running loop
-        if message_id:
-            try:
-                loop = asyncio.get_running_loop()
-                loop.create_task(self._ack_and_track(message_id))
-            except RuntimeError:
-                pass  # no running loop (e.g. tests)
-            self._last_msg_id[chat_id] = message_id
-
         # Record chat_id mapping for DMs
         open_id = event.get("user_id", "")
         chat_type = event.get("chat_type", "")
@@ -362,12 +351,6 @@ class FeishuAdapter:
         )
         self.runtime.send(address, msg)
 
-    async def _ack_and_track(self, message_id: str) -> None:
-        """Send ACK reaction and track the reaction_id for later removal."""
-        reaction_id = await self._send_reaction(message_id, track=True)
-        if reaction_id:
-            self._ack_reactions[message_id] = reaction_id
-
     def on_feishu_reaction(self, event: dict) -> None:
         """Route a reaction event to the appropriate actor.
 
@@ -412,12 +395,6 @@ class FeishuAdapter:
         action = payload.get("action")
         chat_id = actor.transport.config["chat_id"] if actor.transport else ""
 
-        # Remove ACK reaction for the last inbound message in this chat
-        last_msg = self._last_msg_id.pop(chat_id, "")
-        reaction_id = self._ack_reactions.pop(last_msg, "") if last_msg else ""
-        if last_msg and reaction_id:
-            await self._remove_reaction(last_msg, reaction_id)
-
         if action is None:
             text = payload.get("text", "")
             sent_id = await self._send_message(chat_id, text, None)
@@ -450,11 +427,6 @@ class FeishuAdapter:
         chat_id = config.get("chat_id", "")
         root_id = config.get("root_id", "")
         action = payload.get("action")
-
-        last_msg = self._last_msg_id.pop(chat_id, "")
-        reaction_id = self._ack_reactions.pop(last_msg, "") if last_msg else ""
-        if last_msg and reaction_id:
-            await self._remove_reaction(last_msg, reaction_id)
 
         if action is None:
             text = payload.get("text", "")
@@ -574,7 +546,7 @@ class FeishuAdapter:
         except Exception as e:
             log.warning("_send_file error: %s", e)
 
-    async def _send_reaction(self, message_id: str, emoji_type: str = "MUSCLE", *, track: bool = False) -> str:
+    async def _send_reaction(self, message_id: str, emoji_type: str = "MUSCLE") -> str:
         """Add emoji reaction to a Feishu message. Returns reaction_id or ''."""
         if not self.feishu_client:
             log.warning("_send_reaction: no feishu_client")

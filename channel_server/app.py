@@ -27,9 +27,11 @@ class ChannelServerApp:
         admin_chat_id: str | None = None,
         feishu_enabled: bool = True,
         port: int = 0,
+        service_name: str = "channel-server",
     ) -> None:
         self.admin_chat_id = admin_chat_id
         self.feishu_enabled = feishu_enabled
+        self.service_name = service_name
         self.runtime = ActorRuntime()
         self.actors_file = PROJECT_ROOT / ".workspace" / "actors.json"
         self.feishu_adapter = None
@@ -68,6 +70,7 @@ class ChannelServerApp:
         self.pidfile.write_text(json.dumps({
             "pid": os.getpid(),
             "port": actual_port,
+            "service": self.service_name,
         }))
         log.info("Wrote pidfile: %s", self.pidfile)
 
@@ -229,6 +232,25 @@ async def main() -> None:
         datefmt="%H:%M:%S",
     )
 
+    # Read service name from cc-openclaw.sh (SESSION_NAME) or env
+    service_name = os.environ.get("SERVICE_NAME", "")
+    if not service_name:
+        launcher = PROJECT_ROOT / "cc-openclaw.sh"
+        if launcher.exists():
+            for line in launcher.read_text().splitlines():
+                stripped = line.strip()
+                if stripped.startswith("SESSION_NAME="):
+                    service_name = stripped.split("=", 1)[1].strip().strip('"').strip("'")
+                    break
+    service_name = service_name or "channel-server"
+
+    # Set process title for identification (avoids killing wrong process)
+    try:
+        import setproctitle
+        setproctitle.setproctitle(f"{service_name}-channel-server")
+    except ImportError:
+        pass
+
     admin_chat_id = os.environ.get("ADMIN_CHAT_ID", "")
     feishu_enabled = os.environ.get("FEISHU_ENABLED", "true").lower() not in ("0", "false", "no")
     port = int(os.environ.get("CHANNEL_SERVER_PORT", "0"))
@@ -237,6 +259,7 @@ async def main() -> None:
         admin_chat_id=admin_chat_id or None,
         feishu_enabled=feishu_enabled,
         port=port,
+        service_name=service_name,
     )
 
     stop_event = asyncio.Event()
@@ -253,7 +276,7 @@ async def main() -> None:
 
     feishu_status = "enabled" if app.feishu_adapter else "disabled"
     print(
-        f"\n  Channel Server started"
+        f"\n  {service_name}-channel-server started"
         f"\n  WebSocket: ws://127.0.0.1:{app.cc_adapter.port}"
         f"\n  Feishu:    {feishu_status}"
         f"\n  PID:       {os.getpid()}"

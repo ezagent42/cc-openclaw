@@ -224,8 +224,8 @@ class FeishuAdapter:
             event_handler=handler,
             log_level=lark.LogLevel.ERROR,
         )
-        # Suppress noisy Lark logger for unhandled event types
-        logging.getLogger("Lark").setLevel(logging.CRITICAL)
+        # Allow Lark warnings/errors for WS connection diagnostics
+        logging.getLogger("Lark").setLevel(logging.WARNING)
 
         def ws_thread() -> None:
             # lark_oapi.ws.client captures asyncio.get_event_loop() at import time.

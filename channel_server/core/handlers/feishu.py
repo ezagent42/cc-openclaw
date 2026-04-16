@@ -29,6 +29,17 @@ class FeishuInboundHandler:
         if message_id and message_id in sent_ids:
             return []
         actions: list[Action] = []
+
+        # Record chat_id mapping for DMs
+        chat_type = msg.metadata.get("chat_type", "")
+        user_id = msg.metadata.get("user_id", "")
+        chat_id = msg.payload.get("chat_id", "")
+        if chat_type == "p2p" and user_id and chat_id:
+            chat_map = dict(actor.metadata.get("chat_id_map", {}))
+            if user_id not in chat_map:
+                chat_map[user_id] = chat_id
+                actions.append(UpdateActor(changes={"metadata": {"chat_id_map": chat_map}}))
+
         if message_id:
             actions.append(UpdateActor(changes={"metadata": {"ack_msg_id": message_id}}))
             actions.append(TransportSend(payload={"action": "ack_react", "message_id": message_id}))

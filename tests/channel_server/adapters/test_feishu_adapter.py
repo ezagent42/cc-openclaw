@@ -31,6 +31,7 @@ def feishu_event(
     root_id: str | None = None,
     msg_type: str = "text",
     file_path: str = "",
+    chat_type: str = "",
 ) -> dict:
     """Build a minimal Feishu message event dict."""
     evt: dict = {
@@ -41,6 +42,7 @@ def feishu_event(
         "user": user,
         "user_id": user_id,
         "msg_type": msg_type,
+        "chat_type": chat_type,
     }
     if root_id is not None:
         evt["root_id"] = root_id
@@ -111,7 +113,7 @@ def test_on_feishu_event_sends_message():
 
 
 # ---------------------------------------------------------------------------
-# 5. on_feishu_event dedup — same message_id only delivered once
+# 5. on_feishu_event dedup — same message_id only delivered once (via runtime)
 # ---------------------------------------------------------------------------
 
 def test_on_feishu_event_dedup():
@@ -122,26 +124,30 @@ def test_on_feishu_event_dedup():
 
     addr = "feishu:oc_abc123"
     mailbox = rt.mailboxes[addr]
-    # Only one message should have been delivered
+    # Only one message should have been delivered — runtime deduplicates by message_id
     assert mailbox.qsize() == 1
 
 
 # ---------------------------------------------------------------------------
-# 6. on_feishu_event skips own messages (_recent_sent)
+# 6. on_feishu_event — echo prevention is now handler-level (FeishuInboundHandler)
 # ---------------------------------------------------------------------------
 
 def test_on_feishu_event_skip_own_messages():
+    """Echo prevention is now checked in FeishuInboundHandler via actor.metadata["sent_msg_ids"].
+    The adapter delivers the message; the handler drops it if it's in sent_msg_ids.
+    This test verifies the adapter itself no longer holds _recent_sent state.
+    """
     adapter, rt = make_adapter()
-    # Pre-populate _recent_sent with the message_id
-    adapter._recent_sent.add("msg_self")
+    assert not hasattr(adapter, "_recent_sent"), "adapter should not have _recent_sent"
+    # Adapter always delivers — handler does the echo check
     evt = feishu_event(message_id="msg_self")
     adapter.on_feishu_event(evt)
 
     addr = "feishu:oc_abc123"
-    # Actor may or may not be spawned, but no message should be delivered
+    # Message IS delivered to the mailbox; handler will drop it if msg_id is in sent_msg_ids
     mailbox = rt.mailboxes.get(addr)
-    if mailbox is not None:
-        assert mailbox.empty()
+    assert mailbox is not None
+    assert not mailbox.empty()
 
 
 # ---------------------------------------------------------------------------
@@ -210,17 +216,17 @@ def test_on_feishu_event_includes_file_path():
 
 
 # ---------------------------------------------------------------------------
-# 9. dedup set is bounded (max 10K entries)
+# 9. dedup set is bounded (max 10K entries) — now in runtime._dedup
 # ---------------------------------------------------------------------------
 
 def test_dedup_set_bounded():
-    adapter, _ = make_adapter()
-    # Push 10001 events with unique message_ids
+    adapter, rt = make_adapter()
+    # Push 10001 events with unique message_ids — dedup now lives in runtime
     for i in range(10_001):
         evt = feishu_event(message_id=f"msg_{i}")
         adapter.on_feishu_event(evt)
 
-    assert len(adapter._seen) <= 10_000
+    assert len(rt._dedup) <= 10_000
 
 
 # ---------------------------------------------------------------------------

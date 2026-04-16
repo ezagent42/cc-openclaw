@@ -34,12 +34,6 @@ log = logging.getLogger(__name__)
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent.parent
 
-# Max size for dedup set before clearing old entries
-_SEEN_MAX = 10_000
-
-# Path for persisting open_id -> chat_id mapping
-_CHAT_ID_MAP_PATH = PROJECT_ROOT / ".openclaw" / "chat_id_map.json"
-
 
 class FeishuAdapter:
     """Bridge between Feishu events/API and the actor runtime.
@@ -51,10 +45,6 @@ class FeishuAdapter:
     def __init__(self, runtime: ActorRuntime, feishu_client) -> None:
         self.runtime = runtime
         self.feishu_client = feishu_client
-        self._recent_sent: set[str] = set()  # echo prevention — message_ids we sent
-        self._seen: set[str] = set()          # dedup — message_ids already processed
-        self._chat_id_map: dict[str, str] = self._load_chat_id_map()
-
         self._user_names: dict[str, str] = self._load_user_names()
 
         # Register transport handlers
@@ -128,10 +118,6 @@ class FeishuAdapter:
                 # Skip bot's own messages
                 if sender_type == "app":
                     log.info("Feishu WS skip: bot's own message %s", msg_id[:20])
-                    return
-
-                if msg_id in self._recent_sent:
-                    log.info("Feishu WS skip: echo prevention %s", msg_id[:20])
                     return
 
                 # Parse content via parsers registry
@@ -259,13 +245,8 @@ class FeishuAdapter:
     def on_feishu_event(self, event: dict) -> None:
         """Route a parsed Feishu message event to the appropriate actor.
 
-        - Dedup by message_id
-        - Skip own messages (_recent_sent)
-        - ACK reaction
-        - Record chat_id mapping
-        - Auto-spawn feishu actor if not exists
-        - Build Message with full metadata
-        - runtime.send() to the feishu actor
+        Pure routing function — dedup and echo prevention are handled downstream
+        (runtime.send dedup, FeishuInboundHandler echo prevention).
         """
         message_id = event.get("message_id", "")
         chat_id = event.get("chat_id", "")
@@ -273,35 +254,9 @@ class FeishuAdapter:
         log.info("on_feishu_event: msg_id=%s chat_id=%s text=%s",
                  message_id[:20], chat_id[:20], event.get("text", "")[:40])
 
-        # Skip own messages
-        if message_id and message_id in self._recent_sent:
-            log.info("on_feishu_event skip: echo prevention %s", message_id[:20])
-            return
-
-        # Dedup
-        if message_id:
-            if message_id in self._seen:
-                log.info("on_feishu_event skip: dedup %s", message_id[:20])
-                return
-            self._seen.add(message_id)
-            if len(self._seen) > _SEEN_MAX:
-                # Remove oldest half
-                to_remove = list(self._seen)[:5000]
-                self._seen -= set(to_remove)
-
-        # Record chat_id mapping for DMs
-        open_id = event.get("user_id", "")
-        chat_type = event.get("chat_type", "")
-        if open_id and chat_id and chat_type == "p2p":
-            self._record_chat_id(open_id, chat_id)
-
+        # Thread routing
         root_id = event.get("root_id") or None
-
-        # Route to thread actor ONLY if one was explicitly spawned (by /spawn)
-        # and its downstream CC actor is active with transport.
-        # Thread actors are NEVER auto-created here — only by _handle_spawn.
-        # Feishu sets root_id on quote-replies too, not just thread replies.
-        address = self.resolve_actor_address(chat_id, None)  # default: main chat
+        address = self.resolve_actor_address(chat_id, None)
         if root_id:
             thread_addr = self.resolve_actor_address(chat_id, root_id)
             thread_actor = self.runtime.lookup(thread_addr)
@@ -312,44 +267,35 @@ class FeishuAdapter:
                         address = thread_addr
                         break
 
-        # Auto-spawn main chat actor if not present (never auto-spawn thread actors)
+        # Auto-spawn main chat actor if needed
         actor = self.runtime.lookup(address)
         if actor is None or actor.state == "ended":
             self.runtime.spawn(
-                address,
-                "feishu_inbound",
-                tag=chat_id,
+                address, "feishu_inbound", tag=chat_id,
                 transport=Transport(type="feishu_chat", config={"chat_id": chat_id}),
             )
 
-        # Build and deliver message
-        msg_type = event.get("msg_type", "text")
-        text = event.get("text", "")
-        user = event.get("user", "")
-        user_id = event.get("user_id", "")
-
+        # Build and deliver — dedup by runtime
         msg = Message(
-            sender=f"feishu_user:{user_id}" if user_id else "feishu_user:unknown",
+            sender=f"feishu_user:{event.get('user_id', '') or 'unknown'}",
             payload={
-                # --- content (message body) ---
-                "text": text,
+                "text": event.get("text", ""),
                 "file_path": event.get("file_path", ""),
-                # --- addressing (routing metadata) ---
                 "chat_id": chat_id,
                 "message_id": message_id,
-                # --- discriminator (content format) ---
-                "msg_type": msg_type,
+                "msg_type": event.get("msg_type", "text"),
             },
             metadata={
-                "user": user,
-                "user_id": user_id,
+                "user": event.get("user", ""),
+                "user_id": event.get("user_id", ""),
                 "message_id": message_id,
                 "chat_id": chat_id,
                 "root_id": root_id or "",
-                "msg_type": msg_type,
+                "msg_type": event.get("msg_type", "text"),
+                "chat_type": event.get("chat_type", ""),
             },
         )
-        self.runtime.send(address, msg)
+        self.runtime.send(address, msg, message_id=message_id)
 
     def on_feishu_reaction(self, event: dict) -> None:
         """Route a reaction event to the appropriate actor.
@@ -488,7 +434,6 @@ class FeishuAdapter:
                 resp = await self.feishu_client.im.v1.message.acreate(req)
 
             if resp.success() and resp.data and resp.data.message_id:
-                self._recent_sent.add(resp.data.message_id)
                 return resp.data.message_id
             elif not resp.success():
                 log.warning("_send_message failed: code=%s msg=%s", resp.code, resp.msg)
@@ -538,7 +483,6 @@ class FeishuAdapter:
             send_resp = await self.feishu_client.im.v1.message.acreate(send_req)
 
             if send_resp.success() and send_resp.data and send_resp.data.message_id:
-                self._recent_sent.add(send_resp.data.message_id)
                 log.info("_send_file: sent %s to %s", file_name, chat_id)
             else:
                 log.warning("_send_file send failed: code=%s msg=%s", send_resp.code, send_resp.msg)
@@ -656,7 +600,6 @@ class FeishuAdapter:
                 return None
 
             anchor_msg_id = resp.data.message_id
-            self._recent_sent.add(anchor_msg_id)
 
             # Reply in thread to auto-create the topic
             reply_body = (
@@ -669,7 +612,6 @@ class FeishuAdapter:
             reply_req = ReplyMessageRequest.builder().message_id(anchor_msg_id).request_body(reply_body).build()
             reply_resp = await self.feishu_client.im.v1.message.areply(reply_req)
             if reply_resp.success() and reply_resp.data and reply_resp.data.message_id:
-                self._recent_sent.add(reply_resp.data.message_id)
                 log.info("Auto-created thread for anchor %s", anchor_msg_id)
             else:
                 log.warning("Failed to auto-create thread: %s", reply_resp.msg if reply_resp else "no response")
@@ -697,7 +639,6 @@ class FeishuAdapter:
             resp = await self.feishu_client.im.v1.message.acreate(req)
             if resp.success() and resp.data and resp.data.message_id:
                 msg_id = resp.data.message_id
-                self._recent_sent.add(msg_id)
                 log.info("Created tool card for chat %s: %s", chat_id, msg_id)
                 return msg_id
             log.warning("Failed to create tool card: %s", resp.msg if resp else "no response")
@@ -828,35 +769,6 @@ class FeishuAdapter:
             return ""
 
     # ------------------------------------------------------------------
-    # Chat ID map — maps open_id to DM chat_id for user routing
-    # ------------------------------------------------------------------
-
-    @staticmethod
-    def _load_chat_id_map() -> dict[str, str]:
-        """Read chat_id map from disk. Returns {} if file doesn't exist."""
-        try:
-            if _CHAT_ID_MAP_PATH.exists():
-                return json.loads(_CHAT_ID_MAP_PATH.read_text())
-        except Exception as e:
-            log.warning("Failed to load chat_id map: %s", e)
-        return {}
-
-    def _save_chat_id_map(self) -> None:
-        """Write chat_id map to disk."""
-        try:
-            _CHAT_ID_MAP_PATH.parent.mkdir(parents=True, exist_ok=True)
-            _CHAT_ID_MAP_PATH.write_text(json.dumps(self._chat_id_map, indent=2, ensure_ascii=False))
-        except Exception as e:
-            log.warning("Failed to save chat_id map: %s", e)
-
-    def _record_chat_id(self, open_id: str, chat_id: str) -> None:
-        """Record a user's DM chat_id if not already known."""
-        if open_id not in self._chat_id_map:
-            self._chat_id_map[open_id] = chat_id
-            self._save_chat_id_map()
-            log.info("Recorded chat_id mapping: %s -> %s", open_id[:16], chat_id)
-
-    # ------------------------------------------------------------------
     # Startup notification
     # ------------------------------------------------------------------
 
@@ -875,7 +787,6 @@ class FeishuAdapter:
             req = CreateMessageRequest.builder().receive_id_type("chat_id").request_body(body).build()
             resp = await self.feishu_client.im.v1.message.acreate(req)
             if resp.success() and resp.data and resp.data.message_id:
-                self._recent_sent.add(resp.data.message_id)
                 log.info("Sent startup notification to %s", admin_chat_id)
             else:
                 log.warning("Startup notification failed: %s", resp.msg if resp else "no response")

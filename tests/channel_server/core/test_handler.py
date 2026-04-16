@@ -1,6 +1,8 @@
 """Tests for Handler protocol and built-in handlers."""
 from __future__ import annotations
 
+from unittest.mock import MagicMock
+
 import pytest
 
 from channel_server.core.actor import Actor, Message, Send, TransportSend, UpdateActor
@@ -143,25 +145,61 @@ def test_cc_session_forward():
 
 
 # ---------------------------------------------------------------------------
-# 6. CCSessionHandler — send_summary → Send to parent_feishu
+# 6. CCSessionHandler — send_summary → Send to parent_feishu via runtime lookup
 # ---------------------------------------------------------------------------
 
 def test_cc_session_send_summary():
+    # Build a mock runtime with parent actor that has a feishu downstream
+    parent_actor = make_actor(
+        address="actor://cc-parent",
+        downstream=["feishu:oc_parent_chat", "other://something"],
+    )
+    runtime = MagicMock()
+    runtime.lookup.return_value = parent_actor
+
     actor = make_actor(address="actor://cc", tag="session-1")
+    actor.parent = "actor://cc-parent"
+
     msg = make_msg(
         sender="actor://cc",
         payload={
             "action": "send_summary",
-            "parent_feishu": "actor://parent-feishu",
             "text": "Summary text",
         },
     )
-    actions = CCSessionHandler().handle(actor, msg)
+    handler = CCSessionHandler(runtime=runtime)
+    actions = handler.handle(actor, msg)
     assert len(actions) == 1
     action = actions[0]
     assert isinstance(action, Send)
-    assert action.to == "actor://parent-feishu"
+    assert action.to == "feishu:oc_parent_chat"
     assert action.message is msg
+
+
+def test_cc_session_send_summary_no_parent():
+    """send_summary with no parent actor returns empty (no-op)."""
+    actor = make_actor(address="actor://cc", tag="session-1")
+    # actor.parent is None by default
+
+    msg = make_msg(
+        sender="actor://cc",
+        payload={"action": "send_summary", "text": "Summary text"},
+    )
+    actions = CCSessionHandler().handle(actor, msg)
+    assert actions == []
+
+
+def test_cc_session_send_summary_no_runtime():
+    """send_summary with parent set but no runtime returns empty (no-op)."""
+    actor = make_actor(address="actor://cc", tag="session-1")
+    actor.parent = "actor://cc-parent"
+
+    msg = make_msg(
+        sender="actor://cc",
+        payload={"action": "send_summary", "text": "Summary text"},
+    )
+    actions = CCSessionHandler().handle(actor, msg)
+    assert actions == []
 
 
 # ---------------------------------------------------------------------------

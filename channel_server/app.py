@@ -34,6 +34,10 @@ class ChannelServerApp:
         self.actors_file = PROJECT_ROOT / ".workspace" / "actors.json"
         self.feishu_adapter = None
         self.cc_adapter = CCAdapter(self.runtime, port=port)
+
+        # Inject runtime into CCSessionHandler so send_summary can resolve parent_feishu
+        from channel_server.core.handler import HANDLER_REGISTRY
+        HANDLER_REGISTRY["cc_session"].set_runtime(self.runtime)
         self.pidfile = PROJECT_ROOT / ".channel-server.pid"
         self._persist_task: asyncio.Task | None = None
         self._stopped = False

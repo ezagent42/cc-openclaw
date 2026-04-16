@@ -180,19 +180,13 @@ class CCAdapter:
         chat_ids = msg.get("chat_ids", [])
         session = instance_id.split(".")[-1] if "." in instance_id else ""
         if session == "root" and chat_ids:
-            cc_actor = self.runtime.lookup(address)
             chat_id = next((c for c in chat_ids if c != "*"), None)
-            if cc_actor and chat_id:
+            if chat_id:
                 feishu_addr = f"feishu:{chat_id}"
-                # Wire CC → feishu (reply path)
-                if feishu_addr not in cc_actor.downstream:
-                    cc_actor.downstream.append(feishu_addr)
-                    log.info("Wired %s → %s", address, feishu_addr)
-                # Wire admin → CC (inbound path)
-                admin = self.runtime.lookup("system:admin")
-                if admin and address not in admin.downstream:
-                    admin.downstream.append(address)
-                    log.info("Wired system:admin → %s", address)
+                self.runtime.wire(address, feishu_addr)
+                log.info("Wired %s → %s", address, feishu_addr)
+                self.runtime.wire("system:admin", address)
+                log.info("Wired system:admin → %s", address)
 
         await ws.send(json.dumps({"action": "registered", "address": address}))
 
@@ -243,19 +237,6 @@ class CCAdapter:
 
         action = msg.get("action", "")
         log.info("CC message from %s: action=%s text=%s", address, action or "(reply)", str(msg.get("text", ""))[:60])
-
-        # --- addressing (routing metadata) ---
-        # send_summary needs parent_feishu injected for handler routing
-        if action == "send_summary":
-            actor = self.runtime.lookup(address)
-            if actor and actor.parent:
-                parent = self.runtime.lookup(actor.parent)
-                if parent:
-                    parent_feishu = next(
-                        (d for d in parent.downstream if d.startswith("feishu:")), ""
-                    )
-                    if parent_feishu:
-                        msg["parent_feishu"] = parent_feishu
 
         actor_msg = Message(sender=address, payload=msg)
         self.runtime.send(address, actor_msg)

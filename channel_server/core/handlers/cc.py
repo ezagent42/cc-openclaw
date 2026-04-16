@@ -11,6 +11,13 @@ class CCSessionHandler:
     - CC-originated (sender == actor.address): dispatch by payload action.
     """
 
+    def __init__(self, runtime=None):
+        self._runtime = runtime
+
+    def set_runtime(self, runtime) -> None:
+        """Inject the actor runtime after construction."""
+        self._runtime = runtime
+
     def handle(self, actor: Actor, msg: Message) -> list[Action]:
         if msg.sender != actor.address:
             # External message — forward to the CC session over its transport.
@@ -37,8 +44,16 @@ class CCSessionHandler:
             return [Send(to=target, message=msg)]
 
         if action == "send_summary":
-            parent_feishu = msg.payload.get("parent_feishu", "")
-            return [Send(to=parent_feishu, message=msg)]
+            parent_feishu = ""
+            if actor.parent and self._runtime:
+                parent = self._runtime.lookup(actor.parent)
+                if parent:
+                    parent_feishu = next(
+                        (d for d in parent.downstream if d.startswith("feishu:")), ""
+                    )
+            if parent_feishu:
+                return [Send(to=parent_feishu, message=msg)]
+            return []
 
         if action == "tool_notify":
             # Route to the tool_card actor for this user session.

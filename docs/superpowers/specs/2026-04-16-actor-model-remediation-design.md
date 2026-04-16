@@ -22,9 +22,27 @@ multiple threads).
 
 ## Non-Goals
 
-- Changing the actor/runtime/mailbox architecture itself
 - Changing the WS protocol between channel.py and adapter
 - Adding new features (reaction forwarding, thread management, etc.)
+
+## Scope Clarifications
+
+- **Runtime changes are in scope**: `_execute` becomes async, TransportSend gains
+  return values, `wire()` method added, dedup in `send()`. These are necessary to
+  support the handler migration but do not change the actor/mailbox model itself.
+- **Feishu WS listener thread stays**: `lark_oapi.ws.Client.start()` is a blocking
+  call that runs its own event loop. This structural thread is not a workaround —
+  it is excluded from the "remove all threading.Thread" scope.
+- **Adapter "stateless" exemptions**: Transport-level connection state
+  (`CCAdapter._ws_to_address`, `_address_to_ws`) and static config lookups
+  (`FeishuAdapter._user_names` from roles.yaml) remain on adapters. These are
+  connection/config plumbing, not business state.
+- **File downloads**: `download_file`/`download_image_by_key` are called from
+  parsers.py in the Feishu WS thread (before actor pipeline). These become async
+  and are called via `asyncio.run_coroutine_threadsafe()` from the WS callback,
+  or deferred to the handler by passing file_key in the payload and downloading
+  in the transport handler. Deferred approach preferred — adapter just passes
+  metadata, actor decides if/when to download.
 
 ---
 
@@ -67,7 +85,7 @@ channel_server/
 │ - handle(actor, msg) → list[Action]                     │
 │ - on_stop(actor) → list[Action]                         │
 │ - All state in actor.metadata                           │
-│ - Pure functions, no I/O, no side effects               │
+│ - Deterministic given (actor, msg), no I/O               │
 ├─────────────────────────────────────────────────────────┤
 │ Runtime (orchestration layer)                           │
 │ - Actor lifecycle, mailbox, loop                        │
@@ -94,7 +112,7 @@ actor.metadata = {
 ```
 
 FeishuInboundHandler manages these in its serial loop:
-- Inbound message → `UpdateActor(metadata={"ack_msg_id": msg_id})` + `TransportSend(action="ack_react")`
+- Inbound message → `UpdateActor(changes={"metadata": {"ack_msg_id": msg_id}})` + `TransportSend(action="ack_react")`
 - Outbound reply → `TransportSend(action="remove_ack")` reading from actor.metadata
 - No concurrent access — actor loop is serial
 
@@ -103,12 +121,17 @@ FeishuInboundHandler manages these in its serial loop:
 **Current**: `FeishuAdapter._recent_sent: set[str]` written from daemon threads,
 read from WS callback.
 
-**After**: When the feishu actor sends a message (outbound), the transport handler
-returns the sent message_id. The runtime stores it in actor.metadata
-(`sent_msg_ids: list[str]`, bounded ring buffer). FeishuInboundHandler checks
-this on inbound and skips if matched.
+**After**: When the feishu actor sends a message (outbound), the async transport
+handler returns `{"_sent_msg_id": "om_xxx"}`. The runtime merges this into
+actor.metadata. FeishuInboundHandler manages the echo set:
+- On outbound TransportSend result, handler receives the sent_msg_id via metadata
+- Handler maintains `actor.metadata["sent_msg_ids"]` as a bounded list (max 100)
+  via `UpdateActor(changes={"metadata": {"sent_msg_ids": updated_list}})`
+- On inbound, handler checks if message_id is in `actor.metadata["sent_msg_ids"]`
+  and skips if matched
 
-All access is within the actor's serial loop — no concurrent reads/writes.
+The handler manages the list directly — no ring buffer in runtime, no custom
+merge logic. All access is within the actor's serial loop.
 
 ### _seen (dedup) → runtime.send()
 
@@ -128,13 +151,19 @@ def send(self, to: str, message: Message, *, message_id: str = "") -> None:
     ...
 ```
 
-### _chat_id_map → FeishuInboundHandler + persistent actor metadata
+### _chat_id_map → FeishuInboundHandler + actor.metadata + file persistence
 
-**Current**: `FeishuAdapter._chat_id_map: dict[str, str]` with sync disk I/O.
+**Current**: `FeishuAdapter._chat_id_map: dict[str, str]` with sync disk I/O
+in hot path.
 
 **After**: FeishuInboundHandler detects DM messages (`chat_type == "p2p"`) and
-emits `UpdateActor(metadata={"chat_id_map": {open_id: chat_id}})`. The persistence
-layer (already exists) saves actor state periodically — no hot-path disk I/O.
+emits `UpdateActor(changes={"metadata": {"chat_id_map": {open_id: chat_id}}})`.
+
+For persistence: the existing `persistence.py` saves/loads actors to
+`.workspace/actors.json`. Actor metadata (including chat_id_map) is already
+persisted via `Actor.to_dict()`. The save happens on shutdown and can be
+extended to save periodically (e.g., every 60s). No new persistence layer
+needed — just ensure the existing one is called on a timer, not in hot path.
 
 ---
 
@@ -152,7 +181,7 @@ _handle_chat_transport() → _last_msg_id.pop() → threading.Thread(_remove_rea
 ```
 FeishuInboundHandler.handle():
   inbound msg from feishu_user:
-    → UpdateActor(metadata={"ack_msg_id": msg_id})
+    → UpdateActor(changes={"metadata": {"ack_msg_id": msg_id}})
     → TransportSend(action="ack_react", message_id=msg_id)
     → Send(to=downstream)  # forward to CC
 
@@ -178,10 +207,32 @@ transport-layer routing ("which API endpoint to call"). It stays, but:
 ### Topology Wiring — from CCAdapter to runtime
 
 **Current**: `CCAdapter._handle_register()` directly mutates `actor.downstream`.
+`CCAdapter._route_to_actor()` walks the actor graph to inject `parent_feishu`
+into `send_summary` payloads.
 
-**After**: Runtime gets a `wire(from_addr, to_addr)` method. CCAdapter calls
-`self.runtime.wire("system:admin", address)` instead of directly appending
-to downstream lists.
+**After**: Runtime gets a `wire(from_addr, to_addr)` method:
+```python
+def wire(self, from_addr: str, to_addr: str) -> None:
+    """Append to_addr to from_addr's downstream if not already present.
+    No-op if from_addr doesn't exist. Does not create actors."""
+    actor = self.actors.get(from_addr)
+    if actor and to_addr not in actor.downstream:
+        actor.downstream.append(to_addr)
+```
+
+CCAdapter calls `self.runtime.wire("system:admin", address)`.
+
+The `send_summary` parent_feishu injection moves from `_route_to_actor()` to
+`CCSessionHandler.handle()` — the handler walks `actor.parent` and its
+downstream to find the feishu address, which is actor-level business logic.
+
+### Reaction Events — from adapter to handler
+
+**Current**: `on_feishu_reaction()` broadcasts to all feishu actors from
+the adapter.
+
+**After**: `on_feishu_reaction()` in the adapter just does
+`runtime.send(main_chat_addr, msg)` — the handler decides what to do with it.
 
 ---
 
@@ -210,18 +261,32 @@ from sync to async:
 All `threading.Thread(target=..., daemon=True).start()` calls are removed.
 Transport handlers become `async def`.
 
-### Runtime TransportSend — handle async + return values
+### Runtime TransportSend — async execution + return values
 
-`_execute_transport_send` already handles awaitables via `asyncio.ensure_future`.
-Extend to capture return values and merge into actor.metadata:
+This is a significant runtime change: `_execute` and `_execute_transport_send`
+become async. This is necessary because transport handlers are now async
+(calling async Feishu SDK). The change propagates through the action execution
+chain:
 
 ```python
+# _actor_loop (already async) calls:
+async def _execute(self, actor, action):
+    if isinstance(action, TransportSend):
+        await self._execute_transport_send(actor, action)
+    elif isinstance(action, StopActor):
+        self.stop(action.address)  # stop stays sync (no I/O)
+    # ... other actions stay sync
+
 async def _execute_transport_send(self, actor, action):
     callback = self._transport_handlers.get(actor.transport.type)
     result = await callback(actor, action.payload)  # always async now
     if isinstance(result, dict):
         actor.metadata.update(result)  # e.g., ack_reaction_id
 ```
+
+The `on_stop` lifecycle also needs to await async actions — `_execute` calls
+in the `stop()` method become async too, requiring `stop()` to be async or
+to use `asyncio.ensure_future` for transport sends during cleanup.
 
 ### Blocking calls in _handle_spawn
 
@@ -323,14 +388,16 @@ def test_transport_handlers_are_async():
 
 ## Migration Order
 
-1. **Create handlers/ directory** — extract existing handlers from handler.py into separate files
-2. **Migrate FeishuInboundHandler** — add ACK logic, echo prevention, dedup (biggest change)
-3. **Migrate shared state** — remove _last_msg_id, _ack_reactions from adapter; add dedup to runtime
-4. **Async migration** — convert all feishu API methods to async, remove threading.Thread
-5. **Simplify transport handlers** — remove side effects, make async
-6. **Runtime changes** — TransportSend return values, wire() method, dedup in send()
-7. **Simplify CCAdapter** — remove topology wiring from _handle_register
-8. **Tests** — all 4 categories
-9. **Cleanup** — remove dead code, unused imports
+Steps ordered to resolve dependencies (runtime support before handler migration):
 
-Each step should be independently testable and committable.
+1. **Create handlers/ directory** — extract existing handlers from handler.py into separate files. No logic changes, pure move. All existing tests must still pass.
+2. **Runtime changes** — `_execute` becomes async, TransportSend captures return values and merges into actor.metadata, add `wire()` method, add dedup in `send()`. This provides the infrastructure that handler migration depends on.
+3. **Async migration** — convert all feishu API methods to async SDK, transport handlers become `async def`, remove all `threading.Thread`. Transport handlers return metadata dicts.
+4. **Migrate FeishuInboundHandler** — add ACK logic (emit TransportSend for ack_react/remove_ack), echo prevention (check actor.metadata.sent_msg_ids), reaction event handling. Remove corresponding code from adapter.
+5. **Migrate shared state** — remove `_last_msg_id`, `_ack_reactions`, `_seen`, `_recent_sent`, `_chat_id_map` from adapter. Adapter becomes stateless transport pipe.
+6. **Simplify CCAdapter** — topology wiring via `runtime.wire()`, `send_summary` routing moves to CCSessionHandler, simplify `_handle_register`.
+7. **File download refactor** — adapter passes file_key in payload, transport handler does async download on demand.
+8. **Tests** — all 4 categories (statelessness, pure handler, serial correctness, compliance)
+9. **Cleanup** — remove dead code, unused imports, verify 0 threading.Thread in adapters
+
+Each step is independently testable and committable.

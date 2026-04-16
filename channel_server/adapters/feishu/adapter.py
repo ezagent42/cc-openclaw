@@ -404,6 +404,23 @@ class FeishuAdapter:
         root_id = config.get("root_id", "")
         action = payload.get("action")
 
+        if action == "create_thread_anchor":
+            tag = payload.get("tag", "")
+            anchor_msg_id = await self.create_thread_anchor(chat_id, tag)
+            if anchor_msg_id:
+                await self.pin_message(anchor_msg_id)
+                actor.transport.config["root_id"] = anchor_msg_id
+                return {"anchor_msg_id": anchor_msg_id}
+            return None
+
+        if action == "create_tool_card":
+            tag = payload.get("tag", "")
+            anchor = actor.metadata.get("anchor_msg_id", "")
+            card_msg_id = await self.create_tool_card(chat_id, f"\U0001f7e2 [{tag}]", root_id=anchor or None)
+            if card_msg_id:
+                return {"card_msg_id": card_msg_id}
+            return None
+
         if action is None:
             text = payload.get("text", "")
             sent_id = await self._send_message(chat_id, text, root_id)
@@ -652,21 +669,37 @@ class FeishuAdapter:
             log.warning("Error creating thread anchor: %s", e)
             return None
 
-    async def create_tool_card(self, chat_id: str, text: str) -> str | None:
-        """Create an interactive card for tool notifications. Returns msg_id or None."""
+    async def create_tool_card(self, chat_id: str, text: str, root_id: str | None = None) -> str | None:
+        """Create an interactive card for tool notifications. Returns msg_id or None.
+
+        When root_id is provided, the card is created inside the thread via
+        ReplyMessageRequest with reply_in_thread(True). Otherwise it is created
+        in the main chat via CreateMessageRequest.
+        """
         if not self.feishu_client:
             return None
         try:
             card = self._build_tool_card(text)
-            body = (
-                CreateMessageRequestBody.builder()
-                .receive_id(chat_id)
-                .msg_type("interactive")
-                .content(json.dumps(card))
-                .build()
-            )
-            req = CreateMessageRequest.builder().receive_id_type("chat_id").request_body(body).build()
-            resp = await self.feishu_client.im.v1.message.acreate(req)
+            if root_id:
+                body = (
+                    ReplyMessageRequestBody.builder()
+                    .msg_type("interactive")
+                    .content(json.dumps(card))
+                    .reply_in_thread(True)
+                    .build()
+                )
+                req = ReplyMessageRequest.builder().message_id(root_id).request_body(body).build()
+                resp = await self.feishu_client.im.v1.message.areply(req)
+            else:
+                body = (
+                    CreateMessageRequestBody.builder()
+                    .receive_id(chat_id)
+                    .msg_type("interactive")
+                    .content(json.dumps(card))
+                    .build()
+                )
+                req = CreateMessageRequest.builder().receive_id_type("chat_id").request_body(body).build()
+                resp = await self.feishu_client.im.v1.message.acreate(req)
             if resp.success() and resp.data and resp.data.message_id:
                 msg_id = resp.data.message_id
                 log.info("Created tool card for chat %s: %s", chat_id, msg_id)

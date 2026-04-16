@@ -3,13 +3,13 @@ from __future__ import annotations
 
 import asyncio
 import json
-from unittest.mock import AsyncMock, MagicMock
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
 from channel_server.core.actor import Actor, Message, Transport
 from channel_server.core.runtime import ActorRuntime
-from channel_server.adapters.cc.adapter import CCAdapter
+from channel_server.adapters.cc.adapter import CCAdapter, _read_tmux_session_name
 
 
 # ---------------------------------------------------------------------------
@@ -243,3 +243,98 @@ async def test_handle_message_ignores_pong():
     # This should not raise or send anything
     await adapter.handle_message(ws, {"method": "pong"})
     ws.send.assert_not_called()
+
+
+# ---------------------------------------------------------------------------
+# 9. _read_tmux_session_name reads from cc-openclaw.sh
+# ---------------------------------------------------------------------------
+
+def test_read_tmux_session_name():
+    name = _read_tmux_session_name()
+    assert name == "cc-openclaw"
+
+
+# ---------------------------------------------------------------------------
+# 10. spawn_cc_process returns False when tmux fails
+# ---------------------------------------------------------------------------
+
+def test_spawn_cc_process_returns_false_on_failure():
+    adapter, _ = make_adapter()
+    with patch("channel_server.adapters.cc.adapter.subprocess") as mock_sub:
+        mock_sub.run.side_effect = Exception("tmux not found")
+        result = adapter.spawn_cc_process("alice", "test-session")
+        assert result is False
+
+
+def test_spawn_cc_process_returns_true_on_success():
+    adapter, _ = make_adapter()
+    with patch("channel_server.adapters.cc.adapter.subprocess") as mock_sub:
+        mock_sub.run.return_value = MagicMock(returncode=0)
+        result = adapter.spawn_cc_process("alice", "test-session")
+        assert result is True
+
+
+# ---------------------------------------------------------------------------
+# 11. _handle_spawn rolls back actors on tmux failure
+# ---------------------------------------------------------------------------
+
+@pytest.mark.asyncio
+async def test_handle_spawn_rollback_on_failure():
+    adapter, rt = make_adapter()
+    ws = make_ws()
+
+    # Register root session
+    await adapter._handle_register(ws, {
+        "method": "register",
+        "instance_id": "alice.root",
+        "tag_name": "root",
+    })
+
+    ws.send.reset_mock()
+
+    # Mock spawn_cc_process to fail
+    with patch.object(adapter, "spawn_cc_process", return_value=False):
+        await adapter._handle_spawn(ws, {
+            "method": "spawn",
+            "session_name": "broken-child",
+        })
+
+    # spawn_result should report failure
+    ws.send.assert_called_once()
+    resp = json.loads(ws.send.call_args[0][0])
+    assert resp["method"] == "spawn_result"
+    assert resp["ok"] is False
+    assert "failed" in resp["text"].lower()
+
+    # CC actor should be cleaned up (state == ended)
+    child = rt.lookup("cc:alice.broken-child")
+    assert child is None or child.state == "ended"
+
+
+@pytest.mark.asyncio
+async def test_handle_spawn_success():
+    adapter, rt = make_adapter()
+    ws = make_ws()
+
+    await adapter._handle_register(ws, {
+        "method": "register",
+        "instance_id": "alice.root",
+        "tag_name": "root",
+    })
+
+    ws.send.reset_mock()
+
+    with patch.object(adapter, "spawn_cc_process", return_value=True):
+        await adapter._handle_spawn(ws, {
+            "method": "spawn",
+            "session_name": "good-child",
+        })
+
+    ws.send.assert_called_once()
+    resp = json.loads(ws.send.call_args[0][0])
+    assert resp["method"] == "spawn_result"
+    assert resp["ok"] is True
+
+    child = rt.lookup("cc:alice.good-child")
+    assert child is not None
+    assert child.state == "suspended"

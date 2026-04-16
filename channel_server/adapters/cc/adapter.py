@@ -209,17 +209,34 @@ class CCAdapter:
     # Outbound: push to CC
     # ------------------------------------------------------------------
 
-    async def push_to_cc(self, actor: Actor, payload: dict) -> None:
+    async def push_to_cc(self, actor: Actor, payload: dict) -> dict | None:
         """Transport callback: push message to CC session via WebSocket."""
+        action = payload.get("action")
+
+        if action == "spawn_tmux":
+            user = payload.get("user", "")
+            session_name = payload.get("session_name", "")
+            tag = payload.get("tag", "")
+            chat_id = payload.get("chat_id", "")
+            success = self.spawn_cc_process(user, session_name, tag=tag, chat_id=chat_id)
+            return {"tmux_started": success}
+
+        if action == "kill_tmux":
+            user = payload.get("user", "")
+            session_name = payload.get("session_name", "")
+            self.kill_cc_process(user, session_name)
+            return {"tmux_killed": True}
+
+        # Existing: send JSON over WebSocket
         ws = self._address_to_ws.get(actor.address)
-        if ws is None:
+        if ws:
+            try:
+                await ws.send(json.dumps(payload))
+            except Exception as e:
+                log.warning("push_to_cc error for %s: %s", actor.address, e)
+        else:
             log.warning("push_to_cc: no WebSocket for actor %s", actor.address)
-            return
-        try:
-            data = json.dumps(payload)
-            await ws.send(data)
-        except Exception as e:
-            log.warning("push_to_cc error for %s: %s", actor.address, e)
+        return None
 
     # ------------------------------------------------------------------
     # Route inbound CC commands to actor

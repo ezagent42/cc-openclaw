@@ -65,7 +65,25 @@ class CCSessionHandler:
         return [Send(to=addr, message=msg) for addr in actor.downstream]
 
     def on_spawn(self, actor: Actor) -> list[Action]:
-        return []
+        """Spawn tmux process for child sessions."""
+        parts = actor.address.replace("cc:", "").split(".")
+        if len(parts) < 2 or parts[1] == "root":
+            return []
+
+        user = parts[0]
+        session_name = parts[1]
+        tag = actor.metadata.get("tag", session_name)
+        chat_id = actor.metadata.get("chat_id", "")
+
+        return [
+            TransportSend(payload={
+                "action": "spawn_tmux",
+                "user": user,
+                "session_name": session_name,
+                "tag": tag,
+                "chat_id": chat_id,
+            }),
+        ]
 
     def on_stop(self, actor: Actor) -> list[Action]:
         """Stop child actors (feishu_thread, tool_card) when CC session ends."""

@@ -484,6 +484,39 @@ def test_get_handler_returns_admin():
 
 
 # ---------------------------------------------------------------------------
+# 21b. CCSessionHandler.on_spawn — emits spawn_tmux for child, noop for root
+# ---------------------------------------------------------------------------
+
+def test_cc_session_on_spawn_emits_tmux_spawn():
+    from channel_server.core.actor import TransportSend
+
+    actor = make_actor(
+        address="cc:testuser.dev",
+        tag="dev",
+        handler="cc_session",
+        metadata={"chat_id": "oc_test", "tag": "dev"},
+    )
+    actions = CCSessionHandler().on_spawn(actor)
+    assert len(actions) == 1
+    assert isinstance(actions[0], TransportSend)
+    assert actions[0].payload["action"] == "spawn_tmux"
+    assert actions[0].payload["user"] == "testuser"
+    assert actions[0].payload["session_name"] == "dev"
+
+
+def test_cc_session_on_spawn_root_noop():
+    """Root sessions don't spawn tmux via on_spawn (already running)."""
+    actor = make_actor(
+        address="cc:testuser.root",
+        tag="root",
+        handler="cc_session",
+        metadata={"chat_id": "oc_test"},
+    )
+    actions = CCSessionHandler().on_spawn(actor)
+    assert actions == []
+
+
+# ---------------------------------------------------------------------------
 # 22. FeishuInboundHandler.on_stop — thread actor emits unpin + update_anchor
 # ---------------------------------------------------------------------------
 

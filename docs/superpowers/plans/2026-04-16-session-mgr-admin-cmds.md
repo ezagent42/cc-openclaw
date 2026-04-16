@@ -32,6 +32,99 @@
 
 ---
 
+### Task 0: Add app_id to Feishu Actor Addresses
+
+**Goal:** Change feishu actor address format from `feishu:{chat_id}` to `feishu:{app_id}:{chat_id}` (and thread actors from `feishu:{chat_id}:{anchor}` to `feishu:{app_id}:{chat_id}:{anchor}`). This prepares for multi-app support without needing to change addresses later.
+
+**Files:**
+- Modify: `channel_server/adapters/feishu/adapter.py` (address construction in `on_feishu_event`, `start_feishu_ws`)
+- Modify: `channel_server/adapters/cc/adapter.py` (address references in `_handle_register` wiring, `_handle_spawn`)
+- Modify: `channel_server/core/handlers/cc.py` (any address pattern matching for feishu actors)
+- Modify: `channel_server/core/handlers/feishu.py` (`on_stop` address parsing)
+- Modify: `channel_server/app.py` (admin feishu actor address at startup)
+- Modify: `tests/` (update all feishu actor addresses in tests)
+
+- [ ] **Step 1: Find all feishu actor address construction points**
+
+Search for `feishu:` string literals across the codebase to find every place that constructs or matches feishu actor addresses. Key locations:
+- `feishu/adapter.py`: `on_feishu_event` constructs `feishu:{chat_id}` and `feishu:{chat_id}:{root_id}`
+- `cc/adapter.py`: `_handle_register` wires to `feishu:{chat_id}`, `_handle_spawn` creates `feishu:{chat_id}:{anchor_msg_id}`
+- `app.py`: startup spawns `feishu:{admin_chat_id}`
+- `handlers/cc.py`: `on_stop` and `send_summary` match `feishu:` prefix in downstream
+- Tests: address strings in test fixtures
+
+- [ ] **Step 2: Store app_id on FeishuAdapter**
+
+In `channel_server/adapters/feishu/adapter.py`, store app_id from `start_feishu_ws`:
+
+```python
+def start_feishu_ws(self, app_id: str, app_secret: str) -> None:
+    self.app_id = app_id  # NEW: store for address construction
+    # ... rest unchanged
+```
+
+- [ ] **Step 3: Update feishu adapter address construction**
+
+In `on_feishu_event` and everywhere a feishu actor address is built in the feishu adapter, change:
+- `f"feishu:{chat_id}"` → `f"feishu:{self.app_id}:{chat_id}"`
+- `f"feishu:{chat_id}:{root_id}"` → `f"feishu:{self.app_id}:{chat_id}:{root_id}"`
+
+- [ ] **Step 4: Update CC adapter address references**
+
+In `channel_server/adapters/cc/adapter.py`:
+- `_handle_register`: the feishu address for wiring needs the app_id. Since CC adapter has `self.feishu_adapter`, get it via `self.feishu_adapter.app_id`:
+  ```python
+  feishu_addr = f"feishu:{self.feishu_adapter.app_id}:{chat_id}"
+  ```
+- `_handle_spawn`: same pattern for feishu thread actor addresses
+
+- [ ] **Step 5: Update handlers that match feishu addresses**
+
+In `channel_server/core/handlers/cc.py`:
+- `on_stop`: iterates `actor.downstream` looking for `feishu:` prefix — this still works (prefix match unchanged)
+- `send_summary`: finds parent's downstream starting with `feishu:` — still works
+
+In `channel_server/core/handlers/feishu.py`:
+- `on_stop`: checks `actor.transport.type == "feishu_thread"` — no address parsing, still works
+
+- [ ] **Step 6: Update app.py startup**
+
+```python
+# Where admin feishu actor is spawned:
+feishu_addr = f"feishu:{self.feishu_adapter.app_id}:{self.admin_chat_id}"
+```
+
+- [ ] **Step 7: Update SessionMgrHandler address construction**
+
+In the session_mgr handler (Task 3), thread actor addresses will use:
+```python
+thread_addr = f"feishu:{app_id}:{chat_id}:thread:{session_name}"
+```
+The `app_id` needs to be in the message payload. Add it alongside `chat_id` in the feishu adapter's message injection (Task 6).
+
+- [ ] **Step 8: Update all tests**
+
+Search for `feishu:` in all test files and update addresses to include a test app_id like `feishu:test_app:oc_test`. Key files:
+- `tests/channel_server/core/test_handler.py`
+- `tests/channel_server/core/handlers/test_feishu.py`
+- `tests/channel_server/test_integration.py`
+- `tests/channel_server/adapters/test_cc_adapter.py`
+- `tests/channel_server/adapters/test_feishu_adapter.py`
+
+- [ ] **Step 9: Run full test suite**
+
+Run: `cd /Users/h2oslabs/cc-openclaw && python -m pytest tests/ -v --timeout=30`
+Expected: ALL PASS
+
+- [ ] **Step 10: Commit**
+
+```bash
+git add channel_server/ tests/
+git commit -m "refactor: add app_id to feishu actor addresses (feishu:{app_id}:{chat_id})"
+```
+
+---
+
 ### Task 1: Add `on_spawn` Lifecycle Hook to Runtime
 
 **Files:**
@@ -328,10 +421,11 @@ def make_actor(
     )
 
 
-def make_msg(text: str, user: str = "testuser", chat_id: str = "oc_test123") -> Message:
+def make_msg(text: str, user: str = "testuser", chat_id: str = "oc_test123",
+             app_id: str = "test_app") -> Message:
     return Message(
         sender="feishu_user:u1",
-        payload={"text": text, "user": user, "chat_id": chat_id},
+        payload={"text": text, "user": user, "chat_id": chat_id, "app_id": app_id},
     )
 
 
@@ -361,7 +455,7 @@ def test_spawn_new_session():
     assert cc_spawn.kwargs.get("state") == "suspended"
     assert cc_spawn.kwargs.get("parent") == "cc:testuser.root"
 
-    thread_spawn = next(a for a in spawn_actions if a.address.startswith("feishu:"))
+    thread_spawn = next(a for a in spawn_actions if "thread:" in a.address)
     assert thread_spawn.handler == "feishu_inbound"
 
 
@@ -571,10 +665,10 @@ def _parse_kill_args(text: str) -> str:
     return parts[1] if len(parts) > 1 else ""
 
 
-def _reply(chat_id: str, text: str) -> Send:
+def _reply(app_id: str, chat_id: str, text: str) -> Send:
     """Build a reply action that sends text to the feishu chat actor."""
     return Send(
-        to=f"feishu:{chat_id}",
+        to=f"feishu:{app_id}:{chat_id}",
         message=Message(sender="system:session-mgr", payload={"text": text}),
     )
 
@@ -607,22 +701,23 @@ class SessionMgrHandler:
     def _handle_spawn(self, actor: Actor, msg: Message, runtime: ActorRuntime | None) -> list[Action]:
         user = msg.payload.get("user", "")
         chat_id = msg.payload.get("chat_id", "")
+        app_id = msg.payload.get("app_id", "")
         text = msg.payload.get("text", "")
         session_name, tag = _parse_spawn_args(text)
         tag = tag or session_name
 
         if not session_name:
-            return [_reply(chat_id, "Usage: /spawn <name> [--tag <tag>]")]
+            return [_reply(app_id, chat_id, "Usage: /spawn <name> [--tag <tag>]")]
 
         if not runtime:
-            return [_reply(chat_id, "Internal error: no runtime")]
+            return [_reply(app_id, chat_id, "Internal error: no runtime")]
 
         cc_addr = f"cc:{user}.{session_name}"
         existing = runtime.lookup(cc_addr)
 
         # Already active
         if existing and existing.state == "active":
-            return [_reply(chat_id, f"Session '{session_name}' is already active")]
+            return [_reply(app_id, chat_id, f"Session '{session_name}' is already active")]
 
         # Resume suspended
         if existing and existing.state == "suspended":
@@ -634,7 +729,7 @@ class SessionMgrHandler:
                         payload={"action": "resume", "tag": tag, "chat_id": chat_id},
                     ),
                 ),
-                _reply(chat_id, f"Session '{session_name}' resumed"),
+                _reply(app_id, chat_id, f"Session '{session_name}' resumed"),
             ]
 
         # Check child limit
@@ -644,10 +739,11 @@ class SessionMgrHandler:
             if a.address.startswith(prefix) and a.state not in ("ended",)
         )
         if active >= _MAX_CHILDREN:
-            return [_reply(chat_id, f"Max sessions ({_MAX_CHILDREN}) reached")]
+            return [_reply(app_id, chat_id, f"Max sessions ({_MAX_CHILDREN}) reached")]
 
         # New session: spawn feishu thread actor + cc actor
-        thread_addr = f"feishu:{chat_id}:thread:{session_name}"
+        app_id = msg.payload.get("app_id", "")
+        thread_addr = f"feishu:{app_id}:{chat_id}:thread:{session_name}"
 
         actions: list[Action] = [
             SpawnActor(
@@ -670,7 +766,7 @@ class SessionMgrHandler:
                     "metadata": {"chat_id": chat_id, "tag": tag},
                 },
             ),
-            _reply(chat_id, f"Session '{session_name}' spawned"),
+            _reply(app_id, chat_id, f"Session '{session_name}' spawned"),
         ]
 
         # Wire thread → cc (use runtime.wire after spawn)
@@ -683,23 +779,24 @@ class SessionMgrHandler:
     def _handle_kill(self, actor: Actor, msg: Message, runtime: ActorRuntime | None) -> list[Action]:
         user = msg.payload.get("user", "")
         chat_id = msg.payload.get("chat_id", "")
+        app_id = msg.payload.get("app_id", "")
         text = msg.payload.get("text", "")
         session_name = _parse_kill_args(text)
 
         if not session_name:
-            return [_reply(chat_id, "Usage: /kill <name>")]
+            return [_reply(app_id, chat_id, "Usage: /kill <name>")]
 
         if session_name == "root":
-            return [_reply(chat_id, "Cannot kill root session")]
+            return [_reply(app_id, chat_id, "Cannot kill root session")]
 
         if not runtime:
-            return [_reply(chat_id, "Internal error: no runtime")]
+            return [_reply(app_id, chat_id, "Internal error: no runtime")]
 
         cc_addr = f"cc:{user}.{session_name}"
         existing = runtime.lookup(cc_addr)
 
         if not existing or existing.state == "ended":
-            return [_reply(chat_id, f"Session '{session_name}' not found")]
+            return [_reply(app_id, chat_id, f"Session '{session_name}' not found")]
 
         actions: list[Action] = [StopActor(address=cc_addr)]
 
@@ -708,15 +805,16 @@ class SessionMgrHandler:
             if ds_addr.startswith("feishu:") and ":thread:" in ds_addr:
                 actions.append(StopActor(address=ds_addr))
 
-        actions.append(_reply(chat_id, f"Session '{session_name}' killed"))
+        actions.append(_reply(app_id, chat_id, f"Session '{session_name}' killed"))
         return actions
 
     def _handle_sessions(self, actor: Actor, msg: Message, runtime: ActorRuntime | None) -> list[Action]:
         user = msg.payload.get("user", "")
         chat_id = msg.payload.get("chat_id", "")
+        app_id = msg.payload.get("app_id", "")
 
         if not runtime:
-            return [_reply(chat_id, "Internal error: no runtime")]
+            return [_reply(app_id, chat_id, "Internal error: no runtime")]
 
         prefix = f"cc:{user}."
         sessions = [
@@ -725,7 +823,7 @@ class SessionMgrHandler:
         ]
 
         if not sessions:
-            return [_reply(chat_id, "No active sessions")]
+            return [_reply(app_id, chat_id, "No active sessions")]
 
         lines = []
         for s in sorted(sessions, key=lambda a: a.address):
@@ -733,7 +831,7 @@ class SessionMgrHandler:
             name = s.address.split(".")[-1] if "." in s.address else s.address
             lines.append(f"{icon} {s.tag or name} ({s.state})")
 
-        return [_reply(chat_id, "\n".join(lines))]
+        return [_reply(app_id, chat_id, "\n".join(lines))]
 
     def _handle_init(self, actor: Actor, msg: Message, runtime: ActorRuntime | None) -> list[Action]:
         """Handle init_session from _handle_register for root sessions."""
@@ -878,14 +976,14 @@ git commit -m "feat: spawn system:session-mgr actor at server startup"
 
 ---
 
-### Task 6: Inject chat_id in Feishu Adapter Messages
+### Task 6: Inject chat_id and app_id in Feishu Adapter Messages
 
 **Files:**
 - Modify: `channel_server/adapters/feishu/adapter.py`
 
-- [ ] **Step 1: Add chat_id injection in on_feishu_event**
+- [ ] **Step 1: Add chat_id and app_id injection in on_feishu_event**
 
-In `channel_server/adapters/feishu/adapter.py`, in the `on_feishu_event` method (around line 267-320), ensure the Message payload includes `chat_id`, `user_id`, and `user` fields when constructing the message delivered to the actor:
+In `channel_server/adapters/feishu/adapter.py`, in the `on_feishu_event` method (around line 267-320), ensure the Message payload includes `chat_id`, `app_id`, `user_id`, and `user` fields when constructing the message delivered to the actor:
 
 Find where the Message is constructed and add:
 
@@ -894,6 +992,7 @@ payload = {
     "text": text,
     "msg_type": msg_type,
     "chat_id": chat_id,        # NEW: inject for downstream handlers
+    "app_id": self.app_id,     # NEW: for multi-app address construction
     "user_id": sender_id,       # NEW
     "user": user_name,          # NEW: resolved display name
     # ... existing fields

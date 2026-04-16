@@ -189,7 +189,11 @@ class ActorRuntime:
                         actor.state = "ended"
                         break
         except asyncio.CancelledError:
-            pass
+            log.info("Actor %s loop cancelled", actor.address)
+        except Exception as e:
+            log.error("Actor %s loop crashed: %s", actor.address, e, exc_info=True)
+        finally:
+            log.info("Actor %s loop exited (state=%s)", actor.address, actor.state)
 
     # ------------------------------------------------------------------
     # Action execution

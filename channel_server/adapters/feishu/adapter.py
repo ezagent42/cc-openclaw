@@ -9,6 +9,23 @@ import threading
 import time
 from pathlib import Path
 
+import lark_oapi as lark
+from lark_oapi.api.im.v1 import (
+    CreateFileRequest,
+    CreateFileRequestBody,
+    CreateMessageRequest,
+    CreateMessageRequestBody,
+    CreatePinRequest,
+    CreatePinRequestBody,
+    DeletePinRequest,
+    GetMessageResourceRequest,
+    P2ImMessageReceiveV1,
+    PatchMessageRequest,
+    PatchMessageRequestBody,
+    ReplyMessageRequest,
+    ReplyMessageRequestBody,
+)
+
 from channel_server.core.actor import Actor, Message, Transport
 from channel_server.core.runtime import ActorRuntime
 
@@ -65,9 +82,8 @@ class FeishuAdapter:
         3. Start WS client in daemon thread with its own event loop
         """
         try:
-            import lark_oapi as lark
-            from lark_oapi.api.im.v1 import P2ImMessageReceiveV1
-        except ImportError:
+            lark  # noqa: F841 — verify lark_oapi is importable
+        except NameError:
             log.warning("lark_oapi not installed — Feishu WS listener disabled")
             return
 
@@ -346,7 +362,6 @@ class FeishuAdapter:
             return
         try:
             if thread_anchor:
-                from lark_oapi.api.im.v1 import ReplyMessageRequest, ReplyMessageRequestBody
                 body = (
                     ReplyMessageRequestBody.builder()
                     .msg_type("text")
@@ -357,7 +372,6 @@ class FeishuAdapter:
                 req = ReplyMessageRequest.builder().message_id(thread_anchor).request_body(body).build()
                 resp = self.feishu_client.im.v1.message.reply(req)
             else:
-                from lark_oapi.api.im.v1 import CreateMessageRequest, CreateMessageRequestBody
                 body = (
                     CreateMessageRequestBody.builder()
                     .receive_id(chat_id)
@@ -380,11 +394,6 @@ class FeishuAdapter:
         if not self.feishu_client:
             return
         try:
-            from lark_oapi.api.im.v1 import (
-                CreateFileRequest, CreateFileRequestBody,
-                CreateMessageRequest, CreateMessageRequestBody,
-            )
-
             if not os.path.isfile(file_path):
                 log.warning("_send_file: file not found: %s", file_path)
                 return
@@ -434,7 +443,6 @@ class FeishuAdapter:
         """Add emoji reaction to a Feishu message. Blocking."""
         if not self.feishu_client:
             return
-        import lark_oapi as lark
         try:
             req = (
                 lark.BaseRequest.builder()
@@ -464,7 +472,6 @@ class FeishuAdapter:
         reaction_id = self._ack_reactions.pop(message_id, "")
         if not reaction_id or not self.feishu_client:
             return
-        import lark_oapi as lark
         try:
             req = (
                 lark.BaseRequest.builder()
@@ -486,8 +493,6 @@ class FeishuAdapter:
         if not self.feishu_client:
             return False
         try:
-            from lark_oapi.api.im.v1 import PatchMessageRequest, PatchMessageRequestBody
-
             card = self._build_tool_card(text)
             body = PatchMessageRequestBody.builder().content(json.dumps(card)).build()
             req = PatchMessageRequest.builder().message_id(msg_id).request_body(body).build()
@@ -501,8 +506,6 @@ class FeishuAdapter:
         if not self.feishu_client:
             return False
         try:
-            from lark_oapi.api.im.v1 import PatchMessageRequest, PatchMessageRequestBody
-
             card = {
                 "header": {"title": {"tag": "plain_text", "content": title}, "template": template},
                 "elements": [{"tag": "div", "text": {"tag": "plain_text", "content": body_text or title}}],
@@ -528,11 +531,6 @@ class FeishuAdapter:
         if not self.feishu_client:
             return None
         try:
-            from lark_oapi.api.im.v1 import (
-                CreateMessageRequest, CreateMessageRequestBody,
-                ReplyMessageRequest, ReplyMessageRequestBody,
-            )
-
             card = {
                 "header": {"title": {"tag": "plain_text", "content": f"\U0001f7e2 [{tag}]"}, "template": "green"},
                 "elements": [{"tag": "div", "text": {"tag": "plain_text", "content": f"Session [{tag}] started \u2014 reply in this thread"}}],
@@ -580,8 +578,6 @@ class FeishuAdapter:
         if not self.feishu_client:
             return None
         try:
-            from lark_oapi.api.im.v1 import CreateMessageRequest, CreateMessageRequestBody
-
             card = self._build_tool_card(text)
             body = (
                 CreateMessageRequestBody.builder()
@@ -608,9 +604,6 @@ class FeishuAdapter:
         if not self.feishu_client:
             return False
         try:
-            import lark_oapi as lark
-            from lark_oapi.api.im.v1 import CreatePinRequest, CreatePinRequestBody
-
             body = CreatePinRequestBody.builder().message_id(message_id).build()
             req = CreatePinRequest.builder().request_body(body).build()
             resp = self.feishu_client.im.v1.pin.create(req)
@@ -629,8 +622,6 @@ class FeishuAdapter:
         if not self.feishu_client:
             return False
         try:
-            from lark_oapi.api.im.v1 import DeletePinRequest
-
             req = DeletePinRequest.builder().message_id(message_id).build()
             resp = self.feishu_client.im.v1.pin.delete(req)
             if resp.success():
@@ -697,8 +688,6 @@ class FeishuAdapter:
         Returns the local file path on success, empty string on failure.
         """
         try:
-            from lark_oapi.api.im.v1 import GetMessageResourceRequest
-
             req = (
                 GetMessageResourceRequest.builder()
                 .message_id(message_id)
@@ -769,8 +758,6 @@ class FeishuAdapter:
         if not self.feishu_client or not admin_chat_id:
             return
         try:
-            from lark_oapi.api.im.v1 import CreateMessageRequest, CreateMessageRequestBody
-
             body = (
                 CreateMessageRequestBody.builder()
                 .receive_id(admin_chat_id)

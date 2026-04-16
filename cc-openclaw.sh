@@ -227,34 +227,16 @@ if [ "$CLI_ACTION" = "stop" ]; then
     exit 0
 fi
 
-if [ "$CLI_ACTION" = "user" ]; then
-    if [ -z "$CLI_TARGET" ]; then
-        echo "❌ Usage: cc-openclaw.sh --user <username>"
-        exit 1
-    fi
-
-    ROLE_INFO=$(parse_roles_yaml "$CLI_TARGET")
-    if [ $? -ne 0 ]; then
-        echo "❌ User '$CLI_TARGET' not found in roles/roles.yaml"
-        exit 1
-    fi
-    eval "$ROLE_INFO"
-
-    WINDOW_NAME="${CLI_TARGET}.${CLI_SESSION}"
+# --- Shared session launcher ---
+launch_session() {
+    # Expects: CLI_TARGET, ROLE, CHAT_ID, DISPLAY_NAME, CLI_SESSION, CLI_TAG
+    local WINDOW_NAME="${CLI_TARGET}.${CLI_SESSION}"
 
     echo "🦞 Starting CC session: $DISPLAY_NAME ($WINDOW_NAME)"
     echo "   Role: $ROLE"
     echo "   Session: $CLI_SESSION"
-    [ -n "$CLI_TAG" ] && echo "   Tag: $CLI_TAG"
-
-    CHAT_ID=$(get_chat_id_for_user "$OPEN_ID")
-    if [ -z "$CHAT_ID" ]; then
-        echo "⚠️  No chat_id mapping found for $CLI_TARGET."
-        echo "   The user needs to DM the bot first to register their chat_id."
-        echo "   Then retry this command."
-        exit 1
-    fi
     echo "   Chat ID: $CHAT_ID"
+    [ -n "$CLI_TAG" ] && echo "   Tag: $CLI_TAG"
 
     WORKSPACE_DIR="$SCRIPT_DIR/.workspace/$CLI_TARGET/$CLI_SESSION"
     mkdir -p "$WORKSPACE_DIR"
@@ -288,7 +270,7 @@ if [ "$CLI_ACTION" = "user" ]; then
     LOCAL_SH="$SCRIPT_DIR/cc-openclaw.local.sh"
     [ -f "$LOCAL_SH" ] && source "$LOCAL_SH"
 
-    # Build claude command with env vars (source local.sh inside tmux for proxy/env)
+    # Build claude command with env vars
     SETTINGS_FILE="roles/$ROLE/settings.json"
     CLAUDE_CMD="cd $SCRIPT_DIR && [ -f cc-openclaw.local.sh ] && source cc-openclaw.local.sh;"
     CLAUDE_CMD="$CLAUDE_CMD OC_CHAT_ID=$CHAT_ID OC_USER=$CLI_TARGET OC_ROLE=$ROLE OC_SESSION=$CLI_SESSION"
@@ -300,12 +282,36 @@ if [ "$CLI_ACTION" = "user" ]; then
     [ -f "$SCRIPT_DIR/$SETTINGS_FILE" ] && CLAUDE_CMD="$CLAUDE_CMD --settings $SETTINGS_FILE"
 
     tmux new-window -t "$SESSION_NAME" -n "$WINDOW_NAME" "$CLAUDE_CMD" \; \
-        run-shell "sleep 3" \; \
+        run-shell "sleep 5" \; \
         send-keys Enter
 
     echo "✓ Session started: $WINDOW_NAME (tmux window)"
     echo "   Attach: tmux attach -t $SESSION_NAME"
     exit 0
+}
+
+if [ "$CLI_ACTION" = "user" ]; then
+    if [ -z "$CLI_TARGET" ]; then
+        echo "❌ Usage: cc-openclaw.sh --user <username>"
+        exit 1
+    fi
+
+    ROLE_INFO=$(parse_roles_yaml "$CLI_TARGET")
+    if [ $? -ne 0 ]; then
+        echo "❌ User '$CLI_TARGET' not found in roles/roles.yaml"
+        exit 1
+    fi
+    eval "$ROLE_INFO"
+
+    CHAT_ID=$(get_chat_id_for_user "$OPEN_ID")
+    if [ -z "$CHAT_ID" ]; then
+        echo "⚠️  No chat_id mapping found for $CLI_TARGET."
+        echo "   The user needs to DM the bot first to register their chat_id."
+        echo "   Then retry this command."
+        exit 1
+    fi
+
+    launch_session
 fi
 
 if [ "$CLI_ACTION" = "group" ]; then
@@ -319,54 +325,8 @@ if [ "$CLI_ACTION" = "group" ]; then
     ROLE="$GROUP_ROLE"
     CHAT_ID="$GROUP_CHAT_ID"
     DISPLAY_NAME="$GROUP_DISPLAY_NAME"
-    WINDOW_NAME="${CLI_TARGET}.${CLI_SESSION}"
 
-    echo "🦞 Starting group session: $WINDOW_NAME"
-    echo "   Role: $ROLE"
-    echo "   Session: $CLI_SESSION"
-    echo "   Group: $GROUP_DISPLAY_NAME ($CHAT_ID)"
-    [ -n "$CLI_TAG" ] && echo "   Tag: $CLI_TAG"
-
-    WORKSPACE_DIR="$SCRIPT_DIR/.workspace/$CLI_TARGET/$CLI_SESSION"
-    mkdir -p "$WORKSPACE_DIR"
-
-    ROLE_DIR="$SCRIPT_DIR/roles/$ROLE"
-    if [ -f "$ROLE_DIR/CLAUDE.md" ]; then
-        render_claude_md "$ROLE_DIR/CLAUDE.md" "$WORKSPACE_DIR/CLAUDE.md" "$CLI_TARGET" "$DISPLAY_NAME" "$ROLE" "$CLI_SESSION"
-    fi
-
-    tmux has-session -t "$SESSION_NAME" 2>/dev/null || tmux new-session -d -s "$SESSION_NAME"
-
-    if tmux list-windows -t "$SESSION_NAME" -F "#{window_name}" 2>/dev/null | grep -q "^${WINDOW_NAME}$"; then
-        echo "⚠️  Session '$WINDOW_NAME' already running."
-        exit 0
-    fi
-
-    PIDFILE="$SCRIPT_DIR/.channel-server.pid"
-    if [ ! -f "$PIDFILE" ]; then
-        echo "❌ channel-server not running!"
-        exit 1
-    fi
-
-    LOCAL_SH="$SCRIPT_DIR/cc-openclaw.local.sh"
-    [ -f "$LOCAL_SH" ] && source "$LOCAL_SH"
-
-    SETTINGS_FILE="roles/$ROLE/settings.json"
-    CLAUDE_CMD="cd $SCRIPT_DIR && [ -f cc-openclaw.local.sh ] && source cc-openclaw.local.sh;"
-    CLAUDE_CMD="$CLAUDE_CMD OC_CHAT_ID=$CHAT_ID OC_USER=$CLI_TARGET OC_ROLE=$ROLE OC_SESSION=$CLI_SESSION"
-    [ -n "$CLI_TAG" ] && CLAUDE_CMD="$CLAUDE_CMD OC_TAG=$CLI_TAG"
-    CLAUDE_CMD="$CLAUDE_CMD claude --permission-mode bypassPermissions"
-    CLAUDE_CMD="$CLAUDE_CMD --dangerously-load-development-channels server:openclaw-channel"
-    CLAUDE_CMD="$CLAUDE_CMD --mcp-config .mcp.json"
-    CLAUDE_CMD="$CLAUDE_CMD --add-dir $WORKSPACE_DIR"
-    [ -f "$SCRIPT_DIR/$SETTINGS_FILE" ] && CLAUDE_CMD="$CLAUDE_CMD --settings $SETTINGS_FILE"
-
-    tmux new-window -t "$SESSION_NAME" -n "$WINDOW_NAME" "$CLAUDE_CMD" \; \
-        run-shell "sleep 3" \; \
-        send-keys Enter
-
-    echo "✓ Group session started (tmux window: $WINDOW_NAME)"
-    exit 0
+    launch_session
 fi
 
 # --- If no CLI_ACTION, fall through to existing interactive mode ---

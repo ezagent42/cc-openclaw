@@ -63,7 +63,26 @@ class FeishuInboundHandler:
         return actions
 
     def on_spawn(self, actor: Actor) -> list[Action]:
-        return []
+        """Create thread anchor + tool card for child sessions."""
+        mode = actor.metadata.get("mode", "")
+        if mode != "child":
+            return []
+
+        chat_id = actor.metadata.get("chat_id", "")
+        tag = actor.metadata.get("tag", "")
+
+        return [
+            TransportSend(payload={
+                "action": "create_thread_anchor",
+                "chat_id": chat_id,
+                "tag": tag,
+            }),
+            TransportSend(payload={
+                "action": "create_tool_card",
+                "chat_id": chat_id,
+                "tag": tag,
+            }),
+        ]
 
     def on_stop(self, actor: Actor) -> list[Action]:
         actions: list[Action] = []

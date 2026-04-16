@@ -102,9 +102,17 @@ async def main() -> None:
     )
     runner = web.AppRunner(app)
     await runner.setup()
-    site = web.TCPSite(runner, "127.0.0.1", cfg.api_port)
+    # Port 0 = OS-assigned random port (avoids conflicts with other sidecar instances)
+    site = web.TCPSite(runner, "127.0.0.1", 0)
     await site.start()
-    log.info("sidecar ready on http://127.0.0.1:%d", cfg.api_port)
+    actual_port = site._server.sockets[0].getsockname()[1]
+
+    # Write pidfile for service discovery
+    pidfile_path = os.path.join(os.path.dirname(os.path.abspath(config_path)), ".sidecar.pid")
+    import json as _json
+    with open(pidfile_path, "w") as f:
+        f.write(_json.dumps({"pid": os.getpid(), "port": actual_port}))
+    log.info("sidecar ready on http://127.0.0.1:%d (pidfile: %s)", actual_port, pidfile_path)
 
     if feishu_enabled:
         reconciler = Reconciler(

@@ -9,8 +9,34 @@
  *    Uses before_dispatch hook for messages routed to fallback agent.
  */
 
+import { readFileSync } from "node:fs";
+import { resolve, dirname } from "node:path";
+
 const SIDECAR_DEFAULT_URL = "http://127.0.0.1:18791";
 const DEFAULT_ACCOUNT_ID = "shared";
+const PIDFILE_NAME = ".sidecar.pid";
+
+/**
+ * Resolve sidecar URL by reading pidfile (written by sidecar on startup).
+ * Falls back to config or default URL if pidfile is missing.
+ */
+function resolveSidecarUrl(configUrl) {
+  try {
+    // Look for pidfile in project root (same dir as sidecar-config.yaml)
+    const candidates = [
+      resolve(process.cwd(), PIDFILE_NAME),
+      resolve(process.cwd(), "..", PIDFILE_NAME),
+    ];
+    for (const pidfile of candidates) {
+      try {
+        const content = readFileSync(pidfile, "utf-8");
+        const { port } = JSON.parse(content);
+        if (port) return `http://127.0.0.1:${port}`;
+      } catch { /* try next */ }
+    }
+  } catch { /* fallback */ }
+  return configUrl || SIDECAR_DEFAULT_URL;
+}
 
 export default {
   id: "openclaw-sidecar",
@@ -19,8 +45,10 @@ export default {
 
   register(api) {
     const cfg = api.pluginConfig || {};
-    const sidecarUrl = cfg.sidecarUrl || SIDECAR_DEFAULT_URL;
     const accountId = cfg.accountId || DEFAULT_ACCOUNT_ID;
+
+    // Dynamic sidecar URL — reads pidfile on each call for port discovery
+    const getSidecarUrl = () => resolveSidecarUrl(cfg.sidecarUrl);
 
     // ------------------------------------------------------------------
     // Registered Commands (appear in /help, processed before LLM)
@@ -32,7 +60,7 @@ export default {
       requireAuth: true,
       handler: async (ctx) => {
         try {
-          const resp = await fetch(`${sidecarUrl}/api/v1/agents`);
+          const resp = await fetch(`${getSidecarUrl()}/api/v1/agents`);
           if (!resp.ok) return { text: "无法获取 agent 状态" };
           const { agents } = await resp.json();
           const active = agents.filter((a) => a.status === "active").length;
@@ -51,7 +79,7 @@ export default {
       requireAuth: true,
       handler: async (ctx) => {
         try {
-          const resp = await fetch(`${sidecarUrl}/api/v1/agents`);
+          const resp = await fetch(`${getSidecarUrl()}/api/v1/agents`);
           if (!resp.ok) return { text: "无法获取 agent 列表" };
           const { agents } = await resp.json();
           if (agents.length === 0) return { text: "当前没有任何 agent" };
@@ -73,7 +101,7 @@ export default {
       requireAuth: true,
       handler: async (ctx) => {
         try {
-          const resp = await fetch(`${sidecarUrl}/api/v1/audit-log?limit=10`);
+          const resp = await fetch(`${getSidecarUrl()}/api/v1/audit-log?limit=10`);
           if (!resp.ok) return { text: "无法获取操作日志" };
           const { logs } = await resp.json();
           if (logs.length === 0) return { text: "暂无操作日志" };
@@ -107,7 +135,7 @@ export default {
 
         try {
           const actor = ctx.senderId || "";
-          const resp = await fetch(`${sidecarUrl}/api/v1/admin/broadcast`, {
+          const resp = await fetch(`${getSidecarUrl()}/api/v1/admin/broadcast`, {
             method: "POST",
             headers: { "Content-Type": "application/json" },
             body: JSON.stringify({ message: message.trim(), actor }),
@@ -128,7 +156,7 @@ export default {
     });
 
     api.logger.info(
-      `Sidecar plugin registered (url=${sidecarUrl}, account=${accountId})`
+      `Sidecar plugin registered (url=${getSidecarUrl()}, account=${accountId})`
     );
 
     // ------------------------------------------------------------------
@@ -154,7 +182,7 @@ export default {
         api.logger.info(`Intercepting fallback group message in ${conversationId}`);
 
         try {
-          const resolveResp = await fetch(`${sidecarUrl}/api/v1/resolve-sender`, {
+          const resolveResp = await fetch(`${getSidecarUrl()}/api/v1/resolve-sender`, {
             method: "POST",
             headers: { "Content-Type": "application/json" },
             body: JSON.stringify({ chat_id: conversationId }),
@@ -171,7 +199,7 @@ export default {
           if (action === "active") return;
 
           if (action === "provision_group") {
-            const provResp = await fetch(`${sidecarUrl}/api/v1/provision-group`, {
+            const provResp = await fetch(`${getSidecarUrl()}/api/v1/provision-group`, {
               method: "POST",
               headers: { "Content-Type": "application/json" },
               body: JSON.stringify({ chat_id: conversationId }),
@@ -202,7 +230,7 @@ export default {
       api.logger.info(`Intercepting fallback message from ${senderId}`);
 
       try {
-        const resolveResp = await fetch(`${sidecarUrl}/api/v1/resolve-sender`, {
+        const resolveResp = await fetch(`${getSidecarUrl()}/api/v1/resolve-sender`, {
           method: "POST",
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify({ open_id: senderId }),
@@ -218,7 +246,7 @@ export default {
 
         switch (action) {
           case "provision": {
-            const provResp = await fetch(`${sidecarUrl}/api/v1/provision`, {
+            const provResp = await fetch(`${getSidecarUrl()}/api/v1/provision`, {
               method: "POST",
               headers: { "Content-Type": "application/json" },
               body: JSON.stringify({ open_id: senderId }),
@@ -232,7 +260,7 @@ export default {
           }
 
           case "restore": {
-            const restResp = await fetch(`${sidecarUrl}/api/v1/restore`, {
+            const restResp = await fetch(`${getSidecarUrl()}/api/v1/restore`, {
               method: "POST",
               headers: { "Content-Type": "application/json" },
               body: JSON.stringify({ open_id: senderId }),

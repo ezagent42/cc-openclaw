@@ -61,13 +61,19 @@ async def test_spawn_calls_on_spawn_hook():
     rt = ActorRuntime()
     HANDLER_REGISTRY["test_spawn_hook"] = SpawnHookHandler()
     transport_calls = []
-    rt.register_transport_handler("test", lambda actor, payload: transport_calls.append(payload))
+
+    async def mock_transport(actor, payload):
+        transport_calls.append(payload)
+        return None
+
+    rt.register_transport_handler("test", mock_transport)
 
     try:
+        # spawn() is sync — on_spawn hooks are scheduled as async tasks
         rt.spawn("test:actor", "test_spawn_hook", tag="mytag",
                  transport=Transport(type="test", config={}))
-        # on_spawn is async, need to run it
-        await asyncio.sleep(0.1)
+        # Give the deferred on_spawn task time to execute
+        await asyncio.sleep(0.2)
         assert len(transport_calls) == 1
         assert transport_calls[0]["action"] == "init"
         assert transport_calls[0]["tag"] == "mytag"
@@ -99,75 +105,89 @@ class Handler(Protocol):
 
 - [ ] **Step 4: Add on_spawn execution to runtime.spawn()**
 
-In `channel_server/core/runtime.py`, modify `spawn()` to be async and call on_spawn. Replace the `spawn` method (lines 40-74):
+In `channel_server/core/runtime.py`, add on_spawn hook execution to `spawn()`. **Critical: spawn() stays sync.** The on_spawn hook actions are scheduled as a deferred async task, avoiding a breaking change to 30+ call sites (including `feishu/adapter.py:295` which calls spawn via `call_soon_threadsafe` from a background thread — making spawn async would silently break this).
 
-The key change: after creating the actor and registering it, look up the handler and call `on_spawn` if it exists, then execute returned actions:
+Add this at the end of `spawn()`, before the return statement (after `_maybe_start_loop`):
 
 ```python
-async def spawn(self, address: str, handler: str, *, tag: str = "",
-                state: str = "active", parent: str | None = None,
-                downstream: list[str] | None = None,
-                transport: Transport | None = None,
-                metadata: dict | None = None) -> Actor:
-    if address in self.actors and self.actors[address].state != "ended":
-        raise ValueError(f"Actor already exists: {address}")
-
-    actor = Actor(
-        address=address,
-        tag=tag or address.split(".")[-1] if "." in address else address,
-        handler=handler,
-        state=state,
-        parent=parent,
-        downstream=downstream or [],
-        transport=transport,
-        metadata=metadata or {},
-    )
-    self.actors[address] = actor
-    if not self.mailboxes.get(address):
-        self.mailboxes[address] = asyncio.Queue()
-
-    # Execute on_spawn lifecycle hook
-    from channel_server.core.handler import get_handler
-    try:
-        h = get_handler(handler)
-        if hasattr(h, "on_spawn"):
-            actions = h.on_spawn(actor)
-            for action in actions:
-                await self._execute(actor, action)
-    except ValueError:
-        pass  # unknown handler — skip hook
+def spawn(self, address: str, handler: str, *, tag: str = "",
+          state: str = "active", parent: str | None = None,
+          downstream: list[str] | None = None,
+          transport: Transport | None = None,
+          metadata: dict | None = None) -> Actor:
+    # ... existing code unchanged ...
 
     if state == "active" and self._stop_event and not self._stop_event.is_set():
         self._maybe_start_loop(actor)
 
+    # NEW: schedule on_spawn hook as deferred async task
+    self._schedule_on_spawn(actor)
+
     return actor
 ```
 
-**Important:** Since `spawn()` is now async, all callers must be updated to `await`. Check all call sites:
-- `runtime.py:_execute()` line 234: `self.spawn(...)` → `await self.spawn(...)`
-- `app.py` startup: wrap in asyncio task or call from async context
-- `adapters/cc/adapter.py:_handle_register()`: already async, add `await`
-- `adapters/cc/adapter.py:_handle_spawn()`: already async, add `await`
+Add the new helper method:
 
-- [ ] **Step 5: Update all spawn() call sites to await**
+```python
+def _schedule_on_spawn(self, actor: Actor) -> None:
+    """Schedule on_spawn lifecycle hook as an async task."""
+    from channel_server.core.handler import get_handler
+    try:
+        h = get_handler(actor.handler)
+    except ValueError:
+        return  # unknown handler — skip
+    if not hasattr(h, "on_spawn"):
+        return
+    actions = h.on_spawn(actor)
+    if not actions:
+        return
 
-Search for `self.runtime.spawn(` and `runtime.spawn(` across the codebase and add `await` where needed. Key files:
-- `channel_server/core/runtime.py:234` — `_execute` for SpawnActor
-- `channel_server/adapters/cc/adapter.py` — `_handle_register` and `_handle_spawn`
-- `channel_server/adapters/feishu/adapter.py` — `on_feishu_event` auto-spawn
-- `channel_server/app.py` — startup actor creation
+    async def _run_on_spawn():
+        for action in actions:
+            try:
+                await self._execute(actor, action)
+            except Exception:
+                logger.exception("on_spawn action failed for %s", actor.address)
 
-For `app.py` startup where spawn is called outside an async context, wrap startup spawns in an async init method.
+    try:
+        loop = asyncio.get_running_loop()
+        loop.create_task(_run_on_spawn())
+    except RuntimeError:
+        pass  # no running loop (e.g., during tests) — skip
+```
 
-- [ ] **Step 6: Run test to verify it passes**
+**Key design choices:**
+- `spawn()` stays sync — zero call site changes needed
+- `on_spawn()` handler method is sync (returns list[Action]) — same as `on_stop()`
+- Action execution is async (TransportSend calls feishu API) — scheduled as task
+- Failure in on_spawn is logged, not fatal — actor still exists
+- No event loop = no hook execution (safe for sync tests)
+
+Also add error handling in `_execute` around SpawnActor for race conditions (spec requirement):
+
+```python
+# In _execute(), around the SpawnActor case:
+elif isinstance(action, SpawnActor):
+    try:
+        self.spawn(action.address, action.handler, **action.kwargs)
+    except ValueError as e:
+        logger.warning("SpawnActor failed (duplicate?): %s", e)
+```
+
+- [ ] **Step 5: Run test to verify it passes**
 
 Run: `cd /Users/h2oslabs/cc-openclaw && python -m pytest tests/channel_server/core/test_runtime.py -v`
-Expected: ALL PASS
+Expected: ALL PASS (existing tests unaffected — spawn is still sync)
+
+- [ ] **Step 6: Run full test suite to verify no regressions**
+
+Run: `cd /Users/h2oslabs/cc-openclaw && python -m pytest tests/ -v --timeout=30`
+Expected: ALL PASS — no call site changes needed
 
 - [ ] **Step 7: Commit**
 
 ```bash
-git add channel_server/core/handler.py channel_server/core/runtime.py channel_server/adapters/ channel_server/app.py tests/channel_server/core/test_runtime.py
+git add channel_server/core/handler.py channel_server/core/runtime.py tests/channel_server/core/test_runtime.py
 git commit -m "feat: add on_spawn lifecycle hook to runtime and handler protocol"
 ```
 
@@ -755,6 +775,8 @@ HANDLER_REGISTRY: dict[str, Handler] = {
     "session_mgr": SessionMgrHandler(),  # NEW
 }
 ```
+
+Also update `channel_server/core/handlers/__init__.py` to export `SessionMgrHandler` for consistency with existing pattern (all handlers are importable from the package).
 
 - [ ] **Step 5: Run tests**
 

@@ -113,11 +113,11 @@ class CCAdapter:
         if action == "register":
             await self._handle_register(ws, msg)
         elif action == "spawn_session":
-            await self._handle_spawn(ws, msg)
+            await self._forward_session_cmd(ws, msg)
         elif action == "kill_session":
-            await self._handle_kill(ws, msg)
+            await self._forward_session_cmd(ws, msg)
         elif action == "list_sessions":
-            await self._handle_list(ws, msg)
+            await self._forward_session_cmd(ws, msg)
         elif action == "pong":
             pass  # ignore keepalive pongs
         elif action == "tool_notify":
@@ -271,6 +271,57 @@ class CCAdapter:
     # ------------------------------------------------------------------
     # Session management — spawn / kill / list
     # ------------------------------------------------------------------
+
+    async def _forward_session_cmd(self, ws, msg: dict) -> None:
+        """Forward session command to system:session-mgr."""
+        address = self._ws_to_address.get(id(ws))
+        if not address:
+            await ws.send(json.dumps({"action": "error", "message": "Not registered"}))
+            return
+
+        parts = address.replace("cc:", "").split(".")
+        user = parts[0] if parts else "unknown"
+
+        # Find chat_id from root actor's downstream feishu actor
+        root_actor = self.runtime.lookup(address)
+        chat_id = ""
+        app_id = self.feishu_adapter.app_id if self.feishu_adapter else ""
+        if root_actor:
+            for ds_addr in root_actor.downstream:
+                ds = self.runtime.lookup(ds_addr)
+                if ds and ds.transport and ds.transport.type == "feishu_chat":
+                    chat_id = ds.transport.config.get("chat_id", "")
+                    break
+
+        action = msg.get("action", "")
+        session_name = msg.get("session_name", "")
+        tag = msg.get("tag", "")
+
+        if action == "spawn_session":
+            text = f"/spawn {session_name}"
+            if tag:
+                text += f" --tag {tag}"
+        elif action == "kill_session":
+            text = f"/kill {session_name}"
+        elif action == "list_sessions":
+            text = "/sessions"
+        else:
+            return
+
+        from channel_server.core.actor import Message
+        self.runtime.send(
+            "system:session-mgr",
+            Message(
+                sender=address,
+                payload={"text": text, "user": user, "chat_id": chat_id, "app_id": app_id},
+            ),
+        )
+
+        await ws.send(json.dumps({
+            "action": f"{action}_ack",
+            "ok": True,
+            "text": f"Command forwarded: {text}",
+        }))
 
     async def _handle_spawn(self, ws, msg: dict) -> None:
         """Spawn a child session.

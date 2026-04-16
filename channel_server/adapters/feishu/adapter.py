@@ -279,43 +279,29 @@ class FeishuAdapter:
 
         root_id = event.get("root_id") or None
 
-        # For thread messages (root_id set), check if a thread actor exists
-        # and has downstream. If not, route to the main chat actor instead —
-        # this handles feishu "reply" messages in DMs which set root_id but
-        # aren't part of a spawned thread session.
+        # Route to thread actor ONLY if one was explicitly spawned (by /spawn)
+        # and its downstream CC actor is active with transport.
+        # Thread actors are NEVER auto-created here — only by _handle_spawn.
+        # Feishu sets root_id on quote-replies too, not just thread replies.
+        address = self.resolve_actor_address(chat_id, None)  # default: main chat
         if root_id:
             thread_addr = self.resolve_actor_address(chat_id, root_id)
             thread_actor = self.runtime.lookup(thread_addr)
-            # Only route to thread if it has a downstream CC actor that is active
-            # (has transport = WS connected). Otherwise fall back to main chat.
-            has_active_downstream = False
             if thread_actor and thread_actor.state != "ended":
                 for ds_addr in thread_actor.downstream:
                     ds = self.runtime.lookup(ds_addr)
                     if ds and ds.state == "active" and ds.transport is not None:
-                        has_active_downstream = True
+                        address = thread_addr
                         break
-            if has_active_downstream:
-                address = thread_addr
-            else:
-                # No active thread session — fall back to main chat
-                address = self.resolve_actor_address(chat_id, None)
-                root_id = None
-        else:
-            address = self.resolve_actor_address(chat_id, None)
 
-        # Auto-spawn actor if not present
+        # Auto-spawn main chat actor if not present (never auto-spawn thread actors)
         actor = self.runtime.lookup(address)
         if actor is None or actor.state == "ended":
-            transport_type = "feishu_thread" if root_id else "feishu_chat"
-            config: dict = {"chat_id": chat_id}
-            if root_id:
-                config["root_id"] = root_id
             self.runtime.spawn(
                 address,
                 "feishu_inbound",
                 tag=chat_id,
-                transport=Transport(type=transport_type, config=config),
+                transport=Transport(type="feishu_chat", config={"chat_id": chat_id}),
             )
 
         # Build and deliver message

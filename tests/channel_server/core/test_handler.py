@@ -152,7 +152,7 @@ def test_cc_session_send_summary():
     # Build a mock runtime with parent actor that has a feishu downstream
     parent_actor = make_actor(
         address="actor://cc-parent",
-        downstream=["feishu:oc_parent_chat", "other://something"],
+        downstream=["feishu:test_app:oc_parent_chat", "other://something"],
     )
     runtime = MagicMock()
     runtime.lookup.return_value = parent_actor
@@ -172,7 +172,7 @@ def test_cc_session_send_summary():
     assert len(actions) == 1
     action = actions[0]
     assert isinstance(action, Send)
-    assert action.to == "feishu:oc_parent_chat"
+    assert action.to == "feishu:test_app:oc_parent_chat"
     assert action.message is msg
 
 
@@ -420,7 +420,7 @@ def test_admin_unknown_command():
 # 18. AdminHandler — session command passthrough
 # ---------------------------------------------------------------------------
 
-def test_admin_session_command_passthrough():
+def test_admin_session_command_routes_to_session_mgr():
     actor = make_actor(
         address="system:admin",
         handler="admin",
@@ -431,7 +431,7 @@ def test_admin_session_command_passthrough():
         actions = AdminHandler().handle(actor, msg)
         assert len(actions) == 1
         assert isinstance(actions[0], Send)
-        assert actions[0].to == "cc:user.root"
+        assert actions[0].to == "system:session-mgr"
         assert actions[0].message is msg
 
 
@@ -443,7 +443,7 @@ def test_admin_system_notification_forward():
     actor = make_actor(
         address="system:admin",
         handler="admin",
-        downstream=["cc:user.root", "feishu:chat1"],
+        downstream=["cc:user.root", "feishu:test_app:chat1"],
     )
     msg = make_msg(
         sender="system:runtime",
@@ -452,7 +452,7 @@ def test_admin_system_notification_forward():
     actions = AdminHandler().handle(actor, msg)
     assert len(actions) == 2
     targets = {a.to for a in actions}
-    assert targets == {"cc:user.root", "feishu:chat1"}
+    assert targets == {"cc:user.root", "feishu:test_app:chat1"}
     for action in actions:
         assert isinstance(action, Send)
         assert action.message is msg
@@ -484,6 +484,39 @@ def test_get_handler_returns_admin():
 
 
 # ---------------------------------------------------------------------------
+# 21b. CCSessionHandler.on_spawn — emits spawn_tmux for child, noop for root
+# ---------------------------------------------------------------------------
+
+def test_cc_session_on_spawn_emits_tmux_spawn():
+    from channel_server.core.actor import TransportSend
+
+    actor = make_actor(
+        address="cc:testuser.dev",
+        tag="dev",
+        handler="cc_session",
+        metadata={"chat_id": "oc_test", "tag": "dev"},
+    )
+    actions = CCSessionHandler().on_spawn(actor)
+    assert len(actions) == 1
+    assert isinstance(actions[0], TransportSend)
+    assert actions[0].payload["action"] == "spawn_tmux"
+    assert actions[0].payload["user"] == "testuser"
+    assert actions[0].payload["session_name"] == "dev"
+
+
+def test_cc_session_on_spawn_root_noop():
+    """Root sessions don't spawn tmux via on_spawn (already running)."""
+    actor = make_actor(
+        address="cc:testuser.root",
+        tag="root",
+        handler="cc_session",
+        metadata={"chat_id": "oc_test"},
+    )
+    actions = CCSessionHandler().on_spawn(actor)
+    assert actions == []
+
+
+# ---------------------------------------------------------------------------
 # 22. FeishuInboundHandler.on_stop — thread actor emits unpin + update_anchor
 # ---------------------------------------------------------------------------
 
@@ -491,7 +524,7 @@ def test_feishu_inbound_on_stop_thread_actor():
     from channel_server.core.actor import Transport
 
     actor = make_actor(
-        address="feishu:oc_test:om_anchor123",
+        address="feishu:test_app:oc_test:om_anchor123",
         tag="dev-session",
         handler="feishu_inbound",
     )
@@ -537,13 +570,13 @@ def test_cc_session_on_stop_stops_children():
         address="cc:user.dev",
         tag="dev",
         handler="cc_session",
-        downstream=["feishu:oc_test:om_anchor"],
+        downstream=["feishu:test_app:oc_test:om_anchor"],
     )
 
     actions = CCSessionHandler().on_stop(actor)
     stop_addrs = {a.address for a in actions if isinstance(a, StopActor)}
     assert "tool_card:user.dev" in stop_addrs
-    assert "feishu:oc_test:om_anchor" in stop_addrs
+    assert "feishu:test_app:oc_test:om_anchor" in stop_addrs
 
 
 # ---------------------------------------------------------------------------
@@ -570,3 +603,20 @@ def test_tool_card_on_stop_no_transport_noop():
     actor = make_actor(handler="tool_card", metadata={"card_msg_id": "om_card_999"})
     actions = ToolCardHandler().on_stop(actor)
     assert actions == []
+
+
+# ---------------------------------------------------------------------------
+# 25. All handlers accept runtime as third argument
+# ---------------------------------------------------------------------------
+
+def test_handler_receives_runtime_arg():
+    """All handlers accept runtime as third argument."""
+    runtime = MagicMock()
+    actor = make_actor(address="system:admin", handler="admin", downstream=["cc:user.root"])
+    msg = make_msg(sender="feishu_user:u1", payload={"text": "hello"})
+
+    AdminHandler().handle(actor, msg, runtime)
+    FeishuInboundHandler().handle(actor, msg, runtime)
+    CCSessionHandler().handle(actor, msg, runtime)
+    ForwardAllHandler().handle(actor, msg, runtime)
+    ToolCardHandler().handle(actor, msg, runtime)

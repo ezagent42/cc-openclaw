@@ -71,6 +71,7 @@ class ActorRuntime:
         if not self._stop_event.is_set() and state == "active":
             self._maybe_start_loop(actor)
 
+        self._schedule_on_spawn(actor)
         return actor
 
     async def stop(self, address: str) -> None:
@@ -186,7 +187,7 @@ class ActorRuntime:
                     continue
                 try:
                     log.info("Actor %s processing msg from %s action=%s", actor.address, msg.sender, msg.payload.get("action") or msg.payload.get("msg_type", "message"))
-                    actions = handler.handle(actor, msg)
+                    actions = handler.handle(actor, msg, self)
                     log.info("Actor %s produced %d actions: %s", actor.address, len(actions), [type(a).__name__ for a in actions])
                     for action in actions:
                         await self._execute(actor, action)
@@ -231,7 +232,10 @@ class ActorRuntime:
         elif isinstance(action, UpdateActor):
             self._execute_update(actor, action)
         elif isinstance(action, SpawnActor):
-            self.spawn(action.address, action.handler, **action.kwargs)
+            try:
+                self.spawn(action.address, action.handler, **action.kwargs)
+            except ValueError as e:
+                log.warning("SpawnActor failed (duplicate?): %s", e)
         elif isinstance(action, StopActor):
             await self.stop(action.address)
 
@@ -269,6 +273,32 @@ class ActorRuntime:
     # ------------------------------------------------------------------
     # Internal helpers
     # ------------------------------------------------------------------
+
+    def _schedule_on_spawn(self, actor: Actor) -> None:
+        """Schedule on_spawn lifecycle hook as an async task."""
+        from channel_server.core.handler import get_handler
+        try:
+            h = get_handler(actor.handler)
+        except ValueError:
+            return
+        if not hasattr(h, "on_spawn"):
+            return
+        actions = h.on_spawn(actor)
+        if not actions:
+            return
+
+        async def _run_on_spawn():
+            for action in actions:
+                try:
+                    await self._execute(actor, action)
+                except Exception:
+                    log.exception("on_spawn action failed for %s", actor.address)
+
+        try:
+            loop = asyncio.get_running_loop()
+            loop.create_task(_run_on_spawn())
+        except RuntimeError:
+            pass  # no running loop — skip
 
     def _maybe_start_loop(self, actor: Actor) -> None:
         """Start an actor loop task if one isn't already running."""

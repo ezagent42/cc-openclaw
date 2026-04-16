@@ -16,16 +16,16 @@ class AdminHandler:
 
     SESSION_COMMANDS = ("/spawn", "/kill", "/sessions")
 
-    def handle(self, actor: Actor, msg: Message) -> list[Action]:
+    def handle(self, actor: Actor, msg: Message, runtime=None) -> list[Action]:
         text = msg.payload.get("text", "").strip()
 
         # System notifications -> forward to downstream
         if msg.payload.get("msg_type") == "system":
             return [Send(to=addr, message=msg) for addr in actor.downstream]
 
-        # Session commands -> pass through to downstream CC actor
+        # Session commands -> route to session-mgr (bypasses LLM)
         if text.startswith(self.SESSION_COMMANDS):
-            return [Send(to=addr, message=msg) for addr in actor.downstream]
+            return [Send(to="system:session-mgr", message=msg)]
 
         # Non-slash messages -> forward to downstream
         if not text.startswith("/"):
@@ -56,6 +56,9 @@ class AdminHandler:
             )
             for addr in actor.downstream
         ]
+
+    def on_spawn(self, actor: Actor) -> list[Action]:
+        return []
 
     def on_stop(self, actor: Actor) -> list[Action]:
         return []

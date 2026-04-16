@@ -18,7 +18,7 @@ class CCSessionHandler:
         """Inject the actor runtime after construction."""
         self._runtime = runtime
 
-    def handle(self, actor: Actor, msg: Message) -> list[Action]:
+    def handle(self, actor: Actor, msg: Message, runtime=None) -> list[Action]:
         if msg.sender != actor.address:
             # External message — forward to the CC session over its transport.
             # Merge metadata (user, user_id, etc.) into payload so channel.py
@@ -63,6 +63,27 @@ class CCSessionHandler:
 
         # Catch-all (react, send_file, update_title, etc.) → send to downstream.
         return [Send(to=addr, message=msg) for addr in actor.downstream]
+
+    def on_spawn(self, actor: Actor) -> list[Action]:
+        """Spawn tmux process for child sessions."""
+        parts = actor.address.replace("cc:", "").split(".")
+        if len(parts) < 2 or parts[1] == "root":
+            return []
+
+        user = parts[0]
+        session_name = parts[1]
+        tag = actor.metadata.get("tag", session_name)
+        chat_id = actor.metadata.get("chat_id", "")
+
+        return [
+            TransportSend(payload={
+                "action": "spawn_tmux",
+                "user": user,
+                "session_name": session_name,
+                "tag": tag,
+                "chat_id": chat_id,
+            }),
+        ]
 
     def on_stop(self, actor: Actor) -> list[Action]:
         """Stop child actors (feishu_thread, tool_card) when CC session ends."""

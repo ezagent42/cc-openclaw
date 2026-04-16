@@ -9,6 +9,7 @@ from channel_server.core.handlers import (
     CCSessionHandler,
     FeishuInboundHandler,
     ForwardAllHandler,
+    SessionMgrHandler,
     ToolCardHandler,
 )
 
@@ -16,7 +17,11 @@ from channel_server.core.handlers import (
 class Handler(Protocol):
     """Protocol that all actor message handlers must satisfy."""
 
-    def handle(self, actor: Actor, msg: Message) -> list[Action]: ...
+    def handle(self, actor: Actor, msg: Message, runtime: "ActorRuntime | None" = None) -> list[Action]: ...
+
+    def on_spawn(self, actor: Actor) -> list[Action]:
+        """Lifecycle callback invoked when an actor is spawned."""
+        return []
 
     def on_stop(self, actor: Actor) -> list[Action]:
         """Lifecycle callback invoked when an actor is stopped.
@@ -37,6 +42,7 @@ HANDLER_REGISTRY: dict[str, Handler] = {
     "forward_all": ForwardAllHandler(),
     "tool_card": ToolCardHandler(),
     "admin": AdminHandler(),
+    "session_mgr": SessionMgrHandler(),
 }
 
 

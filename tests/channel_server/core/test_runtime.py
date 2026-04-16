@@ -206,7 +206,7 @@ async def test_actor_loop_handles_handler_error():
     from channel_server.core.handler import HANDLER_REGISTRY
 
     class BrokenHandler:
-        def handle(self, actor, msg):
+        def handle(self, actor, msg, runtime=None):
             raise RuntimeError("boom")
 
     received: list[dict] = []
@@ -219,7 +219,7 @@ async def test_actor_loop_handles_handler_error():
         def __init__(self, sink: list):
             self._sink = sink
 
-        def handle(self, actor, msg):
+        def handle(self, actor, msg, runtime=None):
             self._sink.append(msg)
             return []
 
@@ -251,7 +251,7 @@ async def test_actor_loop_ends_after_max_errors():
     from channel_server.core.handler import HANDLER_REGISTRY
 
     class BrokenHandler:
-        def handle(self, actor, msg):
+        def handle(self, actor, msg, runtime=None):
             raise RuntimeError("boom")
 
     HANDLER_REGISTRY["broken2"] = BrokenHandler()
@@ -348,7 +348,7 @@ async def test_handler_error_notifies_parent():
     from channel_server.core.handler import HANDLER_REGISTRY
 
     class BrokenHandler:
-        def handle(self, actor, msg):
+        def handle(self, actor, msg, runtime=None):
             raise RuntimeError("test-error")
 
     received: list = []
@@ -357,7 +357,7 @@ async def test_handler_error_notifies_parent():
         def __init__(self, sink):
             self._sink = sink
 
-        def handle(self, actor, msg):
+        def handle(self, actor, msg, runtime=None):
             self._sink.append(msg)
             return []
 
@@ -392,7 +392,7 @@ async def test_max_errors_stops_actor():
     from channel_server.core.handler import HANDLER_REGISTRY
 
     class BrokenHandler:
-        def handle(self, actor, msg):
+        def handle(self, actor, msg, runtime=None):
             raise RuntimeError("always-broken")
 
     HANDLER_REGISTRY["broken_max"] = BrokenHandler()
@@ -425,7 +425,7 @@ async def test_stop_calls_on_stop():
     on_stop_called = []
 
     class LifecycleHandler:
-        def handle(self, actor, msg):
+        def handle(self, actor, msg, runtime=None):
             return []
 
         def on_stop(self, actor):
@@ -451,14 +451,14 @@ async def test_stop_on_stop_cascades():
     from channel_server.core.handler import HANDLER_REGISTRY
 
     class ParentHandler:
-        def handle(self, actor, msg):
+        def handle(self, actor, msg, runtime=None):
             return []
 
         def on_stop(self, actor):
             return [StopActor(address="actor://child")]
 
     class ChildHandler:
-        def handle(self, actor, msg):
+        def handle(self, actor, msg, runtime=None):
             return []
 
         def on_stop(self, actor):
@@ -486,3 +486,42 @@ async def test_stop_idempotent():
     await rt.stop("actor://x")
     await rt.stop("actor://x")  # should not raise
     assert rt.lookup("actor://x").state == "ended"
+
+
+# ---------------------------------------------------------------------------
+# 16. on_spawn lifecycle hook
+# ---------------------------------------------------------------------------
+
+@pytest.mark.asyncio
+async def test_spawn_calls_on_spawn_hook():
+    """on_spawn hook actions are executed when actor is spawned."""
+    from channel_server.core.actor import TransportSend
+    from channel_server.core.handler import HANDLER_REGISTRY
+
+    class SpawnHookHandler:
+        def handle(self, actor, msg, runtime=None):
+            return []
+        def on_spawn(self, actor):
+            return [TransportSend(payload={"action": "init", "tag": actor.tag})]
+        def on_stop(self, actor):
+            return []
+
+    rt = ActorRuntime()
+    HANDLER_REGISTRY["test_spawn_hook"] = SpawnHookHandler()
+    transport_calls = []
+
+    async def mock_transport(actor, payload):
+        transport_calls.append(payload)
+        return None
+
+    rt.register_transport_handler("test", mock_transport)
+
+    try:
+        rt.spawn("test:actor", "test_spawn_hook", tag="mytag",
+                 transport=Transport(type="test", config={}))
+        await asyncio.sleep(0.2)
+        assert len(transport_calls) == 1
+        assert transport_calls[0]["action"] == "init"
+        assert transport_calls[0]["tag"] == "mytag"
+    finally:
+        del HANDLER_REGISTRY["test_spawn_hook"]

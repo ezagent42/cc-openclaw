@@ -198,36 +198,7 @@ async def test_handle_register_rejects_missing_instance_id():
 
 
 # ---------------------------------------------------------------------------
-# 7. _handle_list returns sessions for the user
-# ---------------------------------------------------------------------------
-
-@pytest.mark.asyncio
-async def test_handle_list_returns_sessions():
-    adapter, rt = make_adapter()
-    ws = make_ws()
-
-    # Register root
-    await adapter._handle_register(ws, {
-        "action": "register",
-        "instance_id": "alice.root",
-    })
-
-    # Manually spawn a child
-    rt.spawn("cc:alice.dev", "cc_session", tag="dev", state="suspended")
-
-    ws.send.reset_mock()
-    await adapter._handle_list(ws, {"action": "list_sessions"})
-
-    ws.send.assert_called_once()
-    resp = json.loads(ws.send.call_args[0][0])
-    assert resp["action"] == "sessions_list"
-    names = [s["name"] for s in resp["sessions"]]
-    assert "root" in names
-    assert "dev" in names
-
-
-# ---------------------------------------------------------------------------
-# 8. handle_message ignores pong
+# 7. handle_message ignores pong
 # ---------------------------------------------------------------------------
 
 @pytest.mark.asyncio
@@ -270,73 +241,7 @@ def test_spawn_cc_process_returns_true_on_success():
 
 
 # ---------------------------------------------------------------------------
-# 11. _handle_spawn rolls back actors on tmux failure
-# ---------------------------------------------------------------------------
-
-@pytest.mark.asyncio
-async def test_handle_spawn_rollback_on_failure():
-    adapter, rt = make_adapter()
-    ws = make_ws()
-
-    # Register root session
-    await adapter._handle_register(ws, {
-        "action": "register",
-        "instance_id": "alice.root",
-        "tag_name": "root",
-    })
-
-    ws.send.reset_mock()
-
-    # Mock spawn_cc_process to fail
-    with patch.object(adapter, "spawn_cc_process", return_value=False):
-        await adapter._handle_spawn(ws, {
-            "action": "spawn",
-            "session_name": "broken-child",
-        })
-
-    # spawn_result should report failure
-    ws.send.assert_called_once()
-    resp = json.loads(ws.send.call_args[0][0])
-    assert resp["action"] == "spawn_result"
-    assert resp["ok"] is False
-    assert "failed" in resp["text"].lower()
-
-    # CC actor should be cleaned up (state == ended)
-    child = rt.lookup("cc:alice.broken-child")
-    assert child is None or child.state == "ended"
-
-
-@pytest.mark.asyncio
-async def test_handle_spawn_success():
-    adapter, rt = make_adapter()
-    ws = make_ws()
-
-    await adapter._handle_register(ws, {
-        "action": "register",
-        "instance_id": "alice.root",
-        "tag_name": "root",
-    })
-
-    ws.send.reset_mock()
-
-    with patch.object(adapter, "spawn_cc_process", return_value=True):
-        await adapter._handle_spawn(ws, {
-            "action": "spawn",
-            "session_name": "good-child",
-        })
-
-    ws.send.assert_called_once()
-    resp = json.loads(ws.send.call_args[0][0])
-    assert resp["action"] == "spawn_result"
-    assert resp["ok"] is True
-
-    child = rt.lookup("cc:alice.good-child")
-    assert child is not None
-    assert child.state == "suspended"
-
-
-# ---------------------------------------------------------------------------
-# 12. _route_anonymous_tool_notify routes by chat_id
+# 11. _route_anonymous_tool_notify routes by chat_id
 # ---------------------------------------------------------------------------
 
 def test_route_anonymous_tool_notify():

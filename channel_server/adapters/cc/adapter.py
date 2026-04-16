@@ -21,6 +21,23 @@ PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent.parent
 _MAX_CHILDREN = 10
 
 
+def _read_tmux_session_name() -> str:
+    """Read SESSION_NAME from cc-openclaw.sh (single source of truth)."""
+    script = PROJECT_ROOT / "cc-openclaw.sh"
+    if script.exists():
+        for line in script.read_text().splitlines():
+            stripped = line.strip()
+            if stripped.startswith("SESSION_NAME="):
+                # SESSION_NAME="cc-openclaw" → cc-openclaw
+                val = stripped.split("=", 1)[1].strip().strip('"').strip("'")
+                if val:
+                    return val
+    return "cc-openclaw"
+
+
+_TMUX_SESSION = os.environ.get("TMUX_SESSION") or _read_tmux_session_name()
+
+
 class CCAdapter:
     """Bridge between Claude Code WebSocket sessions and the actor runtime.
 
@@ -366,14 +383,24 @@ class CCAdapter:
                 thread_actor.downstream.append(child_cc_addr)
 
         # Start CC process via tmux
-        self.spawn_cc_process(user, session_name, tag=tag)
-
-        await ws.send(json.dumps({
-            "method": "spawn_result", "ok": True,
-            "text": f"Session '{session_name}' spawned",
-            "session_name": session_name,
-            "address": child_cc_addr,
-        }))
+        if self.spawn_cc_process(user, session_name, tag=tag):
+            await ws.send(json.dumps({
+                "method": "spawn_result", "ok": True,
+                "text": f"Session '{session_name}' spawned",
+                "session_name": session_name,
+                "address": child_cc_addr,
+            }))
+        else:
+            # Rollback: clean up all actors created during this spawn
+            log.error("Spawn failed for %s — rolling back actors", child_cc_addr)
+            tool_card_addr = f"tool_card:{user}.{session_name}"
+            for addr in [child_cc_addr, tool_card_addr, feishu_thread_addr]:
+                if addr:
+                    self.runtime.stop(addr)
+            await ws.send(json.dumps({
+                "method": "spawn_result", "ok": False,
+                "text": f"Session '{session_name}' failed: could not create tmux window (session={_TMUX_SESSION})",
+            }))
 
     async def _handle_kill(self, ws, msg: dict) -> None:
         """Kill a child session.
@@ -477,21 +504,15 @@ class CCAdapter:
     # Process management
     # ------------------------------------------------------------------
 
-    def spawn_cc_process(self, user: str, session_name: str, tag: str = "") -> None:
-        """Start CC process via cc-openclaw.sh in tmux."""
+    def spawn_cc_process(self, user: str, session_name: str, tag: str = "") -> bool:
+        """Start CC process via cc-openclaw.sh in tmux. Returns True on success."""
         script = PROJECT_ROOT / "cc-openclaw.sh"
         if not script.exists():
             log.warning("cc-openclaw.sh not found at %s", script)
-            return
+            return False
 
         window_name = f"{user}.{session_name}"
-        tmux_session = os.environ.get("TMUX_SESSION", "openclaw")
 
-        cmd = [
-            "tmux", "new-window", "-t", tmux_session,
-            "-n", window_name,
-            str(script),
-        ]
         env_vars = {
             "OC_USER": user,
             "OC_SESSION": session_name,
@@ -500,7 +521,7 @@ class CCAdapter:
         # Build the full command with env vars
         env_prefix = " ".join(f"{k}={v}" for k, v in env_vars.items())
         cmd = [
-            "tmux", "new-window", "-t", tmux_session,
+            "tmux", "new-window", "-t", _TMUX_SESSION,
             "-n", window_name,
             f"{env_prefix} {script}",
         ]
@@ -508,13 +529,15 @@ class CCAdapter:
         try:
             subprocess.run(cmd, check=True, capture_output=True, timeout=10)
             log.info("Spawned CC process: %s in tmux window %s", session_name, window_name)
+            return True
         except Exception as e:
-            log.warning("Failed to spawn CC process %s: %s", session_name, e)
+            log.error("Failed to spawn CC process %s: %s", session_name, e)
+            return False
 
     def kill_cc_process(self, user: str, session_name: str) -> None:
         """Kill tmux window by looking up window index (dots in name break tmux parsing)."""
         window_name = f"{user}.{session_name}"
-        tmux_session = os.environ.get("TMUX_SESSION", "openclaw")
+        tmux_session = _TMUX_SESSION
 
         try:
             # Use list-windows to find the window index by name

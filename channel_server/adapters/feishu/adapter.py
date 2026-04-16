@@ -402,7 +402,7 @@ class FeishuAdapter:
         except Exception as e:
             log.warning("_send_file error: %s", e)
 
-    def _send_reaction(self, message_id: str, emoji_type: str = "THUMBSUP", *, track: bool = False) -> None:
+    def _send_reaction(self, message_id: str, emoji_type: str = "ROCKET", *, track: bool = False) -> None:
         """Add emoji reaction to a Feishu message. Blocking."""
         if not self.feishu_client:
             return
@@ -599,6 +599,9 @@ class FeishuAdapter:
     def download_file(self, message_id: str, message) -> str:
         """Download a file/image/audio/media attachment from Feishu.
 
+        Uses the typed SDK (GetMessageResourceRequest) which handles binary
+        responses correctly — BaseRequest cannot.
+
         Returns the local file path on success, empty string on failure.
         """
         try:
@@ -629,31 +632,7 @@ class FeishuAdapter:
             log.warning("No file_key in %s message", msg_type)
             return ""
 
-        try:
-            import lark_oapi as lark
-
-            req = (
-                lark.BaseRequest.builder()
-                .http_method(lark.HttpMethod.GET)
-                .uri(f"/open-apis/im/v1/messages/{message_id}/resources/{file_key}?type={resource_type}")
-                .token_types({lark.AccessTokenType.TENANT})
-                .build()
-            )
-            resp = self.feishu_client.request(req)
-            if not resp.success():
-                log.warning("File download failed: code=%s msg=%s", resp.code, resp.msg)
-                return ""
-
-            upload_dir = PROJECT_ROOT / ".openclaw" / "uploads" / chat_id
-            upload_dir.mkdir(parents=True, exist_ok=True)
-            dest = upload_dir / file_name
-            dest.write_bytes(resp.raw.content)
-            log.info("Downloaded %s -> %s (%d bytes)", msg_type, dest, len(resp.raw.content))
-            return str(dest)
-
-        except Exception as e:
-            log.error("File download error: %s", e, exc_info=True)
-            return ""
+        return self._download_resource(message_id, file_key, resource_type, file_name, chat_id, msg_type)
 
     def download_image_by_key(self, message_id: str, image_key: str) -> str:
         """Download an inline image by image_key.
@@ -662,29 +641,47 @@ class FeishuAdapter:
         """
         if not self.feishu_client or not message_id or not image_key:
             return ""
+        return self._download_resource(message_id, image_key, "image", f"{image_key}.png", "inline", "inline_image")
+
+    def _download_resource(self, message_id: str, file_key: str, resource_type: str,
+                           file_name: str, chat_id: str, label: str) -> str:
+        """Download a message resource using the typed SDK API.
+
+        Returns the local file path on success, empty string on failure.
+        """
         try:
-            import lark_oapi as lark
+            from lark_oapi.api.im.v1 import GetMessageResourceRequest
 
             req = (
-                lark.BaseRequest.builder()
-                .http_method(lark.HttpMethod.GET)
-                .uri(f"/open-apis/im/v1/messages/{message_id}/resources/{image_key}?type=image")
-                .token_types({lark.AccessTokenType.TENANT})
+                GetMessageResourceRequest.builder()
+                .message_id(message_id)
+                .file_key(file_key)
+                .type(resource_type)
                 .build()
             )
-            resp = self.feishu_client.request(req)
+            resp = self.feishu_client.im.v1.message_resource.get(req)
             if not resp.success():
-                log.warning("Inline image download failed: code=%s msg=%s", resp.code, resp.msg)
+                log.warning("%s download failed: code=%s msg=%s", label, resp.code, resp.msg)
                 return ""
 
-            upload_dir = PROJECT_ROOT / ".openclaw" / "uploads" / "inline"
+            upload_dir = PROJECT_ROOT / ".openclaw" / "uploads" / chat_id
             upload_dir.mkdir(parents=True, exist_ok=True)
-            dest = upload_dir / f"{image_key}.png"
-            dest.write_bytes(resp.raw.content)
-            log.info("Downloaded inline image -> %s (%d bytes)", dest, len(resp.raw.content))
+            dest = upload_dir / file_name
+
+            # Typed API returns file content via resp.file
+            if resp.file:
+                dest.write_bytes(resp.file.read())
+            elif resp.raw and resp.raw.content:
+                dest.write_bytes(resp.raw.content)
+            else:
+                log.warning("%s download: empty response body", label)
+                return ""
+
+            log.info("Downloaded %s -> %s (%d bytes)", label, dest, dest.stat().st_size)
             return str(dest)
+
         except Exception as e:
-            log.error("Inline image download error: %s", e, exc_info=True)
+            log.error("%s download error: %s", label, e, exc_info=True)
             return ""
 
     # ------------------------------------------------------------------

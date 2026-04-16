@@ -1,12 +1,12 @@
-"""Tests for FeishuAdapter — inbound routing, dedup, echo prevention, auto-spawn."""
+"""Tests for FeishuAdapter — inbound routing, dedup, echo prevention, auto-spawn, file download."""
 from __future__ import annotations
 
-import asyncio
-from unittest.mock import MagicMock
+import io
+import json
+from pathlib import Path
+from unittest.mock import MagicMock, patch
 
-import pytest
-
-from channel_server.core.actor import Actor, Message, Transport
+from channel_server.core.actor import Message
 from channel_server.core.runtime import ActorRuntime
 from channel_server.adapters.feishu.adapter import FeishuAdapter
 
@@ -189,3 +189,99 @@ def test_dedup_set_bounded():
         adapter.on_feishu_event(evt)
 
     assert len(adapter._seen) <= 10_000
+
+
+# ---------------------------------------------------------------------------
+# 10. download_file uses typed SDK and returns file path
+# ---------------------------------------------------------------------------
+
+def test_download_file_success(tmp_path):
+    adapter, _ = make_adapter()
+
+    # Mock message
+    msg = MagicMock()
+    msg.message_type = "file"
+    msg.chat_id = "oc_test"
+    msg.content = json.dumps({"file_key": "fk_123", "file_name": "test.txt"})
+
+    # Mock typed SDK response
+    mock_resp = MagicMock()
+    mock_resp.success.return_value = True
+    mock_resp.file = io.BytesIO(b"file content here")
+    mock_resp.raw = None
+
+    adapter.feishu_client.im.v1.message_resource.get.return_value = mock_resp
+
+    with patch("channel_server.adapters.feishu.adapter.PROJECT_ROOT", tmp_path):
+        result = adapter.download_file("msg_001", msg)
+
+    assert result != ""
+    assert "test.txt" in result
+    assert Path(result).exists()
+    assert Path(result).read_bytes() == b"file content here"
+
+
+def test_download_file_api_failure():
+    adapter, _ = make_adapter()
+
+    msg = MagicMock()
+    msg.message_type = "image"
+    msg.chat_id = "oc_test"
+    msg.content = json.dumps({"image_key": "img_bad"})
+
+    mock_resp = MagicMock()
+    mock_resp.success.return_value = False
+    mock_resp.code = 99991
+    mock_resp.msg = "permission denied"
+
+    adapter.feishu_client.im.v1.message_resource.get.return_value = mock_resp
+
+    result = adapter.download_file("msg_002", msg)
+    assert result == ""
+
+
+def test_download_file_no_file_key():
+    adapter, _ = make_adapter()
+
+    msg = MagicMock()
+    msg.message_type = "file"
+    msg.chat_id = "oc_test"
+    msg.content = json.dumps({})
+
+    result = adapter.download_file("msg_003", msg)
+    assert result == ""
+
+
+# ---------------------------------------------------------------------------
+# 11. download_image_by_key
+# ---------------------------------------------------------------------------
+
+def test_download_image_by_key_success(tmp_path):
+    adapter, _ = make_adapter()
+
+    mock_resp = MagicMock()
+    mock_resp.success.return_value = True
+    mock_resp.file = io.BytesIO(b"\x89PNG...")
+    mock_resp.raw = None
+
+    adapter.feishu_client.im.v1.message_resource.get.return_value = mock_resp
+
+    with patch("channel_server.adapters.feishu.adapter.PROJECT_ROOT", tmp_path):
+        result = adapter.download_image_by_key("msg_010", "img_key_abc")
+
+    assert result != ""
+    assert "img_key_abc.png" in result
+    assert Path(result).exists()
+
+
+# ---------------------------------------------------------------------------
+# 12. ACK reaction uses ROCKET emoji
+# ---------------------------------------------------------------------------
+
+def test_ack_reaction_uses_rocket():
+    adapter, _ = make_adapter()
+    # Verify the default emoji_type parameter
+    import inspect
+    sig = inspect.signature(adapter._send_reaction)
+    emoji_default = sig.parameters["emoji_type"].default
+    assert emoji_default == "ROCKET"

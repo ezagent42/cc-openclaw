@@ -8,6 +8,7 @@ from channel_server.core.actor import (
     Actor,
     Message,
     Send,
+    StopActor,
     TransportSend,
     UpdateActor,
 )
@@ -17,6 +18,14 @@ class Handler(Protocol):
     """Protocol that all actor message handlers must satisfy."""
 
     def handle(self, actor: Actor, msg: Message) -> list[Action]: ...
+
+    def on_stop(self, actor: Actor) -> list[Action]:
+        """Lifecycle callback invoked when an actor is stopped.
+
+        Returns actions to execute as cleanup (e.g. unpin messages,
+        update cards, notify parents). Default: no-op.
+        """
+        return []
 
 
 # ---------------------------------------------------------------------------
@@ -39,6 +48,30 @@ class FeishuInboundHandler:
         actions: list[Action] = []
         if actor.transport is not None:
             actions.append(TransportSend(payload=msg.payload))
+        return actions
+
+    def on_stop(self, actor: Actor) -> list[Action]:
+        """Cleanup: unpin anchor message and update card to 'ended'.
+
+        Only applies to thread actors (feishu_thread transport) that have
+        an anchor message (root_id in transport config).
+        """
+        actions: list[Action] = []
+        if actor.transport is None or actor.transport.type != "feishu_thread":
+            return actions
+        anchor_msg_id = actor.transport.config.get("root_id", "")
+        if anchor_msg_id:
+            actions.append(TransportSend(payload={
+                "action": "unpin",
+                "message_id": anchor_msg_id,
+            }))
+            actions.append(TransportSend(payload={
+                "action": "update_anchor",
+                "msg_id": anchor_msg_id,
+                "title": f"\U0001f534 [{actor.tag}] ended",
+                "body_text": f"Session [{actor.tag}] has been terminated",
+                "template": "red",
+            }))
         return actions
 
 
@@ -89,6 +122,17 @@ class CCSessionHandler:
         # Catch-all (react, send_file, update_title, etc.) → send to downstream.
         return [Send(to=addr, message=msg) for addr in actor.downstream]
 
+    def on_stop(self, actor: Actor) -> list[Action]:
+        """Stop child actors (feishu_thread, tool_card) when CC session ends."""
+        actions: list[Action] = []
+        user_session = actor.address.removeprefix("cc:")
+        # Stop tool card
+        actions.append(StopActor(address=f"tool_card:{user_session}"))
+        # Stop downstream feishu thread actors
+        for addr in actor.downstream:
+            actions.append(StopActor(address=addr))
+        return actions
+
 
 # ---------------------------------------------------------------------------
 # ForwardAllHandler
@@ -99,6 +143,9 @@ class ForwardAllHandler:
 
     def handle(self, actor: Actor, msg: Message) -> list[Action]:
         return [Send(to=addr, message=msg) for addr in actor.downstream]
+
+    def on_stop(self, actor: Actor) -> list[Action]:
+        return []
 
 
 # ---------------------------------------------------------------------------
@@ -123,6 +170,17 @@ class ToolCardHandler:
                 "card_msg_id": actor.metadata.get("card_msg_id", ""),
             }),
         ]
+
+    def on_stop(self, actor: Actor) -> list[Action]:
+        """Clear the tool card on session end."""
+        card_msg_id = actor.metadata.get("card_msg_id", "")
+        if card_msg_id and actor.transport is not None:
+            return [TransportSend(payload={
+                "action": "tool_notify",
+                "text": f"\u2b1b Session ended",
+                "card_msg_id": card_msg_id,
+            })]
+        return []
 
 
 # ---------------------------------------------------------------------------
@@ -181,6 +239,9 @@ class AdminHandler:
             )
             for addr in actor.downstream
         ]
+
+    def on_stop(self, actor: Actor) -> list[Action]:
+        return []
 
     @staticmethod
     def _help_text() -> str:

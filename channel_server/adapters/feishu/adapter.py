@@ -274,6 +274,20 @@ class FeishuAdapter:
             msg_id = payload.get("card_msg_id", "")
             text = payload.get("text", "")
             threading.Thread(target=self._update_card, args=(msg_id, text), daemon=True).start()
+        elif action == "unpin":
+            message_id = payload.get("message_id", "")
+            threading.Thread(target=self.unpin_message, args=(message_id,), daemon=True).start()
+        elif action == "update_anchor":
+            msg_id = payload.get("msg_id", "")
+            title = payload.get("title", "")
+            body_text = payload.get("body_text", "")
+            template = payload.get("template", "red")
+            threading.Thread(
+                target=self._update_anchor_card,
+                args=(msg_id, title),
+                kwargs={"body_text": body_text, "template": template},
+                daemon=True,
+            ).start()
         else:
             log.warning("_handle_chat_transport: unhandled action=%s actor=%s", action, actor.address)
 
@@ -305,6 +319,20 @@ class FeishuAdapter:
             msg_id = payload.get("card_msg_id", "")
             text = payload.get("text", "")
             threading.Thread(target=self._update_card, args=(msg_id, text), daemon=True).start()
+        elif action == "unpin":
+            message_id = payload.get("message_id", "")
+            threading.Thread(target=self.unpin_message, args=(message_id,), daemon=True).start()
+        elif action == "update_anchor":
+            msg_id = payload.get("msg_id", "")
+            title = payload.get("title", "")
+            body_text = payload.get("body_text", "")
+            template = payload.get("template", "red")
+            threading.Thread(
+                target=self._update_anchor_card,
+                args=(msg_id, title),
+                kwargs={"body_text": body_text, "template": template},
+                daemon=True,
+            ).start()
         else:
             log.warning("_handle_thread_transport: unhandled action=%s actor=%s", action, actor.address)
 
@@ -594,6 +622,25 @@ class FeishuAdapter:
                 return False
         except Exception as e:
             log.warning("Error pinning message: %s", e)
+            return False
+
+    def unpin_message(self, message_id: str) -> bool:
+        """Unpin a message. Blocking."""
+        if not self.feishu_client:
+            return False
+        try:
+            from lark_oapi.api.im.v1 import DeletePinRequest
+
+            req = DeletePinRequest.builder().message_id(message_id).build()
+            resp = self.feishu_client.im.v1.pin.delete(req)
+            if resp.success():
+                log.info("Unpinned message %s", message_id)
+                return True
+            else:
+                log.warning("Failed to unpin message %s: %s", message_id, resp.msg)
+                return False
+        except Exception as e:
+            log.warning("Error unpinning message: %s", e)
             return False
 
     def download_file(self, message_id: str, message) -> str:

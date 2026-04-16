@@ -443,3 +443,92 @@ def test_admin_non_slash_passthrough():
 
 def test_get_handler_returns_admin():
     assert isinstance(get_handler("admin"), AdminHandler)
+
+
+# ---------------------------------------------------------------------------
+# 22. FeishuInboundHandler.on_stop — thread actor emits unpin + update_anchor
+# ---------------------------------------------------------------------------
+
+def test_feishu_inbound_on_stop_thread_actor():
+    from channel_server.core.actor import Transport
+
+    actor = make_actor(
+        address="feishu:oc_test:om_anchor123",
+        tag="dev-session",
+        handler="feishu_inbound",
+    )
+    actor.transport = Transport(
+        type="feishu_thread",
+        config={"chat_id": "oc_test", "root_id": "om_anchor123"},
+    )
+
+    actions = FeishuInboundHandler().on_stop(actor)
+    assert len(actions) == 2
+
+    unpin = actions[0]
+    assert isinstance(unpin, TransportSend)
+    assert unpin.payload["action"] == "unpin"
+    assert unpin.payload["message_id"] == "om_anchor123"
+
+    update = actions[1]
+    assert isinstance(update, TransportSend)
+    assert update.payload["action"] == "update_anchor"
+    assert "ended" in update.payload["title"]
+    assert update.payload["template"] == "red"
+
+
+def test_feishu_inbound_on_stop_chat_actor_noop():
+    """Chat actors (not thread) should not emit cleanup actions."""
+    from channel_server.core.actor import Transport
+
+    actor = make_actor(handler="feishu_inbound")
+    actor.transport = Transport(type="feishu_chat", config={"chat_id": "oc_test"})
+
+    actions = FeishuInboundHandler().on_stop(actor)
+    assert actions == []
+
+
+# ---------------------------------------------------------------------------
+# 23. CCSessionHandler.on_stop — stops child actors
+# ---------------------------------------------------------------------------
+
+def test_cc_session_on_stop_stops_children():
+    from channel_server.core.actor import StopActor
+
+    actor = make_actor(
+        address="cc:user.dev",
+        tag="dev",
+        handler="cc_session",
+        downstream=["feishu:oc_test:om_anchor"],
+    )
+
+    actions = CCSessionHandler().on_stop(actor)
+    stop_addrs = {a.address for a in actions if isinstance(a, StopActor)}
+    assert "tool_card:user.dev" in stop_addrs
+    assert "feishu:oc_test:om_anchor" in stop_addrs
+
+
+# ---------------------------------------------------------------------------
+# 24. ToolCardHandler.on_stop — emits final card update
+# ---------------------------------------------------------------------------
+
+def test_tool_card_on_stop_updates_card():
+    from channel_server.core.actor import Transport
+
+    actor = make_actor(
+        handler="tool_card",
+        metadata={"card_msg_id": "om_card_999"},
+    )
+    actor.transport = Transport(type="feishu_chat", config={"chat_id": "oc_test"})
+
+    actions = ToolCardHandler().on_stop(actor)
+    assert len(actions) == 1
+    assert isinstance(actions[0], TransportSend)
+    assert actions[0].payload["card_msg_id"] == "om_card_999"
+    assert "ended" in actions[0].payload["text"].lower()
+
+
+def test_tool_card_on_stop_no_transport_noop():
+    actor = make_actor(handler="tool_card", metadata={"card_msg_id": "om_card_999"})
+    actions = ToolCardHandler().on_stop(actor)
+    assert actions == []

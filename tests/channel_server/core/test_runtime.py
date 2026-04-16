@@ -411,3 +411,78 @@ async def test_max_errors_stops_actor():
         assert actor.state == "ended"
     finally:
         del HANDLER_REGISTRY["broken_max"]
+
+
+# ---------------------------------------------------------------------------
+# 15. runtime.stop calls on_stop lifecycle callback
+# ---------------------------------------------------------------------------
+
+def test_stop_calls_on_stop():
+    """runtime.stop() should invoke the handler's on_stop before ending the actor."""
+    rt = make_runtime()
+    from channel_server.core.handler import HANDLER_REGISTRY
+
+    on_stop_called = []
+
+    class LifecycleHandler:
+        def handle(self, actor, msg):
+            return []
+
+        def on_stop(self, actor):
+            on_stop_called.append(actor.address)
+            return []
+
+    HANDLER_REGISTRY["lifecycle_test"] = LifecycleHandler()
+    try:
+        rt.spawn("actor://lc", "lifecycle_test")
+        assert rt.lookup("actor://lc").state == "active"
+
+        rt.stop("actor://lc")
+
+        assert rt.lookup("actor://lc").state == "ended"
+        assert on_stop_called == ["actor://lc"]
+    finally:
+        del HANDLER_REGISTRY["lifecycle_test"]
+
+
+def test_stop_on_stop_cascades():
+    """on_stop can emit StopActor to cascade cleanup."""
+    rt = make_runtime()
+    from channel_server.core.handler import HANDLER_REGISTRY
+
+    class ParentHandler:
+        def handle(self, actor, msg):
+            return []
+
+        def on_stop(self, actor):
+            return [StopActor(address="actor://child")]
+
+    class ChildHandler:
+        def handle(self, actor, msg):
+            return []
+
+        def on_stop(self, actor):
+            return []
+
+    HANDLER_REGISTRY["cascade_parent"] = ParentHandler()
+    HANDLER_REGISTRY["cascade_child"] = ChildHandler()
+    try:
+        rt.spawn("actor://parent", "cascade_parent")
+        rt.spawn("actor://child", "cascade_child")
+
+        rt.stop("actor://parent")
+
+        assert rt.lookup("actor://parent").state == "ended"
+        assert rt.lookup("actor://child").state == "ended"
+    finally:
+        del HANDLER_REGISTRY["cascade_parent"]
+        del HANDLER_REGISTRY["cascade_child"]
+
+
+def test_stop_idempotent():
+    """Stopping an already-ended actor should be a no-op."""
+    rt = make_runtime()
+    rt.spawn("actor://x", "forward_all")
+    rt.stop("actor://x")
+    rt.stop("actor://x")  # should not raise
+    assert rt.lookup("actor://x").state == "ended"

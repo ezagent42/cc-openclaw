@@ -440,10 +440,9 @@ class CCAdapter:
     async def _handle_kill(self, ws, msg: dict) -> None:
         """Kill a child session.
 
-        1. Update anchor card to red 'ended'
-        2. Stop CC actor, tool card actor, feishu thread actor
-        3. Kill tmux window
-        4. Send kill_result ack
+        Stops the CC actor — its on_stop lifecycle cascades to stop child
+        actors (tool_card, feishu_thread), which in turn run their own
+        on_stop (unpin, update anchor card, etc.).
         """
         address = self._ws_to_address.get(id(ws))
         if not address:
@@ -470,28 +469,7 @@ class CCAdapter:
             }))
             return
 
-        # Update anchor card to red
-        anchor_msg_id = child.metadata.get("anchor_msg_id", "")
-        if anchor_msg_id and self.feishu_adapter:
-            self.feishu_adapter._update_anchor_card(
-                anchor_msg_id,
-                f"\U0001f534 [{child.tag}] ended",
-                body_text=f"Session [{child.tag}] has been terminated",
-                template="red",
-            )
-
-        # Stop feishu thread actor
-        chat_id = child.metadata.get("chat_id", "")
-        if anchor_msg_id and chat_id:
-            feishu_thread_addr = f"feishu:{chat_id}:{anchor_msg_id}"
-            self.runtime.stop(feishu_thread_addr)
-
-        # Stop tool card actor
-        tool_card_addr = f"tool_card:{user}.{session_name}"
-        if self.runtime.lookup(tool_card_addr):
-            self.runtime.stop(tool_card_addr)
-
-        # Stop CC actor
+        # Stop CC actor — lifecycle callbacks handle all cleanup
         self.runtime.stop(child_cc_addr)
 
         # Kill tmux window

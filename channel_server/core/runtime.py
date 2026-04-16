@@ -73,11 +73,23 @@ class ActorRuntime:
         return actor
 
     def stop(self, address: str) -> None:
-        """Stop an actor — set state to ended and cancel its loop task."""
+        """Stop an actor — run on_stop lifecycle, set state to ended, cancel loop."""
         actor = self.actors.get(address)
         if actor is None:
             log.warning("stop: actor %s not found", address)
             return
+        if actor.state == "ended":
+            return  # already stopped
+
+        # Run on_stop lifecycle callback before ending
+        try:
+            handler = get_handler(actor.handler)
+            actions = handler.on_stop(actor)
+            for action in actions:
+                self._execute(actor, action)
+        except Exception as e:
+            log.error("on_stop error for %s: %s", address, e)
+
         actor.state = "ended"
         self._cancel_task(address)
 

@@ -49,58 +49,65 @@ def test_parse_text_empty():
 
 
 # ---------------------------------------------------------------------------
-# 2. File download — success
+# 2. File / image / audio / media — parsers no longer download
 # ---------------------------------------------------------------------------
 
 def test_parse_file_download_success():
+    """Parsers no longer download — file_path is always "", file_name in text."""
     msg = make_message("file", {"file_key": "fk_123", "file_name": "doc.pdf"})
     server = make_server(download_returns="/tmp/uploads/doc.pdf")
-    text, file_path = parse_message("file", {"file_key": "fk_123"}, msg, server)
-    assert file_path == "/tmp/uploads/doc.pdf"
+    text, file_path = parse_message("file", {"file_key": "fk_123", "file_name": "doc.pdf"}, msg, server)
+    assert file_path == ""
     assert "doc.pdf" in text
-    server.download_file.assert_called_once_with("msg_001", msg)
+    server.download_file.assert_not_called()
 
 
 def test_parse_image_download_success():
+    """Parsers no longer download — file_path is always "", image_key in text."""
     msg = make_message("image", {"image_key": "img_abc"})
     server = make_server(download_returns="/tmp/uploads/img_abc.png")
     text, file_path = parse_message("image", {"image_key": "img_abc"}, msg, server)
-    assert file_path == "/tmp/uploads/img_abc.png"
-    server.download_file.assert_called_once()
+    assert file_path == ""
+    assert "img_abc" in text
+    server.download_file.assert_not_called()
 
 
 def test_parse_audio_download_success():
+    """Parsers no longer download — file_path is always ""."""
     msg = make_message("audio", {"file_key": "audio_001"})
     server = make_server(download_returns="/tmp/uploads/audio.bin")
     text, file_path = parse_message("audio", {"file_key": "audio_001"}, msg, server)
-    assert file_path == "/tmp/uploads/audio.bin"
+    assert file_path == ""
+    assert "audio_001" in text
 
 
 def test_parse_media_download_success():
+    """Parsers no longer download — file_path is always "", file_name in text."""
     msg = make_message("media", {"file_key": "media_001", "file_name": "video.mp4"})
     server = make_server(download_returns="/tmp/uploads/video.mp4")
-    text, file_path = parse_message("media", {"file_key": "media_001"}, msg, server)
-    assert file_path == "/tmp/uploads/video.mp4"
+    text, file_path = parse_message("media", {"file_key": "media_001", "file_name": "video.mp4"}, msg, server)
+    assert file_path == ""
+    assert "video.mp4" in text
 
 
-# ---------------------------------------------------------------------------
-# 3. File download — failure
-# ---------------------------------------------------------------------------
-
-def test_parse_file_download_failure():
+def test_parse_file_no_download_attempt():
+    """Parsers never attempt download regardless of server state."""
     msg = make_message("file", {"file_key": "fk_bad"})
     server = make_server(download_returns="")
     text, file_path = parse_message("file", {"file_key": "fk_bad"}, msg, server)
     assert file_path == ""
-    assert "下载失败" in text
+    assert "fk_bad" in text
+    server.download_file.assert_not_called()
 
 
-def test_parse_image_download_failure():
+def test_parse_image_no_download_attempt():
+    """Image parsers never attempt download."""
     msg = make_message("image", {"image_key": "img_bad"})
     server = make_server(download_returns="")
     text, file_path = parse_message("image", {"image_key": "img_bad"}, msg, server)
     assert file_path == ""
-    assert "下载失败" in text
+    assert "img_bad" in text
+    server.download_file.assert_not_called()
 
 
 # ---------------------------------------------------------------------------
@@ -119,6 +126,7 @@ def test_parse_post_with_text():
 
 
 def test_parse_post_with_inline_image_success():
+    """Post parsers no longer download — image_key reference appears in text."""
     content = {
         "title": "",
         "content": [[{"tag": "img", "image_key": "img_inline"}]],
@@ -126,11 +134,13 @@ def test_parse_post_with_inline_image_success():
     msg = make_message("post", content)
     server = make_server(download_returns="/tmp/inline.png")
     text, file_path = parse_message("post", content, msg, server)
-    assert file_path == "/tmp/inline.png"
-    server.download_image_by_key.assert_called_once_with("msg_001", "img_inline")
+    assert file_path == ""
+    assert "img_inline" in text
+    server.download_image_by_key.assert_not_called()
 
 
-def test_parse_post_with_inline_image_failure():
+def test_parse_post_with_inline_image_reference():
+    """Post with inline image always yields image_key in text, never downloads."""
     content = {
         "title": "",
         "content": [[{"tag": "img", "image_key": "img_fail"}]],
@@ -140,6 +150,7 @@ def test_parse_post_with_inline_image_failure():
     text, file_path = parse_message("post", content, msg, server)
     assert file_path == ""
     assert "图片: img_fail" in text
+    server.download_image_by_key.assert_not_called()
 
 
 # ---------------------------------------------------------------------------

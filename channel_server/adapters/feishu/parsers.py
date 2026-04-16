@@ -73,32 +73,24 @@ def _parse_post(content: dict, message, server) -> tuple[str, str]:
             elif tag == "img":
                 image_keys.append(node.get("image_key", ""))
 
-    # Download the first inline image if present
-    file_path = ""
-    if image_keys and image_keys[0] and server:
-        msg_id = message.message_id or ""
-        image_key = image_keys[0]
-        try:
-            file_path = server.download_image_by_key(msg_id, image_key)
-        except Exception as e:
-            log.warning("Failed to download inline image: %s", e)
-        if not file_path:
-            parts.append(f"[图片: {image_key}]")
-    elif image_keys:
-        for ik in image_keys:
+    # Don't download inline images — include image_key reference for deferred download
+    for ik in image_keys:
+        if ik:
             parts.append(f"[图片: {ik}]")
 
-    return " ".join(p for p in parts if p), file_path
+    return " ".join(p for p in parts if p), ""
 
 
 @register_parser("image", "file", "audio", "media")
 def _parse_downloadable(content: dict, message, server) -> tuple[str, str]:
-    msg_id = message.message_id or ""
-    file_path = server.download_file(msg_id, message)
     msg_type = message.message_type or "file"
-    if file_path:
-        return f"[File received: {file_path}]", file_path
-    return f"[{msg_type} — 下载失败]", ""
+    if msg_type == "image":
+        file_key = content.get("image_key", "")
+    else:
+        file_key = content.get("file_key", "")
+    file_name = content.get("file_name", file_key or "unknown")
+    # Don't download here — pass file_key for deferred download
+    return f"[{msg_type}: {file_name}]", ""
 
 
 # ---------------------------------------------------------------------------

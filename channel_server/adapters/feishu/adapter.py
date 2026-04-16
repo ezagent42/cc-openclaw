@@ -142,7 +142,8 @@ class FeishuAdapter:
                     "root_id": root_id,
                     "msg_type": msg_type,
                     "text": text,
-                    "file_path": file_path,
+                    "file_path": file_path,  # now always "" — parsers no longer download
+                    "file_key": content_json.get("file_key", "") or content_json.get("image_key", ""),
                     "user": sender_name,
                     "user_id": sender_id,
                     "chat_type": chat_type,

@@ -87,25 +87,48 @@ def _route_anonymous_tool_notify(self, msg: dict) -> None:
 - `CCSessionHandler.on_stop`: Remove `StopActor(address=f"tool_card:{user_session}")` — actor no longer exists.
 - `feishu_adapter._handle_chat_transport` and `_handle_thread_transport`: Remove `tool_notify` action handling (card update via `_update_card`). The feishu transport handlers no longer need to know about tool_notify — they just send text messages.
 
-**5. FeishuInboundHandler outbound handling**
+**5. CCSessionHandler must strip `action` before forwarding to feishu**
 
-The tool_notify message arrives as a regular outbound message via `_handle_outbound`. The existing logic already sends `msg.payload` via `TransportSend`. The feishu transport handler sees `text` in payload and sends it as a text message. This should work without changes — verify in testing.
+When tool_notify is forwarded to downstream feishu actors, the payload contains `{"action": "tool_notify", "text": "..."}`. The feishu transport handler dispatches by `action` field — with `tool_notify` removed from the transport handler, this would hit the "unhandled action" warning. Fix: CCSessionHandler strips the `action` key and sends only `{"text": "..."}` to downstream, so the feishu transport handler treats it as a plain text message (action=None path).
 
-**6. Hook stays unchanged**
+```python
+# In CCSessionHandler.handle:
+if action == "tool_notify":
+    text_msg = Message(sender=msg.sender, payload={"text": msg.payload.get("text", "")})
+    return [Send(to=addr, message=text_msg) for addr in actor.downstream]
+```
+
+**6. Remove dead code from feishu adapter**
+
+After removing tool_card actor, these methods become dead code:
+- `create_tool_card()` — no longer called from anywhere
+- `_build_tool_card()` — only used by create_tool_card
+- `_update_card()` — only called by tool_notify transport handler (being removed)
+
+Remove all three.
+
+**7. Remove tool_card spawn from CC adapter legacy spawn path**
+
+`adapters/cc/adapter.py` lines ~418-433 still have legacy code that spawns `tool_card:*` actors during the old MCP-driven spawn flow (inside `_handle_spawn` which was supposed to be deleted). Verify this code is gone (it should have been removed in the session-mgr refactoring). If any references remain, remove them.
+
+**8. Hook stays unchanged**
 
 `notify-channel.sh` continues to send `{"action": "tool_notify", "chat_id": "...", "text": "..."}` via anonymous WebSocket. No changes needed.
 
 ## What Gets Removed
 
 - `channel_server/core/handlers/tool_card.py` (entire file)
-- `tool_card` from HANDLER_REGISTRY
+- `tool_card` from HANDLER_REGISTRY and `__init__.py`
 - `tool_card:*` actor spawning (on_spawn, init_session)
 - `StopActor(tool_card:*)` from CCSessionHandler.on_stop
-- `tool_notify` case in feishu transport handlers
+- `tool_notify` case in feishu transport handlers (`_handle_chat_transport`, `_handle_thread_transport`)
 - `create_tool_card` TransportSend from FeishuInboundHandler.on_spawn
+- Dead code: `create_tool_card()`, `_build_tool_card()`, `_update_card()` from feishu adapter
+- Any remaining tool_card references in CC adapter
 
 ## Testing
 
-- Update `test_handler.py`: Remove ToolCardHandler tests, update CCSessionHandler tool_notify test to verify routing to downstream
-- Update `test_session_mgr.py`: Update init_session test (no more tool_card spawn)
+- Update `test_handler.py`: Remove ToolCardHandler tests, update CCSessionHandler tool_notify test to verify routing to downstream as text
+- Update `test_session_mgr.py`: Update `test_init_session_root` — _handle_init now returns `[]` for root mode
+- Update `test_cc_session_on_stop_stops_children`: Remove tool_card from expected StopActor addresses
 - Integration: Verify tool_notify messages appear in feishu thread as text

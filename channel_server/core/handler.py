@@ -5,11 +5,9 @@ from typing import Protocol
 
 from channel_server.core.actor import Action, Actor, Message
 from channel_server.core.handlers import (
-    AdminHandler,
     CCSessionHandler,
     FeishuInboundHandler,
     ForwardAllHandler,
-    SessionMgrHandler,
 )
 
 
@@ -39,8 +37,7 @@ HANDLER_REGISTRY: dict[str, Handler] = {
     "feishu_inbound": FeishuInboundHandler(),
     "cc_session": CCSessionHandler(),
     "forward_all": ForwardAllHandler(),
-    "admin": AdminHandler(),
-    "session_mgr": SessionMgrHandler(),
+    "admin": ForwardAllHandler(),
 }
 
 

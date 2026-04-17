@@ -7,7 +7,6 @@ import pytest
 
 from channel_server.core.actor import Actor, Message, Send, TransportSend, UpdateActor
 from channel_server.core.handler import (
-    AdminHandler,
     CCSessionHandler,
     FeishuInboundHandler,
     ForwardAllHandler,
@@ -332,97 +331,15 @@ def test_get_handler_raises_on_unknown():
 
 
 # ---------------------------------------------------------------------------
-# 16. AdminHandler — /help
+# 16. get_handler("admin") now returns ForwardAllHandler
 # ---------------------------------------------------------------------------
 
-def test_admin_help_command():
-    actor = make_actor(
-        address="system:admin",
-        handler="admin",
-        downstream=["cc:user.root"],
-    )
-    msg = make_msg(sender="feishu_user:u1", payload={"text": "/help"})
-    actions = AdminHandler().handle(actor, msg)
-    assert len(actions) == 1
-    assert isinstance(actions[0], Send)
-    assert actions[0].to == "cc:user.root"
-    assert "/help" in actions[0].message.payload["text"]
-    assert "/spawn" in actions[0].message.payload["text"]
+def test_get_handler_admin_returns_forward_all():
+    assert isinstance(get_handler("admin"), ForwardAllHandler)
 
 
 # ---------------------------------------------------------------------------
-# 17. AdminHandler — unknown command
-# ---------------------------------------------------------------------------
-
-def test_admin_unknown_command():
-    actor = make_actor(
-        address="system:admin",
-        handler="admin",
-        downstream=["cc:user.root"],
-    )
-    msg = make_msg(sender="feishu_user:u1", payload={"text": "/foobar"})
-    actions = AdminHandler().handle(actor, msg)
-    assert len(actions) == 1
-    assert isinstance(actions[0], Send)
-    assert "/foobar" in actions[0].message.payload["text"]
-
-
-# ---------------------------------------------------------------------------
-# 18. AdminHandler — session commands no longer route to session-mgr
-# (removed in Task 12: SESSION_COMMANDS is now empty; all session commands
-# are handled by the unified command registry before reaching AdminHandler)
-# ---------------------------------------------------------------------------
-
-# ---------------------------------------------------------------------------
-# 19. AdminHandler — system notification forward (msg_type in payload)
-# ---------------------------------------------------------------------------
-
-def test_admin_system_notification_forward():
-    actor = make_actor(
-        address="system:admin",
-        handler="admin",
-        downstream=["cc:user.root", "feishu:test_app:chat1"],
-    )
-    msg = make_msg(
-        sender="system:runtime",
-        payload={"msg_type": "system", "text": "server online"},
-    )
-    actions = AdminHandler().handle(actor, msg)
-    assert len(actions) == 2
-    targets = {a.to for a in actions}
-    assert targets == {"cc:user.root", "feishu:test_app:chat1"}
-    for action in actions:
-        assert isinstance(action, Send)
-        assert action.message is msg
-
-
-# ---------------------------------------------------------------------------
-# 20. AdminHandler — non-slash message passthrough
-# ---------------------------------------------------------------------------
-
-def test_admin_non_slash_passthrough():
-    actor = make_actor(
-        address="system:admin",
-        handler="admin",
-        downstream=["cc:user.root"],
-    )
-    msg = make_msg(sender="feishu_user:u1", payload={"text": "hello there"})
-    actions = AdminHandler().handle(actor, msg)
-    assert len(actions) == 1
-    assert isinstance(actions[0], Send)
-    assert actions[0].message is msg
-
-
-# ---------------------------------------------------------------------------
-# 21. get_handler returns admin handler
-# ---------------------------------------------------------------------------
-
-def test_get_handler_returns_admin():
-    assert isinstance(get_handler("admin"), AdminHandler)
-
-
-# ---------------------------------------------------------------------------
-# 21b. CCSessionHandler.on_spawn — emits spawn_tmux for child, noop for root
+# 17. CCSessionHandler.on_spawn — emits spawn_tmux for child, noop for root
 # ---------------------------------------------------------------------------
 
 def test_cc_session_on_spawn_emits_tmux_spawn():
@@ -521,7 +438,6 @@ def test_handler_receives_runtime_arg():
     actor = make_actor(address="system:admin", handler="admin", downstream=["cc:user.root"])
     msg = make_msg(sender="feishu_user:u1", payload={"text": "hello"})
 
-    AdminHandler().handle(actor, msg, runtime)
     FeishuInboundHandler().handle(actor, msg, runtime)
     CCSessionHandler().handle(actor, msg, runtime)
     ForwardAllHandler().handle(actor, msg, runtime)

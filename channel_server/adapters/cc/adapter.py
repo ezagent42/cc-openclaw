@@ -202,19 +202,6 @@ class CCAdapter:
             )
             if handled:
                 return
-            # Fall through to legacy if dispatcher returned False
-            # (fallback_on_unknown=True during Phase 2-3)
-
-        # -- Legacy session-cmd handling (still active during migration) --
-        if action == "spawn_session":
-            await self._forward_session_cmd(ws, msg)
-            return
-        if action == "kill_session":
-            await self._forward_session_cmd(ws, msg)
-            return
-        if action == "list_sessions":
-            await self._forward_session_cmd(ws, msg)
-            return
 
         if action == "pong":
             return  # ignore keepalive pongs
@@ -286,23 +273,6 @@ class CCAdapter:
                 log.info("Wired %s → %s", address, feishu_addr)
                 self.runtime.wire("system:admin", address)
                 log.info("Wired system:admin → %s", address)
-
-                # Notify session-mgr to initialize root session (tool card, etc.)
-                user = instance_id.split(".")[0]
-                from channel_server.core.actor import Message as ActorMessage
-                self.runtime.send(
-                    "system:session-mgr",
-                    ActorMessage(
-                        sender=address,
-                        payload={
-                            "user": user,
-                            "session_name": "root",
-                            "chat_id": chat_id,
-                            "mode": "root",
-                        },
-                        metadata={"type": "init_session"},
-                    ),
-                )
 
         await ws.send(json.dumps({"action": "registered", "address": address}))
 
@@ -417,76 +387,6 @@ class CCAdapter:
                     return
 
         log.debug("_route_anonymous_tool_notify: no cc actor for chat_id=%s session=%s", chat_id, session)
-
-    # ------------------------------------------------------------------
-    # Session management — spawn / kill / list
-    # ------------------------------------------------------------------
-
-    async def _forward_session_cmd(self, ws, msg: dict) -> None:
-        """Handle session commands (kill/list).
-
-        spawn_session is now handled by the unified command registry (spawn_cmd).
-        kill/list are forwarded to session-mgr actor.
-        """
-        address = self._ws_to_address.get(id(ws))
-        if not address:
-            await ws.send(json.dumps({"action": "error", "message": "Not registered"}))
-            return
-
-        parts = address.replace("cc:", "").split(".")
-        user = parts[0] if parts else "unknown"
-
-        # Find chat_id from root actor's downstream feishu actor
-        root_actor = self.runtime.lookup(address)
-        chat_id = ""
-        app_id = self.feishu_adapter.app_id if self.feishu_adapter else ""
-        if root_actor:
-            for ds_addr in root_actor.downstream:
-                ds = self.runtime.lookup(ds_addr)
-                if ds and ds.transport and ds.transport.type == "feishu_chat":
-                    chat_id = ds.transport.config.get("chat_id", "")
-                    break
-
-        action = msg.get("action", "")
-        session_name = msg.get("session_name", "")
-
-        if action == "spawn_session":
-            # spawn_session is handled by the unified command registry before
-            # reaching _forward_session_cmd in the live system. If we get here
-            # it is a routing error — log and respond with an error.
-            log.error(
-                "_forward_session_cmd: spawn_session reached legacy path for %s; "
-                "should have been intercepted by CommandDispatcher",
-                address,
-            )
-            await ws.send(json.dumps({
-                "action": "spawn_result", "ok": False,
-                "text": "Internal error: spawn reached legacy path",
-            }))
-            return
-
-        # kill/list → forward to session-mgr
-        if action == "kill_session":
-            text = f"/kill {session_name}"
-        elif action == "list_sessions":
-            text = "/sessions"
-        else:
-            return
-
-        from channel_server.core.actor import Message as ActorMessage
-        self.runtime.send(
-            "system:session-mgr",
-            ActorMessage(
-                sender=address,
-                payload={"text": text, "user": user, "chat_id": chat_id, "app_id": app_id},
-            ),
-        )
-
-        await ws.send(json.dumps({
-            "action": f"{action}_ack",
-            "ok": True,
-            "text": f"Command forwarded: {text}",
-        }))
 
     # ------------------------------------------------------------------
     # Process management

@@ -12,12 +12,13 @@ import channel_server.commands.builtin  # noqa: F401
 def _ctx_partial(**overrides):
     """Partial ctx to pass into dispatch_from_adapter. The dispatcher injects
     `feishu`, `cc`, `runtime` from the adapter/runtime wiring — tests override
-    those by passing a bundle adapter via `adapter=`."""
+    those by passing a bundle adapter via `adapter=`. Scope-injected fields
+    (current_actor, parent_actor, thread_root_id) are populated by resolve_scope
+    based on source_actor and default to None on CommandContext."""
     base = {
         "source": "feishu", "user": "feishu_user:alice", "chat_id": "oc_chat",
         "app_id": "fake_app",
-        "current_actor": None, "parent_actor": None,
-        "thread_root_id": None, "raw_msg": None,
+        "raw_msg": None,
     }
     base.update(overrides)
     return base

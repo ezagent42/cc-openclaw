@@ -7,7 +7,7 @@ from __future__ import annotations
 
 import pytest
 
-from channel_server.core.actor import Actor, Transport
+from channel_server.core.actor import Actor
 
 
 class FakeFeishuAdapter:

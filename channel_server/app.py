@@ -81,6 +81,18 @@ class ChannelServerApp:
                 from channel_server.adapters.feishu.adapter import FeishuAdapter
                 self.feishu_adapter = FeishuAdapter(self.runtime, feishu_client)
                 self.cc_adapter.feishu_adapter = self.feishu_adapter
+
+                # Construct CommandDispatcher and inject into both adapters.
+                # fallback_on_unknown=False since Phase 4 — unknown commands are hard errors.
+                from channel_server.commands.dispatcher import CommandDispatcher
+                import channel_server.commands.builtin  # trigger /help registration
+                self._dispatcher = CommandDispatcher(
+                    self.runtime, self.feishu_adapter, self.cc_adapter,
+                    fallback_on_unknown=False,
+                )
+                self.feishu_adapter.set_dispatcher(self._dispatcher)
+                self.cc_adapter.set_dispatcher(self._dispatcher)
+
                 log.info("Feishu adapter initialized")
 
                 # Start Feishu WS event listener
@@ -125,11 +137,6 @@ class ChannelServerApp:
                     tag="admin",
                 )
             log.info("Spawned admin actor: %s", admin_actor_addr)
-
-        # 5b. Spawn session-mgr actor (global singleton, no transport)
-        if self.runtime.lookup("system:session-mgr") is None:
-            self.runtime.spawn("system:session-mgr", "session_mgr", tag="session-mgr")
-            log.info("Spawned session-mgr actor")
 
         if self.admin_chat_id and self.feishu_adapter:
             # Send startup notification

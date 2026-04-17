@@ -54,27 +54,6 @@ def test_echo_prevention():
     assert actions == []
 
 
-def test_feishu_inbound_on_spawn_child_creates_anchor():
-    """on_spawn for child mode creates thread anchor only."""
-    from channel_server.core.actor import Transport, TransportSend
-
-    actor = make_actor(
-        address="feishu:test_app:oc_test:thread:dev",
-        tag="dev",
-        handler="feishu_inbound",
-        metadata={"chat_id": "oc_test", "tag": "dev", "mode": "child"},
-    )
-    actor.transport = Transport(type="feishu_thread", config={"chat_id": "oc_test"})
-
-    actions = FeishuInboundHandler().on_spawn(actor)
-    assert len(actions) == 1  # only anchor, no tool card
-
-    anchor_action = actions[0]
-    assert isinstance(anchor_action, TransportSend)
-    assert anchor_action.payload["action"] == "create_thread_anchor"
-    assert anchor_action.payload["tag"] == "dev"
-
-
 def test_feishu_inbound_on_spawn_no_mode_noop():
     """on_spawn without mode metadata returns empty."""
     actor = make_actor(handler="feishu_inbound")

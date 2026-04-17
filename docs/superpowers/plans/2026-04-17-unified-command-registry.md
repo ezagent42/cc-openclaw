@@ -12,6 +12,41 @@
 
 ---
 
+## Real-API Reference (Verified 2026-04-17 — Read This First)
+
+The plan's code snippets use these verified names and signatures. If you see any invented-looking names during implementation, cross-check here:
+
+**FeishuAdapter** (`channel_server/adapters/feishu/adapter.py`):
+- `self.app_id: str` — single attribute set at startup (line 48). NOT a per-chat lookup.
+- `async def create_thread_anchor(chat_id, tag) -> str | None` (line 647) — returns anchor msg_id
+- `async def pin_message(message_id) -> bool` (line 695)
+- `async def unpin_message(message_id) -> bool` (line 713)
+- **No `create_tool_card` method exists** in the codebase. The tool_card actor was removed in a prior refactor. Spawn flow does NOT create a tool card explicitly; the anchor card serves that role via `_update_anchor_card`.
+
+**CCAdapter** (`channel_server/adapters/cc/adapter.py`):
+- `self.feishu_adapter` — reference to FeishuAdapter, set by startup wiring
+- `def spawn_cc_process(user, session_name, tag="", chat_id="") -> bool` (line 450) — **SYNC**, starts tmux
+- `def kill_cc_process(user, session_name) -> None` (line 480) — **SYNC**
+
+**ActorRuntime** (`channel_server/core/runtime.py`):
+- `def spawn(address, handler, *, tag="", parent=None, downstream=None, state="active", metadata=None, transport=None) -> Actor` (line 40) — **SYNC**
+- `async def stop(address) -> None` (line 77) — **ASYNC, must be awaited**
+- `def lookup(address) -> Actor | None` (line 124) — **SYNC**
+- `self.actors: dict[str, Actor]` — direct dict access for iteration
+
+**Real `_handle_spawn` flow** (`adapters/cc/adapter.py:379-444`) — what the spawn command must mirror:
+1. `await feishu_adapter.create_thread_anchor(chat_id, tag)` → anchor_msg_id
+2. `await feishu_adapter.pin_message(anchor_msg_id)`
+3. `runtime.spawn(thread_addr, "feishu_inbound", tag=tag, transport=Transport(type="feishu_thread", config={"chat_id": chat_id, "root_id": anchor_msg_id}), downstream=[cc_addr])`
+4. `runtime.spawn(cc_addr, "cc_session", tag=tag, state="suspended", parent=f"cc:{user}.root", downstream=[thread_addr], metadata={"anchor_msg_id": anchor_msg_id, "chat_id": chat_id})`
+5. `spawn_cc_process(user, session_name, tag=tag, chat_id=chat_id)` → bool (if False, rollback via `await runtime.stop(...)`)
+
+**`state="suspended"` is intentional.** The CC actor is suspended until tmux's WS connection arrives and transitions it to "active" — that's the existing design, not the Goal #4 bug. Goal #4 was `SessionMgrHandler._handle_spawn` creating suspended actors WITHOUT starting tmux. The fix is to ensure `spawn_cc_process` is called from the unified command, not to change initial state.
+
+**`FeishuInboundHandler.on_spawn`** (`core/handlers/feishu.py:78-93`) — currently emits ONE `TransportSend(create_thread_anchor)` when `metadata.mode == "child"`. No pin, no tool_card. This is what Task 16 removes to prevent the duplicate anchor.
+
+---
+
 ## File Map
 
 | Action | File | Change |
@@ -122,17 +157,21 @@ from channel_server.core.actor import Message
 class CommandContext:
     """Everything a command function needs.
 
-    `adapter` and `runtime` are typed `Any` to avoid import cycles; in practice
-    they are the adapter instance that received the command and the project's
-    ActorRuntime.
+    `feishu`, `cc`, and `runtime` are typed `Any` to avoid import cycles. In
+    practice: `feishu` is FeishuAdapter, `cc` is CCAdapter, `runtime` is
+    ActorRuntime. Both adapters are populated regardless of which one received
+    the command, because commands like /spawn need both.
     """
     source: str                         # "feishu" | "cc_mcp"
     user: str                           # feishu_user:xxx
     chat_id: str | None                 # top-level Feishu chat id
+    app_id: str                         # FeishuAdapter.app_id (for actor address)
     current_actor: str | None           # actor this command originated from
     parent_actor: str | None            # current_actor's parent
+    thread_root_id: str | None          # root_id if the command came from a thread
     raw_msg: Message | None             # original inbound message (for reply)
-    adapter: Any                        # adapter that received the command
+    feishu: Any                         # FeishuAdapter — always populated
+    cc: Any                             # CCAdapter — always populated
     runtime: Any                        # ActorRuntime
 ```
 
@@ -474,9 +513,10 @@ from channel_server.commands.scope import CommandScope
 
 def _ctx_partial(**overrides):
     base = {
-        "source": "test", "user": "u", "chat_id": "c",
-        "current_actor": None, "parent_actor": None,
-        "raw_msg": None, "adapter": MagicMock(), "runtime": MagicMock(),
+        "source": "test", "user": "u", "chat_id": "c", "app_id": "fake_app",
+        "current_actor": None, "parent_actor": None, "thread_root_id": None,
+        "raw_msg": None, "feishu": MagicMock(), "cc": MagicMock(),
+        "runtime": MagicMock(),
     }
     base.update(overrides)
     return base
@@ -747,111 +787,135 @@ def resolve_scope(
 Write `tests/channel_server/commands/conftest.py`:
 
 ```python
-"""Shared fixtures for command tests."""
+"""Shared fixtures for command tests.
+
+Fakes mirror the REAL adapter method names from channel_server/adapters/*.
+Do NOT invent method names — the command code uses these exact names.
+"""
 from __future__ import annotations
 
-from unittest.mock import MagicMock
+from unittest.mock import AsyncMock
 
 import pytest
 
-from channel_server.core.actor import Actor
+from channel_server.core.actor import Actor, Transport
 
 
-class FakeAdapter:
-    """Records reply / reply_error calls."""
+class FakeFeishuAdapter:
+    """Mirrors FeishuAdapter public surface used by commands.
+
+    Real methods (verified 2026-04-17):
+      async create_thread_anchor(chat_id, tag) -> str | None
+      async pin_message(message_id) -> bool
+      async unpin_message(message_id) -> bool
+      attribute: app_id: str
+    """
     def __init__(self):
-        self.replies: list[tuple[dict, str]] = []
-        self.errors: list[tuple[dict, str]] = []
-
-    async def reply(self, ctx, text):
-        self.replies.append((ctx, text))
-
-    async def reply_error(self, ctx_partial, text):
-        self.errors.append((ctx_partial, text))
-
-
-class FakeFeishuAdapter(FakeAdapter):
-    """Records Feishu I/O calls for spawn tests."""
-    def __init__(self):
-        super().__init__()
+        self.app_id = "fake_app"
         self.created_anchors: list[tuple[str, str]] = []
         self.pinned: list[str] = []
-        self.tool_cards: list[tuple[str, str]] = []
         self.unpinned: list[str] = []
-
-    async def create_thread_anchor(self, chat_id, tag):
-        anchor = f"anchor_{tag}"
-        self.created_anchors.append((chat_id, tag))
-        return anchor
-
-    async def pin_message(self, anchor):
-        self.pinned.append(anchor)
-
-    async def unpin_message(self, anchor):
-        self.unpinned.append(anchor)
-
-    async def create_tool_card(self, chat_id, tag):
-        card = f"card_{tag}"
-        self.tool_cards.append((chat_id, tag))
-        return card
-
-    def app_id_for(self, chat_id):
-        return "fake_app"
-
-
-class FakeCCAdapter(FakeAdapter):
-    """Records CC I/O calls."""
-    def __init__(self):
-        super().__init__()
-        self.spawned_tmux: list[tuple[str, str, str, str]] = []
-        self.killed_tmux: list[str] = []
-
-    async def spawn_tmux(self, user, session_name, tag, cc_addr):
-        self.spawned_tmux.append((user, session_name, tag, cc_addr))
-
-    async def kill_tmux(self, user, session_name):
-        self.killed_tmux.append(f"{user}.{session_name}")
-
-
-class FakeAdapterBundle:
-    """What ctx.adapter exposes — composed from both sub-adapters."""
-    def __init__(self):
-        self.feishu = FakeFeishuAdapter()
-        self.cc = FakeCCAdapter()
-        self.replies: list[tuple[dict, str]] = []
+        self.replies: list[tuple[object, str]] = []
         self.errors: list[tuple[dict, str]] = []
 
+    async def create_thread_anchor(self, chat_id, tag):
+        self.created_anchors.append((chat_id, tag))
+        return f"anchor_{tag}"
+
+    async def pin_message(self, message_id):
+        self.pinned.append(message_id)
+        return True
+
+    async def unpin_message(self, message_id):
+        self.unpinned.append(message_id)
+        return True
+
+    # Reply surface used by commands (new method to be added to real adapter)
     async def reply(self, ctx, text):
         self.replies.append((ctx, text))
 
     async def reply_error(self, ctx_partial, text):
         self.errors.append((ctx_partial, text))
+
+
+class FakeCCAdapter:
+    """Mirrors CCAdapter public surface used by commands.
+
+    Real methods (verified 2026-04-17):
+      SYNC spawn_cc_process(user, session_name, tag="", chat_id="") -> bool
+      SYNC kill_cc_process(user, session_name) -> None
+    """
+    def __init__(self):
+        self.spawned: list[tuple[str, str, str, str]] = []
+        self.killed: list[tuple[str, str]] = []
+        self.spawn_cc_process_ok = True   # toggle for failure-path tests
+
+    def spawn_cc_process(self, user, session_name, tag="", chat_id=""):
+        self.spawned.append((user, session_name, tag, chat_id))
+        return self.spawn_cc_process_ok
+
+    def kill_cc_process(self, user, session_name):
+        self.killed.append((user, session_name))
 
 
 @pytest.fixture
-def fake_adapters():
-    return FakeAdapterBundle()
+def fake_feishu():
+    return FakeFeishuAdapter()
+
+
+@pytest.fixture
+def fake_cc():
+    return FakeCCAdapter()
+
+
+@pytest.fixture
+def fake_adapters(fake_feishu, fake_cc):
+    """Back-compat bundle for tests that reference .feishu / .cc /
+    .replies / .errors. New tests should use fake_feishu / fake_cc directly.
+    """
+    class _Bundle:
+        def __init__(self):
+            self.feishu = fake_feishu
+            self.cc = fake_cc
+            self.replies = fake_feishu.replies
+            self.errors = fake_feishu.errors
+
+        async def reply(self, ctx, text):
+            await fake_feishu.reply(ctx, text)
+
+        async def reply_error(self, ctx_partial, text):
+            await fake_feishu.reply_error(ctx_partial, text)
+    return _Bundle()
 
 
 @pytest.fixture
 def fake_runtime():
-    rt = MagicMock()
-    rt._actors = {}
-    rt.actors = rt._actors
-    rt.lookup.side_effect = lambda addr: rt._actors.get(addr)
-    def _spawn(address, **kwargs):
-        rt._actors[address] = Actor(address=address, handler=kwargs.get("handler", ""),
-                                    tag=kwargs.get("tag", ""),
-                                    parent=kwargs.get("parent"),
-                                    downstream=kwargs.get("downstream", []),
-                                    state=kwargs.get("state", "active"),
-                                    metadata=kwargs.get("metadata", {}))
-    rt.spawn.side_effect = _spawn
-    def _stop(addr):
-        if addr in rt._actors:
-            rt._actors[addr].state = "ended"
-    rt.stop.side_effect = _stop
-    return rt
+    """Lightweight actor-store fake. runtime.stop is ASYNC (matches real)."""
+    class _Runtime:
+        def __init__(self):
+            self.actors: dict[str, Actor] = {}
+            self.stop_calls: list[str] = []
+
+        def spawn(self, address, handler, *, tag="", parent=None,
+                  downstream=None, state="active", metadata=None, transport=None):
+            actor = Actor(
+                address=address, handler=handler, tag=tag, parent=parent,
+                downstream=list(downstream or []),
+                state=state, metadata=dict(metadata or {}),
+                transport=transport,
+            )
+            self.actors[address] = actor
+            return actor
+
+        async def stop(self, address):
+            self.stop_calls.append(address)
+            if address in self.actors:
+                self.actors[address].state = "ended"
+
+        def lookup(self, address):
+            return self.actors.get(address)
+
+    return _Runtime()
 ```
 
 - [ ] **Step 3: Write tests for resolve_scope**
@@ -937,8 +1001,17 @@ log = logging.getLogger(__name__)
 
 
 class CommandDispatcher:
-    def __init__(self, runtime: Any, *, fallback_on_unknown: bool = False):
+    def __init__(
+        self,
+        runtime: Any,
+        feishu_adapter: Any,
+        cc_adapter: Any,
+        *,
+        fallback_on_unknown: bool = False,
+    ):
         self._runtime = runtime
+        self._feishu = feishu_adapter
+        self._cc = cc_adapter
         # During migration, True lets unregistered commands fall through to the
         # legacy actor pipeline. Flipped to False at Phase 4 cleanup.
         self._fallback_on_unknown = fallback_on_unknown
@@ -960,6 +1033,10 @@ class CommandDispatcher:
     ) -> bool:
         """Returns True iff the command was handled here (adapter should stop).
 
+        `adapter` is the adapter that received the command (used for reply_error
+        on the error paths). The command function itself uses ctx.feishu / ctx.cc
+        which are injected here from the dispatcher's stored references.
+
         Returns False for non-command text OR, when fallback_on_unknown is True,
         for unregistered commands (so adapter can deliver to the legacy pipeline).
         """
@@ -968,7 +1045,12 @@ class CommandDispatcher:
             return False
 
         invocation = parse_command(normalized)
-        ctx_partial = {**ctx_partial, "adapter": adapter, "runtime": self._runtime}
+        ctx_partial = {
+            **ctx_partial,
+            "feishu": self._feishu,
+            "cc": self._cc,
+            "runtime": self._runtime,
+        }
 
         try:
             scope = resolve_scope(source_actor, self._runtime)
@@ -992,6 +1074,13 @@ class CommandDispatcher:
         return True
 ```
 
+Dispatcher construction at startup (Task 8):
+```python
+command_dispatcher = CommandDispatcher(
+    runtime, feishu_adapter, cc_adapter, fallback_on_unknown=True,
+)
+```
+
 - [ ] **Step 5: Add dispatcher tests**
 
 Append to `tests/channel_server/commands/test_registry.py`:
@@ -1003,24 +1092,27 @@ from channel_server.commands.scope import CommandScope
 
 @pytest.mark.asyncio
 async def test_dispatcher_non_command_returns_false(fake_adapters, fake_runtime):
-    d = CommandDispatcher(fake_runtime)
+    d = CommandDispatcher(fake_runtime, fake_adapters.feishu, fake_adapters.cc)
     handled = await d.dispatch_from_adapter(
         adapter=fake_adapters, raw_text="hello",
         source_actor=None, ctx_partial={"source": "feishu", "user": "u", "chat_id": "c",
+                                        "app_id": "fake_app",
                                         "current_actor": None, "parent_actor": None,
-                                        "raw_msg": None}
+                                        "thread_root_id": None, "raw_msg": None}
     )
     assert handled is False
 
 
 @pytest.mark.asyncio
 async def test_dispatcher_unknown_command_with_fallback_returns_false(fake_adapters, fake_runtime):
-    d = CommandDispatcher(fake_runtime, fallback_on_unknown=True)
+    d = CommandDispatcher(fake_runtime, fake_adapters.feishu, fake_adapters.cc,
+                          fallback_on_unknown=True)
     handled = await d.dispatch_from_adapter(
         adapter=fake_adapters, raw_text="/nope",
         source_actor=None, ctx_partial={"source": "feishu", "user": "u", "chat_id": "c",
+                                        "app_id": "fake_app",
                                         "current_actor": None, "parent_actor": None,
-                                        "raw_msg": None}
+                                        "thread_root_id": None, "raw_msg": None}
     )
     assert handled is False
     assert fake_adapters.errors == []
@@ -1028,12 +1120,14 @@ async def test_dispatcher_unknown_command_with_fallback_returns_false(fake_adapt
 
 @pytest.mark.asyncio
 async def test_dispatcher_unknown_command_no_fallback_replies_error(fake_adapters, fake_runtime):
-    d = CommandDispatcher(fake_runtime, fallback_on_unknown=False)
+    d = CommandDispatcher(fake_runtime, fake_adapters.feishu, fake_adapters.cc,
+                          fallback_on_unknown=False)
     handled = await d.dispatch_from_adapter(
         adapter=fake_adapters, raw_text="/nope",
         source_actor=None, ctx_partial={"source": "feishu", "user": "u", "chat_id": "c",
+                                        "app_id": "fake_app",
                                         "current_actor": None, "parent_actor": None,
-                                        "raw_msg": None}
+                                        "thread_root_id": None, "raw_msg": None}
     )
     assert handled is True
     assert len(fake_adapters.errors) == 1
@@ -1090,9 +1184,14 @@ import channel_server.commands.builtin  # noqa: F401
 
 
 def _ctx_partial(**overrides):
+    """Partial ctx to pass into dispatch_from_adapter. The dispatcher injects
+    `feishu`, `cc`, `runtime` from the adapter/runtime wiring — tests override
+    those by passing a bundle adapter via `adapter=`."""
     base = {
-        "source": "feishu", "user": "u", "chat_id": "c",
-        "current_actor": None, "parent_actor": None, "raw_msg": None,
+        "source": "feishu", "user": "feishu_user:alice", "chat_id": "oc_chat",
+        "app_id": "fake_app",
+        "current_actor": None, "parent_actor": None,
+        "thread_root_id": None, "raw_msg": None,
     }
     base.update(overrides)
     return base
@@ -1100,7 +1199,7 @@ def _ctx_partial(**overrides):
 
 @pytest.mark.asyncio
 async def test_help_replies_with_command_list(fake_adapters, fake_runtime):
-    d = CommandDispatcher(fake_runtime)
+    d = CommandDispatcher(fake_runtime, fake_adapters.feishu, fake_adapters.cc)
     handled = await d.dispatch_from_adapter(
         adapter=fake_adapters, raw_text="/help",
         source_actor=None, ctx_partial=_ctx_partial(),
@@ -1141,7 +1240,8 @@ async def help_cmd(args, ctx: CommandContext):
         else:
             lines.append(f"/{name}")
     text = "\n".join(lines)
-    await ctx.adapter.reply(ctx, text)
+    # reply goes via FeishuAdapter.reply — a new method added in Task 8
+    await ctx.feishu.reply(ctx, text)
 ```
 
 - [ ] **Step 5: Run test to verify it passes**
@@ -1394,7 +1494,7 @@ If `CCAdapter` doesn't already hold `self._feishu_adapter`, add it via construct
 
 - [ ] **Step 6: Smoke test**
 
-From inside a running CC session, invoke the `list_sessions` MCP tool. The response should come via the unified path (`/sessions` is not yet ported, so with `fallback_on_unknown=True` the dispatcher returns False and the legacy `_handle_list_sessions` runs). Verify /help from a CC session replies into the thread.
+From inside a running CC session, invoke the `spawn_session` or `list_sessions` MCP tool. At this point `/sessions`, `/kill`, `/spawn` are not yet ported, so with `fallback_on_unknown=True` the dispatcher returns False and the legacy path runs. Only `/help` is served by the new path — verify that invoking `/help` from a CC session replies into the correct thread.
 
 - [ ] **Step 7: Commit**
 
@@ -1425,16 +1525,16 @@ from channel_server.core.actor import Actor
 @pytest.mark.asyncio
 async def test_sessions_lists_user_cc_actors(fake_adapters, fake_runtime):
     # Seed fake runtime with two cc actors for alice
-    fake_runtime._actors["cc:alice.main"] = Actor(
-        address="cc:alice.main", tag="main", handler="cc_session",
+    fake_runtime.spawn(
+        address="cc:alice.main", handler="cc_session", tag="main",
         parent="system:admin", state="active",
     )
-    fake_runtime._actors["cc:alice.sub"] = Actor(
-        address="cc:alice.sub", tag="sub", handler="cc_session",
+    fake_runtime.spawn(
+        address="cc:alice.sub", handler="cc_session", tag="sub",
         parent="cc:alice.main", state="active",
     )
 
-    d = CommandDispatcher(fake_runtime)
+    d = CommandDispatcher(fake_runtime, fake_adapters.feishu, fake_adapters.cc)
     handled = await d.dispatch_from_adapter(
         adapter=fake_adapters, raw_text="/sessions",
         source_actor=None,
@@ -1473,9 +1573,9 @@ async def sessions_cmd(args, ctx: CommandContext):
         if actor.address.startswith(user_prefix) and actor.state != "ended":
             rows.append(f"• {actor.tag} ({actor.address}) — {actor.state}")
     if not rows:
-        await ctx.adapter.reply(ctx, "当前没有活跃 sessions")
+        await ctx.feishu.reply(ctx, "当前没有活跃 sessions")
         return
-    await ctx.adapter.reply(ctx, "活跃 sessions:\n" + "\n".join(rows))
+    await ctx.feishu.reply(ctx, "活跃 sessions:\n" + "\n".join(rows))
 ```
 
 - [ ] **Step 4: Register in builtin init**
@@ -1538,36 +1638,41 @@ Append to `tests/channel_server/commands/test_dispatcher.py`:
 
 ```python
 @pytest.mark.asyncio
-async def test_kill_stops_actor_and_tmux(fake_adapters, fake_runtime):
-    fake_runtime._actors["cc:alice.foo"] = Actor(
-        address="cc:alice.foo", tag="foo", handler="cc_session",
+async def test_kill_stops_actor_and_kills_tmux(fake_adapters, fake_runtime):
+    # Seed the CC actor
+    fake_runtime.spawn(
+        address="cc:alice.foo", handler="cc_session", tag="foo",
         parent="system:admin", state="active",
         downstream=["feishu:fake_app:oc_chat:thread:foo"],
     )
-    fake_runtime._actors["feishu:fake_app:oc_chat:thread:foo"] = Actor(
+    fake_runtime.spawn(
         address="feishu:fake_app:oc_chat:thread:foo",
-        tag="foo", handler="feishu_inbound",
+        handler="feishu_inbound", tag="foo",
         parent="cc:alice.foo",
-        metadata={"root_id": "anchor_foo"},
+        transport=Transport(type="feishu_thread",
+                            config={"chat_id": "oc_chat", "root_id": "anchor_foo"}),
     )
 
-    d = CommandDispatcher(fake_runtime)
+    d = CommandDispatcher(fake_runtime, fake_adapters.feishu, fake_adapters.cc)
     handled = await d.dispatch_from_adapter(
         adapter=fake_adapters, raw_text="/kill foo",
         source_actor=None,
         ctx_partial=_ctx_partial(user="feishu_user:alice", chat_id="oc_chat"),
     )
     assert handled is True
-    stopped_addrs = [call.args[0] for call in fake_runtime.stop.call_args_list]
-    assert "cc:alice.foo" in stopped_addrs
-    assert "feishu:fake_app:oc_chat:thread:foo" in stopped_addrs
-    assert fake_adapters.feishu.unpinned == ["anchor_foo"]
-    assert fake_adapters.cc.killed_tmux == ["alice.foo"]
+    # Actors stopped via the runtime's async stop
+    assert "cc:alice.foo" in fake_runtime.stop_calls
+    assert "feishu:fake_app:oc_chat:thread:foo" in fake_runtime.stop_calls
+    # Tmux process killed via sync kill_cc_process
+    assert fake_adapters.cc.killed == [("alice", "foo")]
+    # Note: unpin_message is NOT called directly by kill_cmd — it's emitted by
+    # FeishuInboundHandler.on_stop via TransportSend. Verifying that is an
+    # actor-pipeline concern, out of scope for this command-level test.
 
 
 @pytest.mark.asyncio
 async def test_kill_missing_name_bad_args(fake_adapters, fake_runtime):
-    d = CommandDispatcher(fake_runtime)
+    d = CommandDispatcher(fake_runtime, fake_adapters.feishu, fake_adapters.cc)
     handled = await d.dispatch_from_adapter(
         adapter=fake_adapters, raw_text="/kill",
         source_actor=None,
@@ -1615,32 +1720,22 @@ async def kill_cmd(args: KillArgs, ctx: CommandContext):
     if actor is None:
         raise CommandError(f"session '{args.name}' not found")
 
-    # Find the feishu thread actor in downstream to recover root_id (anchor)
-    thread_addr = None
-    anchor = None
-    for d_addr in actor.downstream:
-        if d_addr.startswith("feishu:"):
-            thread_addr = d_addr
-            thread_actor = ctx.runtime.lookup(d_addr)
-            if thread_actor is not None:
-                anchor = (
-                    thread_actor.metadata.get("root_id")
-                    or (thread_actor.transport.config.get("root_id")
-                        if thread_actor.transport else None)
-                )
-            break
+    # Find the downstream feishu thread actor (if any)
+    thread_addr = next(
+        (d for d in actor.downstream if d.startswith("feishu:")),
+        None,
+    )
 
-    # Tear down I/O
-    await ctx.adapter.cc.kill_tmux(user, args.name)
-    if anchor:
-        await ctx.adapter.feishu.unpin_message(anchor)
+    # Kill the tmux process first (sync — returns None)
+    ctx.cc.kill_cc_process(user, args.name)
 
-    # Stop actors
-    ctx.runtime.stop(cc_addr)
+    # Stop the actors via runtime.stop (ASYNC). on_stop hooks will emit
+    # unpin + anchor-update TransportSend actions automatically.
+    await ctx.runtime.stop(cc_addr)
     if thread_addr:
-        ctx.runtime.stop(thread_addr)
+        await ctx.runtime.stop(thread_addr)
 
-    await ctx.adapter.reply(ctx, f"Session {args.name} ended")
+    await ctx.feishu.reply(ctx, f"Session {args.name} ended")
 ```
 
 - [ ] **Step 4: Register in builtin init**
@@ -1688,7 +1783,7 @@ This is the biggest task. The new `spawn` command combines the I/O sequence from
 **Files:**
 - Create: `channel_server/commands/builtin/spawn.py`
 - Modify: `channel_server/commands/builtin/__init__.py`
-- Modify: `channel_server/adapters/cc/adapter.py` (delete `_handle_spawn` lines 361-436)
+- Modify: `channel_server/adapters/cc/adapter.py` (delete `_handle_spawn` lines 379-444)
 - Modify: `channel_server/core/handlers/session_mgr.py` (delete `_handle_spawn`)
 - Modify: `channel_server/core/handlers/admin.py` (delete `SESSION_COMMANDS`)
 - Modify: `tests/channel_server/commands/test_dispatcher.py`
@@ -1706,7 +1801,7 @@ Take notes on:
 - Metadata keys expected by FeishuInboundHandler (`chat_id`, `tag`, `mode`, `root_id`)
 - Transport type (`feishu_thread`) and config keys (`chat_id`, `root_id`)
 - The CC actor fields (`tag`, `parent`, `downstream`, `state`, `metadata`)
-- What `spawn_cc_process` / `spawn_tmux` expects as arguments
+- What `spawn_cc_process` expects as arguments
 
 - [ ] **Step 2: Write failing test — main chat spawn**
 
@@ -1715,7 +1810,7 @@ Append to `tests/channel_server/commands/test_dispatcher.py`:
 ```python
 @pytest.mark.asyncio
 async def test_spawn_main_chat_full_io_sequence(fake_adapters, fake_runtime):
-    d = CommandDispatcher(fake_runtime)
+    d = CommandDispatcher(fake_runtime, fake_adapters.feishu, fake_adapters.cc)
     handled = await d.dispatch_from_adapter(
         adapter=fake_adapters, raw_text="/spawn foo",
         source_actor=None,
@@ -1723,33 +1818,28 @@ async def test_spawn_main_chat_full_io_sequence(fake_adapters, fake_runtime):
     )
     assert handled is True
 
-    # I/O order: anchor, pin, tool card, tmux
+    # I/O order: anchor created first, then pinned, then tmux started
     assert fake_adapters.feishu.created_anchors == [("oc_chat", "foo")]
     assert fake_adapters.feishu.pinned == ["anchor_foo"]
-    assert fake_adapters.feishu.tool_cards == [("oc_chat", "foo")]
-    assert fake_adapters.cc.spawned_tmux == [
-        ("alice", "foo", "foo", "cc:alice.foo")
-    ]
+    assert fake_adapters.cc.spawned == [("alice", "foo", "foo", "oc_chat")]
 
-    # Actor registration — active, not suspended (Goal #4 fix)
-    cc_actor = fake_runtime._actors["cc:alice.foo"]
-    assert cc_actor.state == "active"
+    # Actor registration — matches legacy flow (suspended until WS connects)
+    cc_actor = fake_runtime.actors["cc:alice.foo"]
+    assert cc_actor.state == "suspended"
     # Address scheme preserved from legacy
-    assert "feishu:fake_app:oc_chat:thread:foo" in fake_runtime._actors
+    assert "feishu:fake_app:oc_chat:thread:foo" in fake_runtime.actors
 
 
 @pytest.mark.asyncio
 async def test_spawn_from_cc_session_sets_parent_actor(fake_adapters, fake_runtime):
     # Seed an existing main session
-    fake_runtime._actors["cc:alice.main"] = Actor(
-        address="cc:alice.main", tag="main", handler="cc_session",
+    fake_runtime.spawn(address="system:admin", handler="admin", parent=None)
+    fake_runtime.spawn(
+        address="cc:alice.main", handler="cc_session", tag="main",
         parent="system:admin", state="active",
     )
-    fake_runtime._actors["system:admin"] = Actor(
-        address="system:admin", tag="admin", handler="admin", parent=None,
-    )
 
-    d = CommandDispatcher(fake_runtime)
+    d = CommandDispatcher(fake_runtime, fake_adapters.feishu, fake_adapters.cc)
     handled = await d.dispatch_from_adapter(
         adapter=fake_adapters, raw_text="/spawn sub",
         source_actor="cc:alice.main",
@@ -1757,7 +1847,7 @@ async def test_spawn_from_cc_session_sets_parent_actor(fake_adapters, fake_runti
     )
     assert handled is True
 
-    cc_actor = fake_runtime._actors["cc:alice.sub"]
+    cc_actor = fake_runtime.actors["cc:alice.sub"]
     # New actor's parent is the session that invoked /spawn
     assert cc_actor.parent == "cc:alice.main"
 
@@ -1765,7 +1855,7 @@ async def test_spawn_from_cc_session_sets_parent_actor(fake_adapters, fake_runti
 @pytest.mark.asyncio
 async def test_spawn_with_quoted_prefix(fake_adapters, fake_runtime):
     """Goal #3 regression: Feishu thread reply auto-prepends quoted content."""
-    d = CommandDispatcher(fake_runtime)
+    d = CommandDispatcher(fake_runtime, fake_adapters.feishu, fake_adapters.cc)
     handled = await d.dispatch_from_adapter(
         adapter=fake_adapters,
         raw_text="> @林懿伦 在上面说了些什么\n/spawn quotetest",
@@ -1773,7 +1863,21 @@ async def test_spawn_with_quoted_prefix(fake_adapters, fake_runtime):
         ctx_partial=_ctx_partial(user="feishu_user:alice", chat_id="oc_chat"),
     )
     assert handled is True
-    assert "cc:alice.quotetest" in fake_runtime._actors
+    assert "cc:alice.quotetest" in fake_runtime.actors
+
+
+@pytest.mark.asyncio
+async def test_spawn_missing_name_bad_args(fake_adapters, fake_runtime):
+    d = CommandDispatcher(fake_runtime, fake_adapters.feishu, fake_adapters.cc)
+    handled = await d.dispatch_from_adapter(
+        adapter=fake_adapters, raw_text="/spawn",
+        source_actor=None,
+        ctx_partial=_ctx_partial(user="feishu_user:alice", chat_id="oc_chat"),
+    )
+    assert handled is True
+    # SpawnArgs.name has no default → bind_args raises BadArgs → dispatcher
+    # replies "参数错误"
+    assert any("参数错误" in msg for _, msg in fake_adapters.errors)
 ```
 
 - [ ] **Step 3: Run test to verify it fails**
@@ -1789,7 +1893,7 @@ Expected: UnknownCommand.
 Write `channel_server/commands/builtin/spawn.py`:
 
 ```python
-"""/spawn [name] — create a CC session (main or child)."""
+"""/spawn <name> — create a CC session (main or child)."""
 from __future__ import annotations
 
 from dataclasses import dataclass
@@ -1805,15 +1909,14 @@ _MAX_CHILDREN = 5
 
 @dataclass
 class SpawnArgs:
-    name: str = ""
+    # Required: no default → bind_args raises BadArgs if the user omits it,
+    # and the dispatcher replies "参数错误" automatically.
+    name: str
 
 
 @ROOT_SCOPE.register("spawn", args=SpawnArgs,
-                     help="/spawn [name] — create a session")
+                     help="/spawn <name> — create a session")
 async def spawn_cmd(args: SpawnArgs, ctx: CommandContext):
-    if not args.name:
-        raise CommandError("usage: /spawn <name>")
-
     user = ctx.user.removeprefix("feishu_user:")
     session_name = args.name
     tag = session_name   # current convention: tag == session name
@@ -1828,49 +1931,57 @@ async def spawn_cmd(args: SpawnArgs, ctx: CommandContext):
             raise CommandError(f"Max sessions ({_MAX_CHILDREN}) reached")
 
     cc_addr = f"cc:{user}.{session_name}"
-    if cc_addr in ctx.runtime.actors and ctx.runtime.actors[cc_addr].state != "ended":
+    existing = ctx.runtime.lookup(cc_addr)
+    if existing is not None and existing.state not in ("ended",):
         raise CommandError(f"session '{session_name}' already exists")
 
-    # ---- I/O phase (order preserved from CCAdapter._handle_spawn) ----
-    anchor = await ctx.adapter.feishu.create_thread_anchor(ctx.chat_id, tag)
-    await ctx.adapter.feishu.pin_message(anchor)
-    await ctx.adapter.feishu.create_tool_card(ctx.chat_id, tag)
+    # ---- I/O phase (order mirrors real CCAdapter._handle_spawn:411-417) ----
+    anchor = await ctx.feishu.create_thread_anchor(ctx.chat_id, tag)
+    if anchor:
+        await ctx.feishu.pin_message(anchor)
 
-    # ---- Actor registration (preserving legacy address scheme) ----
-    app_id = ctx.adapter.feishu.app_id_for(ctx.chat_id)
+    # ---- Actor registration (legacy address scheme preserved) ----
+    app_id = ctx.app_id or ctx.feishu.app_id   # prefer ctx; fallback to adapter
     thread_addr = f"feishu:{app_id}:{ctx.chat_id}:thread:{session_name}"
 
-    ctx.runtime.spawn(
-        address=thread_addr,
-        handler="feishu_inbound",
-        tag=tag,
-        parent=ctx.current_actor,
-        downstream=[cc_addr],
-        metadata={
-            "chat_id": ctx.chat_id,
-            "tag": tag,
-            "mode": "child",
-            "root_id": anchor,
-        },
-        transport=Transport(
-            type="feishu_thread",
-            config={"chat_id": ctx.chat_id, "root_id": anchor},
-        ),
-    )
+    if anchor and ctx.chat_id:
+        ctx.runtime.spawn(
+            address=thread_addr,
+            handler="feishu_inbound",
+            tag=tag,
+            parent=ctx.current_actor,
+            downstream=[cc_addr],
+            metadata={"chat_id": ctx.chat_id, "tag": tag, "mode": "child"},
+            transport=Transport(
+                type="feishu_thread",
+                config={"chat_id": ctx.chat_id, "root_id": anchor},
+            ),
+        )
+
     ctx.runtime.spawn(
         address=cc_addr,
         handler="cc_session",
         tag=tag,
         parent=ctx.current_actor or f"cc:{user}.root",
-        downstream=[thread_addr],
-        state="active",   # ← active from the start; Goal #4 fix
-        metadata={"chat_id": ctx.chat_id, "tag": tag},
+        downstream=[thread_addr] if anchor else [],
+        state="suspended",   # ← matches real flow; flips to "active" when WS connects
+        metadata={
+            "chat_id": ctx.chat_id,
+            "tag": tag,
+            "anchor_msg_id": anchor or "",
+        },
     )
 
-    # ---- Tmux — full I/O ----
-    await ctx.adapter.cc.spawn_tmux(user, session_name, tag, cc_addr)
+    # ---- Start tmux (SYNC in real adapter; returns bool) ----
+    ok = ctx.cc.spawn_cc_process(user, session_name, tag=tag, chat_id=ctx.chat_id)
+    if not ok:
+        # Rollback on tmux failure — mirrors CCAdapter._handle_spawn:440-444
+        if anchor:
+            await ctx.runtime.stop(thread_addr)
+        await ctx.runtime.stop(cc_addr)
+        raise CommandError(f"tmux failed to start for '{session_name}'")
 
-    await ctx.adapter.reply(ctx, f"Session {session_name} started")
+    await ctx.feishu.reply(ctx, f"Session {session_name} started")
 ```
 
 - [ ] **Step 5: Register in builtin init**
@@ -1894,7 +2005,7 @@ Expected: all pass.
 
 - [ ] **Step 7: Remove `/spawn` from legacy**
 
-Delete from `channel_server/adapters/cc/adapter.py`: the entire `_handle_spawn` method (lines 361-436) and the WS action branch that used to call it (the `elif action == "spawn_session"` block). Leave `/spawn` still reachable through the new dispatcher (already wired in Task 9).
+Delete from `channel_server/adapters/cc/adapter.py`: the entire `_handle_spawn` method (lines 379-444) and the WS action branch that used to call it (the `elif action == "spawn_session"` block). Leave `/spawn` still reachable through the new dispatcher (already wired in Task 9).
 
 Delete from `channel_server/core/handlers/session_mgr.py`: `_handle_spawn` method and its dispatch branch.
 
@@ -1945,7 +2056,9 @@ from channel_server.core.actor import Actor
 
 def _ctx_partial(**overrides):
     base = {"source": "feishu", "user": "feishu_user:alice", "chat_id": "oc_chat",
-            "current_actor": None, "parent_actor": None, "raw_msg": None}
+            "app_id": "fake_app",
+            "current_actor": None, "parent_actor": None,
+            "thread_root_id": None, "raw_msg": None}
     base.update(overrides)
     return base
 
@@ -1959,10 +2072,10 @@ async def test_goal_1_adding_command_is_one_file(fake_adapters, fake_runtime):
     @ROOT_SCOPE.register("ping_regression", help="ping test")
     async def ping(args, ctx):
         called.append(True)
-        await ctx.adapter.reply(ctx, "pong")
+        await ctx.feishu.reply(ctx, "pong")
 
     try:
-        d = CommandDispatcher(fake_runtime)
+        d = CommandDispatcher(fake_runtime, fake_adapters.feishu, fake_adapters.cc)
         await d.dispatch_from_adapter(
             adapter=fake_adapters, raw_text="/ping_regression",
             source_actor=None, ctx_partial=_ctx_partial(),
@@ -1984,72 +2097,69 @@ async def test_goal_1_adding_command_is_one_file(fake_adapters, fake_runtime):
 # Goal #2 — I/O lives in the command, order preserved
 @pytest.mark.asyncio
 async def test_goal_2_spawn_io_order_anchor_before_tmux(fake_adapters, fake_runtime):
-    d = CommandDispatcher(fake_runtime)
+    d = CommandDispatcher(fake_runtime, fake_adapters.feishu, fake_adapters.cc)
     await d.dispatch_from_adapter(
         adapter=fake_adapters, raw_text="/spawn iotest",
         source_actor=None, ctx_partial=_ctx_partial(),
     )
     # Anchor must be created before tmux is spawned
     assert fake_adapters.feishu.created_anchors
-    assert fake_adapters.cc.spawned_tmux
-    # (Call ordering is captured by list append order; if they share a clock
-    # we could check timestamps, but append-order suffices for the regression.)
+    assert fake_adapters.cc.spawned
 
 
 # Goal #3 — quoted prefix doesn't break matching
 @pytest.mark.asyncio
 async def test_goal_3_quoted_prefix_matches(fake_adapters, fake_runtime):
-    d = CommandDispatcher(fake_runtime)
+    d = CommandDispatcher(fake_runtime, fake_adapters.feishu, fake_adapters.cc)
     handled = await d.dispatch_from_adapter(
         adapter=fake_adapters,
         raw_text="> @林懿伦 earlier message\n/spawn quoted",
         source_actor=None, ctx_partial=_ctx_partial(),
     )
     assert handled is True
-    assert "cc:alice.quoted" in fake_runtime._actors
+    assert "cc:alice.quoted" in fake_runtime.actors
 
 
-# Goal #4a — Feishu spawn now starts tmux (old bug)
+# Goal #4a — Feishu spawn now starts tmux (old bug: legacy SessionMgrHandler
+# created suspended actor but never called spawn_cc_process)
 @pytest.mark.asyncio
 async def test_goal_4a_feishu_spawn_starts_tmux(fake_adapters, fake_runtime):
-    d = CommandDispatcher(fake_runtime)
+    d = CommandDispatcher(fake_runtime, fake_adapters.feishu, fake_adapters.cc)
     await d.dispatch_from_adapter(
         adapter=fake_adapters, raw_text="/spawn fromfeishu",
         source_actor=None, ctx_partial=_ctx_partial(source="feishu"),
     )
-    assert fake_adapters.cc.spawned_tmux, \
-        "Feishu-entry spawn must start tmux (was suspended in old code)"
+    assert fake_adapters.cc.spawned, \
+        "Feishu-entry spawn must call spawn_cc_process (goal #4 fix)"
 
 
-# Goal #4b — CC MCP spawn and Feishu spawn produce equivalent actor state
+# Goal #4b — CC MCP spawn and Feishu spawn produce equivalent actor shape
 @pytest.mark.asyncio
 async def test_goal_4b_entry_symmetry(fake_adapters, fake_runtime):
-    d = CommandDispatcher(fake_runtime)
+    d = CommandDispatcher(fake_runtime, fake_adapters.feishu, fake_adapters.cc)
 
-    # Path A: Feishu entry
+    # Path A: Feishu entry (top-level, no current_actor)
     await d.dispatch_from_adapter(
         adapter=fake_adapters, raw_text="/spawn via_feishu",
         source_actor=None, ctx_partial=_ctx_partial(source="feishu"),
     )
 
-    # Seed parent for CC path
-    fake_runtime._actors["system:admin"] = Actor(
-        address="system:admin", tag="admin", handler="admin", parent=None,
-    )
-
-    # Path B: CC MCP entry with source_actor=None (acts like top-level)
+    # Path B: CC MCP entry with source_actor=None (also top-level)
     await d.dispatch_from_adapter(
         adapter=fake_adapters, raw_text="/spawn via_cc",
         source_actor=None, ctx_partial=_ctx_partial(source="cc_mcp"),
     )
 
-    a_feishu = fake_runtime._actors["cc:alice.via_feishu"]
-    a_cc = fake_runtime._actors["cc:alice.via_cc"]
+    a_feishu = fake_runtime.actors["cc:alice.via_feishu"]
+    a_cc = fake_runtime.actors["cc:alice.via_cc"]
 
-    # Modulo tag/name differences, actor shape should match
-    assert a_feishu.state == a_cc.state == "active"
+    # Modulo tag/name differences, actor shape matches. Both start suspended
+    # (real behavior — WS connection transitions to active later).
+    assert a_feishu.state == a_cc.state == "suspended"
     assert a_feishu.handler == a_cc.handler == "cc_session"
     assert len(a_feishu.downstream) == len(a_cc.downstream)
+    # Both called spawn_cc_process
+    assert len(fake_adapters.cc.spawned) == 2
 ```
 
 - [ ] **Step 2: Run regression tests**
@@ -2182,15 +2292,15 @@ git commit -m "refactor(feishu): remove command detection from inbound handler"
 **Files:**
 - Modify: `channel_server/core/handlers/feishu.py`
 
-The spawn command now creates the anchor and tool card before spawning the thread actor. Leaving the `mode == "child"` branch of `FeishuInboundHandler.on_spawn` in place would create duplicate anchors.
+The spawn command now creates the anchor before spawning the thread actor. The real `on_spawn` (lines 78-93) emits a single `TransportSend(action="create_thread_anchor")` when `metadata.mode == "child"` — no pin, no tool card. That single TransportSend is what would duplicate.
 
 - [ ] **Step 1: Inspect the current branch**
 
 ```bash
-cd /Users/h2oslabs/cc-openclaw && sed -n '78,100p' channel_server/core/handlers/feishu.py
+cd /Users/h2oslabs/cc-openclaw && sed -n '78,93p' channel_server/core/handlers/feishu.py
 ```
 
-Identify the lines that emit anchor/pin/tool_card `TransportSend` actions when `metadata.get("mode") == "child"`.
+You should see `if mode != "child": return []` followed by a single-element list with `TransportSend(payload={"action": "create_thread_anchor", ...})`. That's the duplicate.
 
 - [ ] **Step 2: Delete those lines**
 
@@ -2263,5 +2373,5 @@ If anything remains, commit as `chore(commands): final cleanup`.
 - **Don't skip the `fallback_on_unknown=True` → `False` flip (Task 14).** It's the single switch that turns on full unified-registry behavior. If you forget, unknown slash commands silently fall through and users see no feedback.
 - **The address scheme is preserved intentionally.** Do not "clean up" the `feishu:{app_id}:{chat_id}:thread:{session_name}` format — it must match what's already persisted on disk.
 - **If FeishuAdapter lacks `reply` / `reply_error` / outbound text helpers**, look at how the existing `_handle_outbound` or `_send_text` path works and wrap that. Do not invent new Feishu API calls.
-- **CC adapter's `kill_tmux` may not exist yet.** Check `adapters/cc/adapter.py` — if the existing code kills tmux via a different method name, use that. Only introduce a new async method if truly absent.
+- **Real CC adapter uses `kill_cc_process` (sync) to kill tmux.** Do not `await` it; do not invent `kill_tmux`.
 - **For ambiguity about exact startup file:** `channel_server/app.py` is the most likely location; if not there, search for `ActorRuntime(` and where adapters are constructed.

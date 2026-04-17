@@ -23,9 +23,6 @@ class FeishuInboundHandler:
             return self._handle_inbound(actor, msg)
         return self._handle_outbound(actor, msg)
 
-    # Session commands that should be intercepted at any feishu actor
-    _SESSION_COMMANDS = ("/spawn", "/kill", "/sessions")
-
     def _handle_inbound(self, actor: Actor, msg: Message) -> list[Action]:
         message_id = msg.payload.get("message_id", "")
         sent_ids = actor.metadata.get("sent_msg_ids", [])
@@ -47,15 +44,6 @@ class FeishuInboundHandler:
             actions.append(UpdateActor(changes={"metadata": {"ack_msg_id": message_id}}))
             actions.append(TransportSend(payload={"action": "ack_react", "message_id": message_id}))
 
-        # Intercept session commands — route to admin (→ session-mgr)
-        # Works from both main chat and threads
-        # Strip quoted content ("> ...") prefix from reply messages
-        text = msg.payload.get("text", "").strip()
-        command_text = text.split("\n")[-1].strip() if "\n" in text else text
-        if command_text.startswith(self._SESSION_COMMANDS):
-            actions.append(Send(to="system:admin", message=msg))
-            return actions
-
         for addr in actor.downstream:
             actions.append(Send(to=addr, message=msg))
         return actions
@@ -76,21 +64,10 @@ class FeishuInboundHandler:
         return actions
 
     def on_spawn(self, actor: Actor) -> list[Action]:
-        """Create thread anchor for child sessions."""
-        mode = actor.metadata.get("mode", "")
-        if mode != "child":
-            return []
-
-        chat_id = actor.metadata.get("chat_id", "")
-        tag = actor.metadata.get("tag", "")
-
-        return [
-            TransportSend(payload={
-                "action": "create_thread_anchor",
-                "chat_id": chat_id,
-                "tag": tag,
-            }),
-        ]
+        """No lifecycle I/O at spawn time. The spawn command creates the
+        Feishu thread anchor before spawning this actor; on_spawn previously
+        emitted a duplicate create_thread_anchor and has been cleared."""
+        return []
 
     def on_stop(self, actor: Actor) -> list[Action]:
         actions: list[Action] = []

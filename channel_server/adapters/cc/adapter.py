@@ -4,6 +4,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import shlex
 import subprocess
 from pathlib import Path
 
@@ -34,6 +35,35 @@ def _read_tmux_session_name() -> str:
 _TMUX_SESSION = os.environ.get("TMUX_SESSION") or _read_tmux_session_name()
 
 
+# Meta-operations on the actor system that route through the command registry.
+# Other WS actions (reply, react, send_file, send_summary, update_title, forward,
+# tool_notify, ...) continue to flow through the existing actor-message path.
+WS_ACTION_TO_COMMAND: dict[str, str] = {
+    "spawn_session": "spawn",
+    "kill_session":  "kill",
+    "list_sessions": "sessions",
+}
+
+
+def ws_args_to_text(cmd_name: str, payload: dict) -> str:
+    """Serialize a WS action payload into shell-tokenizable command text."""
+    if cmd_name == "spawn":
+        name = payload.get("session_name") or payload.get("name", "")
+        tag = payload.get("tag", "")
+        parts = []
+        if name:
+            parts.append(shlex.quote(name))
+        if tag:
+            parts.extend(["--tag", shlex.quote(tag)])
+        return " ".join(parts)
+    if cmd_name == "kill":
+        name = payload.get("session_name") or payload.get("name", "")
+        return shlex.quote(name) if name else ""
+    if cmd_name == "sessions":
+        return ""
+    return ""
+
+
 class CCAdapter:
     """Bridge between Claude Code WebSocket sessions and the actor runtime.
 
@@ -49,8 +79,49 @@ class CCAdapter:
         self._ws_to_address: dict[int, str] = {}  # id(ws) -> actor address
         self._address_to_ws: dict[str, object] = {}  # actor address -> ws
         self.feishu_adapter = None  # Set by app.py after both adapters created
+        self._dispatcher = None  # Set by app.py after construction
 
         runtime.register_transport_handler("websocket", self.push_to_cc)
+
+    # ------------------------------------------------------------------
+    # Dispatcher wiring
+    # ------------------------------------------------------------------
+
+    def set_dispatcher(self, dispatcher) -> None:
+        """Wire the CommandDispatcher in after construction."""
+        self._dispatcher = dispatcher
+
+    def _ws_to_actor(self, ws) -> str | None:
+        """Return the cc:* actor address bound to this WS connection, or None."""
+        return self._ws_to_address.get(id(ws))
+
+    def _ws_user(self, ws) -> str:
+        """Extract feishu_user:{username} from the WS-bound actor address."""
+        addr = self._ws_to_actor(ws)
+        if not addr or not addr.startswith("cc:"):
+            return ""
+        user_session = addr[3:]  # strip "cc:"
+        user = user_session.split(".")[0]
+        return f"feishu_user:{user}"
+
+    def _ws_chat(self, ws) -> str | None:
+        """Get chat_id from the actor's metadata."""
+        addr = self._ws_to_actor(ws)
+        if not addr:
+            return None
+        actor = self.runtime.lookup(addr)
+        if actor is None:
+            return None
+        return actor.metadata.get("chat_id")
+
+    async def reply(self, ctx, text: str) -> None:
+        """Replies for CC-MCP commands go to the Feishu chat the session is bound to."""
+        if self.feishu_adapter is not None:
+            await self.feishu_adapter.reply(ctx, text)
+
+    async def reply_error(self, ctx_partial, text: str) -> None:
+        if self.feishu_adapter is not None:
+            await self.feishu_adapter.reply_error(ctx_partial, text)
 
     # ------------------------------------------------------------------
     # Server lifecycle
@@ -108,25 +179,43 @@ class CCAdapter:
         # -- Control actions (adapter-level, not forwarded to actors) --
         if action == "register":
             await self._handle_register(ws, msg)
-        elif action == "spawn_session":
-            await self._forward_session_cmd(ws, msg)
-        elif action == "kill_session":
-            await self._forward_session_cmd(ws, msg)
-        elif action == "list_sessions":
-            await self._forward_session_cmd(ws, msg)
-        elif action == "pong":
-            pass  # ignore keepalive pongs
-        elif action == "tool_notify":
+            return
+
+        # -- Meta-action commands route through CommandDispatcher --
+        if action in WS_ACTION_TO_COMMAND and self._dispatcher is not None:
+            cmd_name = WS_ACTION_TO_COMMAND[action]
+            raw_text = f"/{cmd_name} {ws_args_to_text(cmd_name, msg)}".strip()
+            source_actor = self._ws_to_actor(ws)
+            ctx_partial = {
+                "source": "cc_mcp",
+                "user": self._ws_user(ws),
+                "chat_id": self._ws_chat(ws),
+                "app_id": self.feishu_adapter.app_id if self.feishu_adapter else "",
+                "current_actor": source_actor,
+                "parent_actor": None,
+                "thread_root_id": None,
+                "raw_msg": None,
+            }
+            handled = await self._dispatcher.dispatch_from_adapter(
+                adapter=self, raw_text=raw_text,
+                source_actor=source_actor, ctx_partial=ctx_partial,
+            )
+            if handled:
+                return
+
+        if action == "pong":
+            return  # ignore keepalive pongs
+
+        if action == "tool_notify":
             # tool_notify can come from anonymous hook connections (no register).
             if self._ws_to_address.get(id(ws)):
                 self._route_to_actor(ws, msg)
             else:
                 self._route_anonymous_tool_notify(msg)
-        else:
-            # -- Actor payload actions (forwarded to actor mailbox) --
-            # No action = default reply; named actions (react, send_file, etc.)
-            # are passed through as payload["action"].
-            self._route_to_actor(ws, msg)
+            return
+
+        # -- Actor payload actions (forwarded to actor mailbox) --
+        self._route_to_actor(ws, msg)
 
     # ------------------------------------------------------------------
     # Registration
@@ -184,23 +273,6 @@ class CCAdapter:
                 log.info("Wired %s → %s", address, feishu_addr)
                 self.runtime.wire("system:admin", address)
                 log.info("Wired system:admin → %s", address)
-
-                # Notify session-mgr to initialize root session (tool card, etc.)
-                user = instance_id.split(".")[0]
-                from channel_server.core.actor import Message as ActorMessage
-                self.runtime.send(
-                    "system:session-mgr",
-                    ActorMessage(
-                        sender=address,
-                        payload={
-                            "user": user,
-                            "session_name": "root",
-                            "chat_id": chat_id,
-                            "mode": "root",
-                        },
-                        metadata={"type": "init_session"},
-                    ),
-                )
 
         await ws.send(json.dumps({"action": "registered", "address": address}))
 
@@ -315,133 +387,6 @@ class CCAdapter:
                     return
 
         log.debug("_route_anonymous_tool_notify: no cc actor for chat_id=%s session=%s", chat_id, session)
-
-    # ------------------------------------------------------------------
-    # Session management — spawn / kill / list
-    # ------------------------------------------------------------------
-
-    async def _forward_session_cmd(self, ws, msg: dict) -> None:
-        """Handle session commands (spawn/kill/list).
-
-        For spawn: creates feishu anchor + actors + tmux process (I/O in adapter).
-        For kill/list: forwards to session-mgr actor.
-        """
-        address = self._ws_to_address.get(id(ws))
-        if not address:
-            await ws.send(json.dumps({"action": "error", "message": "Not registered"}))
-            return
-
-        parts = address.replace("cc:", "").split(".")
-        user = parts[0] if parts else "unknown"
-
-        # Find chat_id from root actor's downstream feishu actor
-        root_actor = self.runtime.lookup(address)
-        chat_id = ""
-        app_id = self.feishu_adapter.app_id if self.feishu_adapter else ""
-        if root_actor:
-            for ds_addr in root_actor.downstream:
-                ds = self.runtime.lookup(ds_addr)
-                if ds and ds.transport and ds.transport.type == "feishu_chat":
-                    chat_id = ds.transport.config.get("chat_id", "")
-                    break
-
-        action = msg.get("action", "")
-        session_name = msg.get("session_name", "")
-        tag = msg.get("tag", "") or session_name
-
-        if action == "spawn_session":
-            await self._handle_spawn(ws, msg, user=user, chat_id=chat_id, app_id=app_id)
-            return
-
-        # kill/list → forward to session-mgr
-        if action == "kill_session":
-            text = f"/kill {session_name}"
-        elif action == "list_sessions":
-            text = "/sessions"
-        else:
-            return
-
-        from channel_server.core.actor import Message as ActorMessage
-        self.runtime.send(
-            "system:session-mgr",
-            ActorMessage(
-                sender=address,
-                payload={"text": text, "user": user, "chat_id": chat_id, "app_id": app_id},
-            ),
-        )
-
-        await ws.send(json.dumps({
-            "action": f"{action}_ack",
-            "ok": True,
-            "text": f"Command forwarded: {text}",
-        }))
-
-    async def _handle_spawn(self, ws, msg: dict, *, user: str, chat_id: str, app_id: str) -> None:
-        """Spawn a child session: create anchor, actors, tmux process."""
-        session_name = msg.get("session_name", "") or msg.get("name", "")
-        tag = msg.get("tag", "") or session_name
-
-        if not session_name:
-            await ws.send(json.dumps({"action": "spawn_result", "ok": False, "text": "Missing session_name"}))
-            return
-
-        cc_addr = f"cc:{user}.{session_name}"
-        existing = self.runtime.lookup(cc_addr)
-
-        # Already active
-        if existing and existing.state == "active":
-            await ws.send(json.dumps({"action": "spawn_result", "ok": False, "text": f"Session '{session_name}' is already active"}))
-            return
-
-        # Resume suspended
-        if existing and existing.state == "suspended":
-            resume_chat_id = existing.metadata.get("chat_id", "") or chat_id
-            if self.spawn_cc_process(user, session_name, tag=tag, chat_id=resume_chat_id):
-                anchor_msg_id = existing.metadata.get("anchor_msg_id", "")
-                if anchor_msg_id and self.feishu_adapter:
-                    await self.feishu_adapter._update_anchor_card(
-                        anchor_msg_id, f"\U0001f7e2 [{tag}] resumed",
-                        body_text=f"Session [{tag}] has been resumed", template="green",
-                    )
-                await ws.send(json.dumps({"action": "spawn_result", "ok": True, "text": f"Session '{session_name}' resumed", "session_name": session_name}))
-            else:
-                await ws.send(json.dumps({"action": "spawn_result", "ok": False, "text": f"Session '{session_name}' resume failed"}))
-            return
-
-        # New session
-        # 1. Create feishu thread anchor
-        anchor_msg_id = None
-        if self.feishu_adapter and chat_id:
-            anchor_msg_id = await self.feishu_adapter.create_thread_anchor(chat_id, tag)
-            if anchor_msg_id:
-                await self.feishu_adapter.pin_message(anchor_msg_id)
-
-        # 2. Spawn feishu thread actor
-        thread_addr = f"feishu:{app_id}:{chat_id}:thread:{session_name}"
-        if anchor_msg_id and chat_id:
-            self.runtime.spawn(
-                thread_addr, "feishu_inbound", tag=tag,
-                transport=Transport(type="feishu_thread", config={"chat_id": chat_id, "root_id": anchor_msg_id}),
-                downstream=[cc_addr],
-            )
-
-        # 3. Spawn CC actor (suspended, waiting for WS transport)
-        downstream = [thread_addr] if anchor_msg_id else []
-        self.runtime.spawn(
-            cc_addr, "cc_session", tag=tag, state="suspended",
-            parent=f"cc:{user}.root", downstream=downstream,
-            metadata={"anchor_msg_id": anchor_msg_id or "", "chat_id": chat_id},
-        )
-
-        # 4. Start CC process via tmux
-        if self.spawn_cc_process(user, session_name, tag=tag, chat_id=chat_id):
-            await ws.send(json.dumps({"action": "spawn_result", "ok": True, "text": f"Session '{session_name}' spawned", "session_name": session_name}))
-        else:
-            # Rollback actors
-            for addr in [cc_addr, thread_addr]:
-                if addr:
-                    await self.runtime.stop(addr)
-            await ws.send(json.dumps({"action": "spawn_result", "ok": False, "text": f"Session '{session_name}' failed: tmux error"}))
 
     # ------------------------------------------------------------------
     # Process management

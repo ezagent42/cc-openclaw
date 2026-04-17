@@ -15,40 +15,18 @@ from channel_server.core.runtime import ActorRuntime
 
 
 @pytest.mark.asyncio
-async def test_session_lifecycle_via_session_mgr():
-    """Full lifecycle: spawn via session-mgr, verify actors, kill."""
+async def test_session_mgr_ignores_spawn_command():
+    """/spawn is no longer handled by session-mgr (Task 12: unified registry).
+
+    Verify that a /spawn message sent directly to session-mgr produces no
+    actor side-effects — the command is silently dropped. In the live system,
+    /spawn is intercepted by CommandDispatcher before session-mgr is involved.
+    """
     rt = ActorRuntime()
-
-    # Register transport handlers (mock — don't actually call feishu/tmux)
-    transport_log = []
-
-    async def mock_feishu_thread(actor, payload):
-        transport_log.append(("feishu_thread", payload))
-        if payload.get("action") == "create_thread_anchor":
-            return {"anchor_msg_id": "om_anchor_test"}
-        if payload.get("action") == "create_tool_card":
-            return {"card_msg_id": "om_card_test"}
-        return None
-
-    async def mock_ws(actor, payload):
-        transport_log.append(("ws", payload))
-        if payload.get("action") == "spawn_tmux":
-            return {"tmux_started": True}
-        return None
-
-    async def mock_feishu_chat(actor, payload):
-        transport_log.append(("feishu_chat", payload))
-        return None
-
-    rt.register_transport_handler("feishu_thread", mock_feishu_thread)
-    rt.register_transport_handler("websocket", mock_ws)
-    rt.register_transport_handler("feishu_chat", mock_feishu_chat)
-
-    # Spawn session-mgr and start the runtime loop
     rt.spawn("system:session-mgr", "session_mgr", tag="session-mgr")
     task = asyncio.create_task(rt.run())
 
-    # Simulate /spawn dev command
+    # Send /spawn dev directly to session-mgr (as would have happened in legacy)
     rt.send(
         "system:session-mgr",
         Message(
@@ -62,51 +40,14 @@ async def test_session_lifecycle_via_session_mgr():
         ),
     )
 
-    # Let the runtime process
-    await asyncio.sleep(0.5)
+    await asyncio.sleep(0.1)
 
-    # Verify: feishu thread actor created
+    # Verify: session-mgr no longer spawns actors for /spawn
     thread_actor = rt.lookup("feishu:test_app:oc_chat1:thread:dev")
-    assert thread_actor is not None
+    assert thread_actor is None, "session-mgr should NOT handle /spawn (now in unified registry)"
 
-    # Verify: cc actor created (suspended, waiting for WS)
     cc_actor = rt.lookup("cc:alice.dev")
-    assert cc_actor is not None
-    assert cc_actor.state == "suspended"
-
-    # Verify: feishu thread on_spawn hooks ran (create_thread_anchor via feishu_thread transport)
-    anchor_calls = [c for c in transport_log if c[1].get("action") == "create_thread_anchor"]
-    assert len(anchor_calls) >= 1
-
-    # Verify: cc on_spawn fires spawn_tmux — only captured if cc actor has a websocket transport.
-    # The cc actor is spawned suspended with no transport, so spawn_tmux goes via the transport
-    # path which is a no-op (no transport attached yet).  After attaching, spawn_tmux is NOT
-    # re-triggered, so we confirm the cc actor *would* have sent it by checking the action
-    # exists in on_spawn output directly.
-    from channel_server.core.handler import get_handler
-    cc_handler = get_handler("cc_session")
-    on_spawn_actions = cc_handler.on_spawn(cc_actor)
-    assert len(on_spawn_actions) == 1
-    assert on_spawn_actions[0].payload["action"] == "spawn_tmux"
-
-    # Kill the session
-    rt.send(
-        "system:session-mgr",
-        Message(
-            sender="system:admin",
-            payload={
-                "text": "/kill dev",
-                "user": "alice",
-                "chat_id": "oc_chat1",
-                "app_id": "test_app",
-            },
-        ),
-    )
-
-    await asyncio.sleep(0.5)
-
-    cc_actor_after = rt.lookup("cc:alice.dev")
-    assert cc_actor_after is None or cc_actor_after.state == "ended"
+    assert cc_actor is None, "session-mgr should NOT handle /spawn (now in unified registry)"
 
     await rt.shutdown()
     await task

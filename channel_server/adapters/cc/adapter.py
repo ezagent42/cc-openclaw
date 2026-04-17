@@ -275,9 +275,8 @@ class CCAdapter:
     def _route_anonymous_tool_notify(self, msg: dict) -> None:
         """Route a tool_notify from an anonymous WS connection (e.g. hook).
 
-        Finds the cc:* actor serving this chat_id by checking downstream
-        feishu actors' transport config, then delivers the message to that
-        cc actor. CCSessionHandler routes it to feishu as plain text.
+        Uses session+user from the payload to find the exact cc actor.
+        Falls back to chat_id matching if session info is missing.
         """
         chat_id = msg.get("chat_id", "")
         text = msg.get("text", "")
@@ -287,6 +286,20 @@ class CCAdapter:
 
         from channel_server.core.actor import Message as ActorMessage
 
+        # Primary: find cc actor by user+session (exact match)
+        session = msg.get("session", "")
+        user = msg.get("user", "")
+        if user and session:
+            target_addr = f"cc:{user}.{session}"
+            target = self.runtime.lookup(target_addr)
+            if target and target.state != "ended":
+                self.runtime.send(target_addr, ActorMessage(
+                    sender="hook:tool_notify",
+                    payload={"action": "tool_notify", "text": text},
+                ))
+                return
+
+        # Fallback: find cc actor by downstream feishu chat_id match
         for addr, actor in self.runtime.actors.items():
             if not addr.startswith("cc:") or actor.state == "ended":
                 continue
@@ -301,7 +314,7 @@ class CCAdapter:
                     ))
                     return
 
-        log.debug("_route_anonymous_tool_notify: no cc actor for chat_id=%s", chat_id)
+        log.debug("_route_anonymous_tool_notify: no cc actor for chat_id=%s session=%s", chat_id, session)
 
     # ------------------------------------------------------------------
     # Session management — spawn / kill / list

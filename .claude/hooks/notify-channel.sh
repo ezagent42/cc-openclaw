@@ -15,6 +15,8 @@ PORT=$(python3 -c "import json; print(json.load(open('$PIDFILE'))['port'])" 2>/d
 
 CHAT_ID="${OC_CHAT_ID:-}"
 [ -n "$CHAT_ID" ] || exit 0
+SESSION="${OC_SESSION:-root}"
+USER="${OC_USER:-}"
 
 INPUT=$(cat)
 
@@ -60,7 +62,7 @@ fi
 MSG="${MSG:0:$MAX}"
 
 # Fire-and-forget: send to channel-server (tool_notify routes to a dedicated thread)
-PAYLOAD=$(jq -nc --arg cid "$CHAT_ID" --arg txt "$MSG" '{"action":"tool_notify","chat_id":$cid,"text":$txt}')
+PAYLOAD=$(jq -nc --arg cid "$CHAT_ID" --arg txt "$MSG" --arg sess "$SESSION" --arg usr "$USER" '{"action":"tool_notify","chat_id":$cid,"text":$txt,"session":$sess,"user":$usr}')
 (
   echo "$PAYLOAD" | websocat -t --no-close -1 "ws://127.0.0.1:${PORT}" &>/dev/null &
   WS_PID=$!

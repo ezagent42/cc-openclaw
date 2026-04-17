@@ -233,6 +233,11 @@ class CCAdapter:
             await ws.send(json.dumps({"action": "error", "message": "Missing instance_id"}))
             return
 
+        # Voice gateway registration (voice: prefix)
+        if instance_id.startswith("voice:"):
+            await self._handle_voice_register(ws, msg, instance_id)
+            return
+
         # Actor address for CC sessions
         address = instance_id if instance_id.startswith("cc:") else f"cc:{instance_id}"
 
@@ -275,6 +280,42 @@ class CCAdapter:
                 log.info("Wired system:admin → %s", address)
 
         await ws.send(json.dumps({"action": "registered", "address": address}))
+
+    async def _handle_voice_register(self, ws, msg: dict, instance_id: str) -> None:
+        """Register a voice gateway: spawn voice actor + paired CC session."""
+        from channel_server.core.actor import Transport
+
+        address = instance_id  # voice:user.voice-1
+        cc_addr = "cc:" + instance_id[len("voice:"):]  # cc:user.voice-1
+        tag = msg.get("tag_name", "") or "Voice"
+
+        # Spawn voice actor with WS transport
+        self.runtime.spawn(
+            address, "voice_session", tag=tag,
+            transport=Transport(type="websocket", config={"instance_id": instance_id}),
+            metadata={"cc_target": cc_addr},
+        )
+
+        # Spawn paired CC session (suspended — waiting for Claude Code WS)
+        # on_spawn TransportSend is no-op because actor has no transport yet
+        self.runtime.spawn(
+            cc_addr, "cc_session", tag=f"voice-{tag}",
+            state="suspended",
+            downstream=[address],  # CC responses route to voice actor
+        )
+
+        # Start Claude Code tmux process
+        parts = instance_id[len("voice:"):].split(".", 1)
+        user = parts[0] if len(parts) > 1 else ""
+        session_name = parts[1] if len(parts) > 1 else parts[0]
+        self.spawn_cc_process(user, session_name, cc_addr, tag)
+
+        # Track WS mapping
+        self._ws_to_address[id(ws)] = address
+        self._address_to_ws[address] = ws
+
+        await ws.send(json.dumps({"action": "registered", "address": address}))
+        log.info("Voice registered: %s → CC %s", address, cc_addr)
 
     # ------------------------------------------------------------------
     # Disconnect

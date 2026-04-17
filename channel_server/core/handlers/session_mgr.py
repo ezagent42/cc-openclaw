@@ -69,8 +69,6 @@ class SessionMgrHandler:
         elif command_text.startswith("/kill"):
             msg = Message(sender=msg.sender, payload={**msg.payload, "text": command_text}, metadata=msg.metadata)
             return self._handle_kill(actor, msg, runtime)
-        elif command_text.startswith("/sessions"):
-            return self._handle_sessions(actor, msg, runtime)
 
         return []
 
@@ -184,31 +182,6 @@ class SessionMgrHandler:
 
         actions.append(_reply(app_id, chat_id, f"Session '{session_name}' killed"))
         return actions
-
-    def _handle_sessions(self, actor: Actor, msg: Message, runtime: "ActorRuntime | None") -> list[Action]:
-        user = msg.payload.get("user", "")
-        chat_id = msg.payload.get("chat_id", "")
-        app_id = msg.payload.get("app_id", "")
-
-        if not runtime:
-            return [_reply(app_id, chat_id, "Internal error: no runtime")]
-
-        prefix = f"cc:{user}."
-        sessions = [
-            a for a in runtime.actors.values()
-            if a.address.startswith(prefix) and a.state != "ended"
-        ]
-
-        if not sessions:
-            return [_reply(app_id, chat_id, "No active sessions")]
-
-        lines = []
-        for s in sorted(sessions, key=lambda a: a.address):
-            icon = "\U0001f7e2" if s.state == "active" else "\U0001f7e1"
-            name = s.address.split(".")[-1] if "." in s.address else s.address
-            lines.append(f"{icon} {s.tag or name} ({s.state})")
-
-        return [_reply(app_id, chat_id, "\n".join(lines))]
 
     def _handle_init(self, actor: Actor, msg: Message, runtime: "ActorRuntime | None") -> list[Action]:
         """Handle init_session from _handle_register for root sessions."""

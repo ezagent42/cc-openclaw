@@ -168,39 +168,6 @@ def test_kill_cannot_kill_root():
 
 
 # ---------------------------------------------------------------------------
-# /sessions tests
-# ---------------------------------------------------------------------------
-
-def test_sessions_lists_all():
-    actor = make_actor()
-    msg = make_msg("/sessions")
-    actors = {
-        "cc:testuser.dev": Actor(address="cc:testuser.dev", tag="dev",
-                                 handler="cc_session", state="active"),
-        "cc:testuser.research": Actor(address="cc:testuser.research", tag="research",
-                                      handler="cc_session", state="suspended"),
-        "cc:testuser.ended": Actor(address="cc:testuser.ended", tag="ended",
-                                   handler="cc_session", state="ended"),
-    }
-    rt = make_runtime(actors=actors)
-
-    actions = SessionMgrHandler().handle(actor, msg, runtime=rt)
-
-    replies = [a for a in actions if isinstance(a, Send)]
-    assert len(replies) == 1
-    text = replies[0].message.payload["text"]
-    # Should list active and suspended but not the ended session
-    assert "dev" in text
-    assert "research" in text
-    # The ended-state session tag is "ended" but "suspended" also contains "ended" as a
-    # substring, so check by state label rather than tag name
-    assert "(active)" in text or "active" in text
-    assert "(suspended)" in text or "suspended" in text
-    # The ended actor's address prefix should not produce a line with state "ended" shown
-    assert "(ended)" not in text
-
-
-# ---------------------------------------------------------------------------
 # init_session tests
 # ---------------------------------------------------------------------------
 

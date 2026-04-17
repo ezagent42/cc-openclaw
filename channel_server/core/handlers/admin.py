@@ -14,7 +14,7 @@ class AdminHandler:
     - Unknown slash commands get an error message.
     """
 
-    SESSION_COMMANDS = ("/spawn", "/kill", "/sessions")
+    SESSION_COMMANDS = ("/spawn", "/kill")  # /sessions now handled by new registry
 
     def handle(self, actor: Actor, msg: Message, runtime=None) -> list[Action]:
         text = msg.payload.get("text", "").strip()

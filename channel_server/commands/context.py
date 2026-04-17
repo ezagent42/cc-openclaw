@@ -20,10 +20,10 @@ class CommandContext:
     user: str                           # feishu_user:xxx
     chat_id: str | None                 # top-level Feishu chat id
     app_id: str                         # FeishuAdapter.app_id (for actor address)
-    current_actor: str | None           # actor this command originated from
-    parent_actor: str | None            # current_actor's parent
-    thread_root_id: str | None          # root_id if the command came from a thread
     raw_msg: Message | None             # original inbound message (for reply)
     feishu: Any                         # FeishuAdapter — always populated
     cc: Any                             # CCAdapter — always populated
     runtime: Any                        # ActorRuntime
+    current_actor: str | None = None    # actor this command originated from (scope-injected)
+    parent_actor: str | None = None     # current_actor's parent (scope-injected)
+    thread_root_id: str | None = None   # root_id if the command came from a thread (scope-injected)

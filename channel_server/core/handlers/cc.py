@@ -19,6 +19,13 @@ class CCSessionHandler:
         self._runtime = runtime
 
     def handle(self, actor: Actor, msg: Message, runtime=None) -> list[Action]:
+        action = msg.payload.get("action")
+
+        # tool_notify from hooks — always route to downstream feishu as text
+        if action == "tool_notify":
+            text_msg = Message(sender=msg.sender, payload={"text": msg.payload.get("text", "")})
+            return [Send(to=addr, message=text_msg) for addr in actor.downstream]
+
         if msg.sender != actor.address:
             # External message — forward to the CC session over its transport.
             # Merge metadata (user, user_id, etc.) into payload so channel.py
@@ -26,7 +33,6 @@ class CCSessionHandler:
             return [TransportSend(payload={**msg.metadata, **msg.payload, "action": "message"})]
 
         # Message originated from CC itself — dispatch on action.
-        action = msg.payload.get("action")
 
         if action is None:
             # Default reply behaviour — tag prefix if not root.
@@ -54,10 +60,6 @@ class CCSessionHandler:
             if parent_feishu:
                 return [Send(to=parent_feishu, message=msg)]
             return []
-
-        if action == "tool_notify":
-            text_msg = Message(sender=msg.sender, payload={"text": msg.payload.get("text", "")})
-            return [Send(to=addr, message=text_msg) for addr in actor.downstream]
 
         # Catch-all (react, send_file, update_title, etc.) → send to downstream.
         return [Send(to=addr, message=msg) for addr in actor.downstream]

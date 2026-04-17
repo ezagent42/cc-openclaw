@@ -127,6 +127,7 @@ class SessionMgrHandler:
                 handler="feishu_inbound",
                 kwargs={
                     "tag": tag,
+                    "downstream": [cc_addr],  # wire thread → cc
                     "metadata": {"chat_id": chat_id, "tag": tag, "mode": "child"},
                     "transport": Transport(type="feishu_thread", config={"chat_id": chat_id}),
                 },

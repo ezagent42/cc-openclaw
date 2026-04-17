@@ -49,6 +49,14 @@ def test_spawn_new_session():
     assert "cc:testuser.dev" in addrs
     assert any("feishu" in a and ":thread:" in a for a in addrs)
 
+    # Verify thread actor has cc in downstream
+    thread_spawn = next(s for s in spawns if ":thread:" in s.address)
+    assert "cc:testuser.dev" in thread_spawn.kwargs.get("downstream", [])
+
+    # Verify cc actor has thread in downstream
+    cc_spawn = next(s for s in spawns if s.address == "cc:testuser.dev")
+    assert thread_spawn.address in cc_spawn.kwargs.get("downstream", [])
+
 
 def test_spawn_with_tag():
     actor = make_actor()

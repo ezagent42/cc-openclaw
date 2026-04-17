@@ -2,12 +2,15 @@
 from __future__ import annotations
 
 import pytest
+from dataclasses import dataclass
 
 from channel_server.commands.parse import (
     normalize_command_text,
     parse_command,
     CommandInvocation,
+    bind_args,
 )
+from channel_server.commands.errors import BadArgs
 
 
 # ---------- normalize_command_text ----------
@@ -55,3 +58,45 @@ def test_parse_command_with_quoted_arg():
 def test_parse_command_with_named_arg():
     inv = parse_command("/spawn foo --tag beta")
     assert inv.tokens == ["foo", "--tag", "beta"]
+
+
+# ---------- bind_args dataclasses ----------
+
+@dataclass
+class _SpawnArgs:
+    tag: str = ""
+
+
+@dataclass
+class _KillArgs:
+    name: str   # required (no default)
+
+
+# ---------- bind_args ----------
+
+def test_bind_none_schema_returns_tokens():
+    assert bind_args(None, ["a", "b"]) == ["a", "b"]
+
+def test_bind_positional():
+    assert bind_args(_SpawnArgs, ["foo"]) == _SpawnArgs(tag="foo")
+
+def test_bind_no_args_uses_defaults():
+    assert bind_args(_SpawnArgs, []) == _SpawnArgs(tag="")
+
+def test_bind_named_flag():
+    assert bind_args(_SpawnArgs, ["--tag", "foo"]) == _SpawnArgs(tag="foo")
+
+def test_bind_named_equals():
+    assert bind_args(_SpawnArgs, ["--tag=foo"]) == _SpawnArgs(tag="foo")
+
+def test_bind_missing_required_raises():
+    with pytest.raises(BadArgs):
+        bind_args(_KillArgs, [])
+
+def test_bind_extra_positional_raises():
+    with pytest.raises(BadArgs):
+        bind_args(_SpawnArgs, ["foo", "bar"])
+
+def test_bind_unknown_named_raises():
+    with pytest.raises(BadArgs):
+        bind_args(_SpawnArgs, ["--wat", "x"])

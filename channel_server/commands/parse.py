@@ -46,4 +46,57 @@ def parse_command(normalized: str) -> CommandInvocation:
     return CommandInvocation(name=head.strip(), raw_args=rest, tokens=tokens)
 
 
-# ---------- Stage 3: bind_args (implemented in Task 4) ----------
+# ---------- Stage 3: bind_args ----------
+
+def bind_args(schema: Type[Any] | None, tokens: list[str]) -> Any:
+    """Bind tokens to a dataclass schema. Raises BadArgs on mismatch.
+
+    Supports:
+      • positional: tokens consumed in field order
+      • named: "--key value" or "--key=value"
+      • named args are matched first; remaining tokens fill positional
+    """
+    if schema is None:
+        return list(tokens)
+
+    schema_fields = fields(schema)
+    known_names = {f.name for f in schema_fields}
+    values: dict[str, Any] = {}
+    positional_leftover: list[str] = []
+
+    i = 0
+    while i < len(tokens):
+        tok = tokens[i]
+        if tok.startswith("--"):
+            body = tok[2:]
+            if "=" in body:
+                key, _, val = body.partition("=")
+                i += 1
+            else:
+                key = body
+                if i + 1 >= len(tokens):
+                    raise BadArgs(f"missing value for --{key}")
+                val = tokens[i + 1]
+                i += 2
+            if key not in known_names:
+                raise BadArgs(f"unknown argument: --{key}")
+            values[key] = val
+        else:
+            positional_leftover.append(tok)
+            i += 1
+
+    # Fill positional from leftovers in field order (skipping ones already set)
+    for f in schema_fields:
+        if f.name in values:
+            continue
+        if positional_leftover:
+            values[f.name] = positional_leftover.pop(0)
+
+    if positional_leftover:
+        raise BadArgs(f"too many arguments: {positional_leftover}")
+
+    # Instantiate — dataclass raises TypeError on missing required fields
+    try:
+        return schema(**values)
+    except TypeError as e:
+        raise BadArgs(str(e)) from e

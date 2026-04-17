@@ -49,8 +49,10 @@ class FeishuInboundHandler:
 
         # Intercept session commands — route to admin (→ session-mgr)
         # Works from both main chat and threads
+        # Strip quoted content ("> ...") prefix from reply messages
         text = msg.payload.get("text", "").strip()
-        if text.startswith(self._SESSION_COMMANDS):
+        command_text = text.split("\n")[-1].strip() if "\n" in text else text
+        if command_text.startswith(self._SESSION_COMMANDS):
             actions.append(Send(to="system:admin", message=msg))
             return actions
 

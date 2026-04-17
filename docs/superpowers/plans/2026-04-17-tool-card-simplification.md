@@ -298,12 +298,20 @@ HANDLER_REGISTRY: dict[str, Handler] = {
 rm channel_server/core/handlers/tool_card.py
 ```
 
-- [ ] **Step 5: Run tests**
+- [ ] **Step 5: Fix remaining test references to tool_card**
+
+In `tests/channel_server/core/test_handler.py`, also remove `test_get_handler_returns_correct_types` assertion for tool_card (or update the test to not check tool_card).
+
+In `tests/channel_server/core/test_runtime.py`, find any test using `"tool_card"` handler and change to a different handler (e.g. `"forward_all"`).
+
+In `tests/channel_server/adapters/test_cc_adapter.py`, update `test_route_anonymous_tool_notify` and `test_route_anonymous_tool_notify_no_match` — these spawn `tool_card:*` actors. Rewrite to match the new routing logic (finding cc actors by downstream feishu chat_id match).
+
+- [ ] **Step 6: Run tests**
 
 Run: `uv run pytest tests/ -v`
-Expected: ALL PASS (some tests may still reference tool_card — fix if needed)
+Expected: ALL PASS
 
-- [ ] **Step 6: Commit**
+- [ ] **Step 7: Commit**
 
 ```bash
 git add -A
@@ -312,10 +320,14 @@ git commit -m "refactor: delete ToolCardHandler and remove from registry"
 
 ---
 
-### Task 4: Rewrite _route_anonymous_tool_notify
+### Task 4: Remove tool_card from _handle_spawn + Rewrite _route_anonymous_tool_notify
 
 **Files:**
-- Modify: `channel_server/adapters/cc/adapter.py:275-299`
+- Modify: `channel_server/adapters/cc/adapter.py`
+
+- [ ] **Step 0: Remove tool_card creation from _handle_spawn**
+
+In `channel_server/adapters/cc/adapter.py`, the `_handle_spawn` method (still live for CC MCP spawn calls) creates tool_card actors at lines ~420-433. Remove the tool card creation block (create_tool_card call + tool_card actor spawn) and remove `tool_card:{user}.{session_name}` from the rollback error path. Keep the rest of _handle_spawn intact.
 
 - [ ] **Step 1: Rewrite _route_anonymous_tool_notify**
 
@@ -382,7 +394,7 @@ In `_handle_chat_transport` (around line 416), remove:
             await self._update_card(payload.get("card_msg_id", ""), payload.get("text", ""))
 ```
 
-In `_handle_thread_transport` (around line 468), remove the same `tool_notify` case.
+In `_handle_thread_transport`, remove the `tool_notify` case AND the `create_tool_card` action case (added in the session-mgr refactoring but now dead code since on_spawn no longer emits create_tool_card).
 
 - [ ] **Step 2: Remove dead methods**
 

@@ -48,6 +48,7 @@ class FeishuAdapter:
         self.app_id: str = ""  # Set by start_feishu_ws
         self._user_names: dict[str, str] = self._load_user_names()
         self._user_ids: dict[str, str] = self._load_user_ids()  # open_id → username
+        self._dispatcher = None  # Set by ChannelServerApp after construction
 
         # Register transport handlers
         runtime.register_transport_handler("feishu_chat", self._handle_chat_transport)
@@ -96,6 +97,10 @@ class FeishuAdapter:
     # Inbound
     # ------------------------------------------------------------------
 
+    def set_dispatcher(self, dispatcher) -> None:
+        """Wire the CommandDispatcher in after construction."""
+        self._dispatcher = dispatcher
+
     def resolve_actor_address(self, chat_id: str, root_id: str | None) -> str:
         """Return the actor address for a Feishu chat or thread.
 
@@ -105,6 +110,42 @@ class FeishuAdapter:
         if root_id:
             return f"feishu:{self.app_id}:{chat_id}:{root_id}"
         return f"feishu:{self.app_id}:{chat_id}"
+
+    def _identify_source_actor(self, chat_id: str, root_id: str | None) -> str | None:
+        """Return the actor address that should be the dispatch context for this event.
+
+        Main chat (no thread context) → None → ROOT_SCOPE.
+        Thread reply → find feishu_thread actor whose transport.config.root_id matches.
+        """
+        if not root_id:
+            return None
+        for addr, actor in self.runtime.actors.items():
+            if actor.state == "ended":
+                continue
+            if (actor.transport
+                    and actor.transport.type == "feishu_thread"
+                    and actor.transport.config.get("root_id") == root_id
+                    and actor.transport.config.get("chat_id") == chat_id):
+                return addr
+        return None
+
+    async def reply(self, ctx, text: str) -> None:
+        """Send a plain-text reply. If ctx came from a thread, reply in-thread."""
+        chat_id = getattr(ctx, "chat_id", None)
+        thread_anchor = getattr(ctx, "thread_root_id", None)
+        if chat_id:
+            await self._send_message(chat_id, text, thread_anchor=thread_anchor)
+
+    async def reply_error(self, ctx_partial, text: str) -> None:
+        """Same as reply but takes the partial dict used before CommandContext is built."""
+        if isinstance(ctx_partial, dict):
+            chat_id = ctx_partial.get("chat_id")
+            thread_anchor = ctx_partial.get("thread_root_id")
+        else:
+            chat_id = getattr(ctx_partial, "chat_id", None)
+            thread_anchor = getattr(ctx_partial, "thread_root_id", None)
+        if chat_id:
+            await self._send_message(chat_id, text, thread_anchor=thread_anchor)
 
     def start_feishu_ws(self, app_id: str, app_secret: str) -> None:
         """Start Feishu WS listener in a background daemon thread.
@@ -293,6 +334,45 @@ class FeishuAdapter:
         Pure routing function — dedup and echo prevention are handled downstream
         (runtime.send dedup, FeishuInboundHandler echo prevention).
         """
+        text = (event.get("text", "") or "").strip()
+        chat_id = event.get("chat_id", "")
+        root_id = event.get("root_id") or None
+
+        # Phase 2: command registry first crack at this text.
+        # If a command is recognized, dispatcher handles it; if not (or
+        # fallback_on_unknown=True returns False), fall through to legacy routing.
+        if self._dispatcher is not None and text:
+            sender_id = event.get("user_id", "") or "unknown"
+            username = self._user_ids.get(sender_id, "")
+            ctx_partial = {
+                "source": "feishu",
+                "user": f"feishu_user:{username}" if username else f"feishu_user:{sender_id}",
+                "chat_id": chat_id,
+                "app_id": self.app_id,
+                "current_actor": self._identify_source_actor(chat_id, root_id),
+                "parent_actor": None,
+                "thread_root_id": root_id,
+                "raw_msg": None,
+            }
+
+            async def _try_dispatch():
+                handled = await self._dispatcher.dispatch_from_adapter(
+                    adapter=self, raw_text=text,
+                    source_actor=ctx_partial["current_actor"],
+                    ctx_partial=ctx_partial,
+                )
+                if not handled:
+                    # Fall back to legacy actor-pipeline routing
+                    self._route_to_actor_pipeline(event)
+
+            asyncio.create_task(_try_dispatch())
+            return
+
+        # No dispatcher wired — direct legacy routing
+        self._route_to_actor_pipeline(event)
+
+    def _route_to_actor_pipeline(self, event: dict) -> None:
+        """Original on_feishu_event body — actor-pipeline routing."""
         message_id = event.get("message_id", "")
         chat_id = event.get("chat_id", "")
 

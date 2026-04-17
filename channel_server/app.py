@@ -81,6 +81,19 @@ class ChannelServerApp:
                 from channel_server.adapters.feishu.adapter import FeishuAdapter
                 self.feishu_adapter = FeishuAdapter(self.runtime, feishu_client)
                 self.cc_adapter.feishu_adapter = self.feishu_adapter
+
+                # Construct CommandDispatcher and inject into both adapters.
+                # fallback_on_unknown=True during migration — unregistered commands
+                # fall through to legacy actor pipeline. Flipped to False at Phase 4.
+                from channel_server.commands.dispatcher import CommandDispatcher
+                import channel_server.commands.builtin  # trigger /help registration
+                self._dispatcher = CommandDispatcher(
+                    self.runtime, self.feishu_adapter, self.cc_adapter,
+                    fallback_on_unknown=True,
+                )
+                self.feishu_adapter.set_dispatcher(self._dispatcher)
+                # self.cc_adapter.set_dispatcher(self._dispatcher)  # T9 will add this
+
                 log.info("Feishu adapter initialized")
 
                 # Start Feishu WS event listener

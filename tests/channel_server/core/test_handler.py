@@ -11,7 +11,6 @@ from channel_server.core.handler import (
     CCSessionHandler,
     FeishuInboundHandler,
     ForwardAllHandler,
-    ToolCardHandler,
     get_handler,
 )
 
@@ -265,20 +264,20 @@ def test_cc_session_update_title():
 
 
 # ---------------------------------------------------------------------------
-# 10. CCSessionHandler — tool_notify → Send to tool_card:*
+# 10. CCSessionHandler — tool_notify → Send to downstream as plain text
 # ---------------------------------------------------------------------------
 
-def test_cc_session_tool_notify():
-    actor = make_actor(address="cc:user.dev", tag="root")
-    msg = make_msg(
-        sender="cc:user.dev",
-        payload={"action": "tool_notify", "text": "Running tests..."},
-    )
+def test_cc_session_tool_notify_sends_to_downstream():
+    actor = make_actor(address="cc:user.dev", tag="dev",
+                       downstream=["feishu:test_app:oc_test:thread:dev"])
+    msg = make_msg(sender="cc:user.dev",
+                   payload={"action": "tool_notify", "text": "⚙️ Running: git status"})
     actions = CCSessionHandler().handle(actor, msg)
     assert len(actions) == 1
     assert isinstance(actions[0], Send)
-    assert actions[0].to == "tool_card:user.dev"
-    assert actions[0].message is msg
+    assert actions[0].to == "feishu:test_app:oc_test:thread:dev"
+    assert actions[0].message.payload == {"text": "⚙️ Running: git status"}
+    assert "tool_notify" not in actions[0].message.payload
 
 
 # ---------------------------------------------------------------------------
@@ -318,53 +317,6 @@ def test_forward_all_broadcasts():
 
 
 # ---------------------------------------------------------------------------
-# 13. ToolCardHandler — accumulates history (max 5), emits tool_notify
-# ---------------------------------------------------------------------------
-
-def test_tool_card_accumulates_history():
-    actor = make_actor(metadata={"history": ["a", "b", "c", "d", "e"]})
-    msg = make_msg(payload={"text": "f"})
-    actions = ToolCardHandler().handle(actor, msg)
-
-    update = next(a for a in actions if isinstance(a, UpdateActor))
-    transport = next(a for a in actions if isinstance(a, TransportSend))
-
-    # history trimmed to last 5
-    assert update.changes["metadata"]["history"] == ["b", "c", "d", "e", "f"]
-    assert transport.payload["action"] == "tool_notify"
-    assert "f" in transport.payload["text"]
-    # oldest entry dropped
-    assert "a" not in transport.payload["text"]
-
-
-def test_tool_card_starts_empty():
-    actor = make_actor()
-    msg = make_msg(payload={"text": "first"})
-    actions = ToolCardHandler().handle(actor, msg)
-
-    update = next(a for a in actions if isinstance(a, UpdateActor))
-    assert update.changes["metadata"]["history"] == ["first"]
-
-
-def test_tool_card_includes_card_msg_id():
-    actor = make_actor(metadata={"card_msg_id": "om_card_123"})
-    msg = make_msg(payload={"text": "Running tests"})
-    actions = ToolCardHandler().handle(actor, msg)
-
-    transport = next(a for a in actions if isinstance(a, TransportSend))
-    assert transport.payload["card_msg_id"] == "om_card_123"
-
-
-def test_tool_card_empty_card_msg_id():
-    actor = make_actor(metadata={})
-    msg = make_msg(payload={"text": "Running tests"})
-    actions = ToolCardHandler().handle(actor, msg)
-
-    transport = next(a for a in actions if isinstance(a, TransportSend))
-    assert transport.payload["card_msg_id"] == ""
-
-
-# ---------------------------------------------------------------------------
 # 14 & 15. get_handler — returns correct types / raises on unknown
 # ---------------------------------------------------------------------------
 
@@ -372,7 +324,6 @@ def test_get_handler_returns_correct_types():
     assert isinstance(get_handler("feishu_inbound"), FeishuInboundHandler)
     assert isinstance(get_handler("cc_session"), CCSessionHandler)
     assert isinstance(get_handler("forward_all"), ForwardAllHandler)
-    assert isinstance(get_handler("tool_card"), ToolCardHandler)
 
 
 def test_get_handler_raises_on_unknown():
@@ -565,48 +516,16 @@ def test_feishu_inbound_on_stop_chat_actor_noop():
 
 def test_cc_session_on_stop_stops_children():
     from channel_server.core.actor import StopActor
-
-    actor = make_actor(
-        address="cc:user.dev",
-        tag="dev",
-        handler="cc_session",
-        downstream=["feishu:test_app:oc_test:om_anchor"],
-    )
-
+    actor = make_actor(address="cc:user.dev", tag="dev", handler="cc_session",
+                       downstream=["feishu:test_app:oc_test:om_anchor"])
     actions = CCSessionHandler().on_stop(actor)
     stop_addrs = {a.address for a in actions if isinstance(a, StopActor)}
-    assert "tool_card:user.dev" in stop_addrs
     assert "feishu:test_app:oc_test:om_anchor" in stop_addrs
+    assert not any("tool_card:" in addr for addr in stop_addrs)
 
 
 # ---------------------------------------------------------------------------
-# 24. ToolCardHandler.on_stop — emits final card update
-# ---------------------------------------------------------------------------
-
-def test_tool_card_on_stop_updates_card():
-    from channel_server.core.actor import Transport
-
-    actor = make_actor(
-        handler="tool_card",
-        metadata={"card_msg_id": "om_card_999"},
-    )
-    actor.transport = Transport(type="feishu_chat", config={"chat_id": "oc_test"})
-
-    actions = ToolCardHandler().on_stop(actor)
-    assert len(actions) == 1
-    assert isinstance(actions[0], TransportSend)
-    assert actions[0].payload["card_msg_id"] == "om_card_999"
-    assert "ended" in actions[0].payload["text"].lower()
-
-
-def test_tool_card_on_stop_no_transport_noop():
-    actor = make_actor(handler="tool_card", metadata={"card_msg_id": "om_card_999"})
-    actions = ToolCardHandler().on_stop(actor)
-    assert actions == []
-
-
-# ---------------------------------------------------------------------------
-# 25. All handlers accept runtime as third argument
+# 24. All handlers accept runtime as third argument
 # ---------------------------------------------------------------------------
 
 def test_handler_receives_runtime_arg():
@@ -619,4 +538,3 @@ def test_handler_receives_runtime_arg():
     FeishuInboundHandler().handle(actor, msg, runtime)
     CCSessionHandler().handle(actor, msg, runtime)
     ForwardAllHandler().handle(actor, msg, runtime)
-    ToolCardHandler().handle(actor, msg, runtime)

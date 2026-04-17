@@ -175,22 +175,32 @@ async def test_actor_loop_forwards_messages():
     rt.register_transport_handler("test", capture)
 
     transport = Transport(type="test", config={})
-    # src forwards to dst; dst uses tool_card which emits TransportSend.
-    src = rt.spawn("actor://src", "forward_all", downstream=["actor://dst"])
-    dst = rt.spawn("actor://dst", "tool_card", transport=transport)
+    # src forwards to dst; dst uses a relay handler that emits TransportSend.
+    from channel_server.core.handler import HANDLER_REGISTRY
 
-    msg = Message(sender="actor://ext", payload={"text": "hello"})
-    rt.send("actor://src", msg)
+    class RelayHandler:
+        def handle(self, actor, msg, runtime=None):
+            return [TransportSend(payload={"action": "relay", "text": msg.payload.get("text", "")})]
 
-    run_task = asyncio.create_task(rt.run())
-    await asyncio.sleep(0.15)
-    await rt.shutdown()
-    await run_task
+    HANDLER_REGISTRY["_test_relay"] = RelayHandler()
+    try:
+        src = rt.spawn("actor://src", "forward_all", downstream=["actor://dst"])
+        dst = rt.spawn("actor://dst", "_test_relay", transport=transport)
 
-    # tool_card handler emits TransportSend, which our capture handler receives.
-    assert len(received) == 1
-    assert received[0]["action"] == "tool_notify"
-    assert "hello" in received[0]["text"]
+        msg = Message(sender="actor://ext", payload={"text": "hello"})
+        rt.send("actor://src", msg)
+
+        run_task = asyncio.create_task(rt.run())
+        await asyncio.sleep(0.15)
+        await rt.shutdown()
+        await run_task
+
+        # RelayHandler emits TransportSend, which our capture handler receives.
+        assert len(received) == 1
+        assert received[0]["action"] == "relay"
+        assert "hello" in received[0]["text"]
+    finally:
+        del HANDLER_REGISTRY["_test_relay"]
 
 
 # ---------------------------------------------------------------------------
@@ -286,18 +296,28 @@ async def test_transport_send_dispatches():
     rt.register_transport_handler("websocket", ws_sender)
 
     transport = Transport(type="websocket", config={"url": "ws://localhost"})
-    actor = rt.spawn("actor://tc", "tool_card", transport=transport)
+    from channel_server.core.handler import HANDLER_REGISTRY
 
-    msg = Message(sender="actor://ext", payload={"text": "ping"})
-    rt.send("actor://tc", msg)
+    class PingHandler:
+        def handle(self, actor, msg, runtime=None):
+            return [TransportSend(payload={"action": "pong", "text": msg.payload.get("text", "")})]
 
-    run_task = asyncio.create_task(rt.run())
-    await asyncio.sleep(0.15)
-    await rt.shutdown()
-    await run_task
+    HANDLER_REGISTRY["_test_ping"] = PingHandler()
+    try:
+        actor = rt.spawn("actor://tc", "_test_ping", transport=transport)
 
-    assert len(sent_payloads) == 1
-    assert sent_payloads[0]["action"] == "tool_notify"
+        msg = Message(sender="actor://ext", payload={"text": "ping"})
+        rt.send("actor://tc", msg)
+
+        run_task = asyncio.create_task(rt.run())
+        await asyncio.sleep(0.15)
+        await rt.shutdown()
+        await run_task
+
+        assert len(sent_payloads) == 1
+        assert sent_payloads[0]["action"] == "pong"
+    finally:
+        del HANDLER_REGISTRY["_test_ping"]
 
 
 # ---------------------------------------------------------------------------

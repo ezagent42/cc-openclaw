@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 import shlex
-from dataclasses import dataclass, fields, MISSING
+from dataclasses import dataclass, fields
 from typing import Any, Type
 
 from channel_server.commands.errors import BadArgs

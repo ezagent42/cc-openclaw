@@ -56,10 +56,8 @@ class CCSessionHandler:
             return []
 
         if action == "tool_notify":
-            # Route to the tool_card actor for this user session.
-            # Actor address is "cc:<user_session>", target is "tool_card:<user_session>".
-            user_session = actor.address.removeprefix("cc:")
-            return [Send(to=f"tool_card:{user_session}", message=msg)]
+            text_msg = Message(sender=msg.sender, payload={"text": msg.payload.get("text", "")})
+            return [Send(to=addr, message=text_msg) for addr in actor.downstream]
 
         # Catch-all (react, send_file, update_title, etc.) → send to downstream.
         return [Send(to=addr, message=msg) for addr in actor.downstream]
@@ -86,12 +84,8 @@ class CCSessionHandler:
         ]
 
     def on_stop(self, actor: Actor) -> list[Action]:
-        """Stop child actors (feishu_thread, tool_card) when CC session ends."""
+        """Stop child actors (feishu_thread) when CC session ends."""
         actions: list[Action] = []
-        user_session = actor.address.removeprefix("cc:")
-        # Stop tool card
-        actions.append(StopActor(address=f"tool_card:{user_session}"))
-        # Stop downstream feishu thread actors
         for addr in actor.downstream:
             actions.append(StopActor(address=addr))
         return actions

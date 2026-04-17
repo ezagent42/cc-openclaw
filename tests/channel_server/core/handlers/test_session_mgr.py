@@ -215,9 +215,7 @@ def test_init_session_root():
 
     actions = SessionMgrHandler().handle(actor, msg, runtime=rt)
 
-    spawns = [a for a in actions if isinstance(a, SpawnActor)]
-    assert len(spawns) == 1
-    assert spawns[0].address == "tool_card:testuser.root"
+    assert actions == []
 
 
 # ---------------------------------------------------------------------------

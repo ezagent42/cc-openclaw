@@ -413,8 +413,6 @@ class FeishuAdapter:
             await self._send_reaction(payload.get("message_id", ""), payload.get("emoji_type", "THUMBSUP"))
         elif action == "send_file":
             await self._send_file(payload.get("chat_id", chat_id), payload.get("file_path", ""))
-        elif action == "tool_notify":
-            await self._update_card(payload.get("card_msg_id", ""), payload.get("text", ""))
         elif action == "unpin":
             await self.unpin_message(payload.get("message_id", ""))
         elif action == "update_anchor":
@@ -439,14 +437,6 @@ class FeishuAdapter:
                 return {"anchor_msg_id": anchor_msg_id}
             return None
 
-        if action == "create_tool_card":
-            tag = payload.get("tag", "")
-            anchor = actor.metadata.get("anchor_msg_id", "")
-            card_msg_id = await self.create_tool_card(chat_id, f"\U0001f7e2 [{tag}]", root_id=anchor or None)
-            if card_msg_id:
-                return {"card_msg_id": card_msg_id}
-            return None
-
         if action is None:
             text = payload.get("text", "")
             sent_id = await self._send_message(chat_id, text, root_id)
@@ -462,11 +452,13 @@ class FeishuAdapter:
         elif action == "react":
             await self._send_reaction(payload.get("message_id", ""), payload.get("emoji_type", "THUMBSUP"))
         elif action == "send_file":
-            await self._send_file(payload.get("chat_id", chat_id), payload.get("file_path", ""))
+            await self._send_file(
+                payload.get("chat_id", chat_id),
+                payload.get("file_path", ""),
+                thread_anchor=root_id or None,
+            )
         elif action == "update_title":
             await self._update_anchor_card(payload.get("msg_id", ""), payload.get("title", ""))
-        elif action == "tool_notify":
-            await self._update_card(payload.get("card_msg_id", ""), payload.get("text", ""))
         elif action == "unpin":
             await self.unpin_message(payload.get("message_id", ""))
         elif action == "update_anchor":
@@ -514,8 +506,12 @@ class FeishuAdapter:
             log.warning("_send_message error: %s", e)
         return ""
 
-    async def _send_file(self, chat_id: str, file_path: str) -> None:
-        """Upload file to Feishu and send as file message."""
+    async def _send_file(self, chat_id: str, file_path: str, thread_anchor: str | None = None) -> None:
+        """Upload file to Feishu and send as file message.
+
+        If thread_anchor is given, posts as a thread reply (reply_in_thread=True);
+        otherwise posts to the main chat stream.
+        """
         if not self.feishu_client:
             return
         try:
@@ -545,18 +541,32 @@ class FeishuAdapter:
                 log.warning("_send_file: no file_key in upload response")
                 return
 
-            body = (
-                CreateMessageRequestBody.builder()
-                .receive_id(chat_id)
-                .msg_type("file")
-                .content(json.dumps({"file_key": file_key}))
-                .build()
-            )
-            send_req = CreateMessageRequest.builder().receive_id_type("chat_id").request_body(body).build()
-            send_resp = await self.feishu_client.im.v1.message.acreate(send_req)
+            content = json.dumps({"file_key": file_key})
+
+            if thread_anchor:
+                reply_body = (
+                    ReplyMessageRequestBody.builder()
+                    .msg_type("file")
+                    .content(content)
+                    .reply_in_thread(True)
+                    .build()
+                )
+                reply_req = ReplyMessageRequest.builder().message_id(thread_anchor).request_body(reply_body).build()
+                send_resp = await self.feishu_client.im.v1.message.areply(reply_req)
+            else:
+                body = (
+                    CreateMessageRequestBody.builder()
+                    .receive_id(chat_id)
+                    .msg_type("file")
+                    .content(content)
+                    .build()
+                )
+                send_req = CreateMessageRequest.builder().receive_id_type("chat_id").request_body(body).build()
+                send_resp = await self.feishu_client.im.v1.message.acreate(send_req)
 
             if send_resp.success() and send_resp.data and send_resp.data.message_id:
-                log.info("_send_file: sent %s to %s", file_name, chat_id)
+                dest = f"thread {thread_anchor}" if thread_anchor else chat_id
+                log.info("_send_file: sent %s to %s", file_name, dest)
             else:
                 log.warning("_send_file send failed: code=%s msg=%s", send_resp.code, send_resp.msg)
 
@@ -611,19 +621,6 @@ class FeishuAdapter:
                 log.debug("Remove reaction failed: %s", resp.code)
         except Exception as e:
             log.debug("Remove reaction error: %s", e)
-
-    async def _update_card(self, msg_id: str, text: str) -> bool:
-        """Update an existing tool notification card."""
-        if not self.feishu_client:
-            return False
-        try:
-            card = self._build_tool_card(text)
-            body = PatchMessageRequestBody.builder().content(json.dumps(card)).build()
-            req = PatchMessageRequest.builder().message_id(msg_id).request_body(body).build()
-            resp = await self.feishu_client.im.v1.message.apatch(req)
-            return resp.success()
-        except Exception:
-            return False
 
     async def _update_anchor_card(self, msg_id: str, title: str, body_text: str = "", template: str = "green") -> bool:
         """Update the card content of a thread anchor message."""
@@ -693,47 +690,6 @@ class FeishuAdapter:
 
         except Exception as e:
             log.warning("Error creating thread anchor: %s", e)
-            return None
-
-    async def create_tool_card(self, chat_id: str, text: str, root_id: str | None = None) -> str | None:
-        """Create an interactive card for tool notifications. Returns msg_id or None.
-
-        When root_id is provided, the card is created inside the thread via
-        ReplyMessageRequest with reply_in_thread(True). Otherwise it is created
-        in the main chat via CreateMessageRequest.
-        """
-        if not self.feishu_client:
-            return None
-        try:
-            card = self._build_tool_card(text)
-            if root_id:
-                body = (
-                    ReplyMessageRequestBody.builder()
-                    .msg_type("interactive")
-                    .content(json.dumps(card))
-                    .reply_in_thread(True)
-                    .build()
-                )
-                req = ReplyMessageRequest.builder().message_id(root_id).request_body(body).build()
-                resp = await self.feishu_client.im.v1.message.areply(req)
-            else:
-                body = (
-                    CreateMessageRequestBody.builder()
-                    .receive_id(chat_id)
-                    .msg_type("interactive")
-                    .content(json.dumps(card))
-                    .build()
-                )
-                req = CreateMessageRequest.builder().receive_id_type("chat_id").request_body(body).build()
-                resp = await self.feishu_client.im.v1.message.acreate(req)
-            if resp.success() and resp.data and resp.data.message_id:
-                msg_id = resp.data.message_id
-                log.info("Created tool card for chat %s: %s", chat_id, msg_id)
-                return msg_id
-            log.warning("Failed to create tool card: %s", resp.msg if resp else "no response")
-            return None
-        except Exception as e:
-            log.warning("Error creating tool card: %s", e)
             return None
 
     async def pin_message(self, message_id: str) -> bool:
@@ -882,14 +838,3 @@ class FeishuAdapter:
         except Exception as e:
             log.warning("Startup notification error: %s", e)
 
-    # ------------------------------------------------------------------
-    # Internal helpers
-    # ------------------------------------------------------------------
-
-    @staticmethod
-    def _build_tool_card(text: str) -> dict:
-        """Build a card JSON for tool notification display."""
-        return {
-            "header": {"title": {"tag": "plain_text", "content": "\U0001f527 Tool Activity"}, "template": "grey"},
-            "elements": [{"tag": "div", "text": {"tag": "plain_text", "content": text}}],
-        }

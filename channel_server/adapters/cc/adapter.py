@@ -275,8 +275,9 @@ class CCAdapter:
     def _route_anonymous_tool_notify(self, msg: dict) -> None:
         """Route a tool_notify from an anonymous WS connection (e.g. hook).
 
-        Looks up the tool_card actor by matching chat_id against registered
-        CC actors' metadata, then delivers the message directly.
+        Finds the cc:* actor serving this chat_id by checking downstream
+        feishu actors' transport config, then delivers the message to that
+        cc actor. CCSessionHandler routes it to feishu as plain text.
         """
         chat_id = msg.get("chat_id", "")
         text = msg.get("text", "")
@@ -284,19 +285,23 @@ class CCAdapter:
             log.warning("_route_anonymous_tool_notify: missing chat_id or text")
             return
 
-        # Find tool_card actor whose parent CC actor serves this chat_id
-        for addr, actor in self.runtime.actors.items():
-            if not addr.startswith("tool_card:") or actor.state == "ended":
-                continue
-            if actor.transport and actor.transport.config.get("chat_id") == chat_id:
-                actor_msg = Message(
-                    sender="hook:tool_notify",
-                    payload={"action": "tool_notify", "text": text},
-                )
-                self.runtime.send(addr, actor_msg)
-                return
+        from channel_server.core.actor import Message as ActorMessage
 
-        log.debug("_route_anonymous_tool_notify: no tool_card actor for chat_id=%s", chat_id)
+        for addr, actor in self.runtime.actors.items():
+            if not addr.startswith("cc:") or actor.state == "ended":
+                continue
+            for ds_addr in actor.downstream:
+                ds = self.runtime.lookup(ds_addr)
+                if (ds and ds.transport
+                        and ds.transport.type in ("feishu_chat", "feishu_thread")
+                        and ds.transport.config.get("chat_id") == chat_id):
+                    self.runtime.send(addr, ActorMessage(
+                        sender="hook:tool_notify",
+                        payload={"action": "tool_notify", "text": text},
+                    ))
+                    return
+
+        log.debug("_route_anonymous_tool_notify: no cc actor for chat_id=%s", chat_id)
 
     # ------------------------------------------------------------------
     # Session management — spawn / kill / list
@@ -359,7 +364,7 @@ class CCAdapter:
         }))
 
     async def _handle_spawn(self, ws, msg: dict, *, user: str, chat_id: str, app_id: str) -> None:
-        """Spawn a child session: create anchor, actors, tool card, tmux process."""
+        """Spawn a child session: create anchor, actors, tmux process."""
         session_name = msg.get("session_name", "") or msg.get("name", "")
         tag = msg.get("tag", "") or session_name
 
@@ -415,22 +420,12 @@ class CCAdapter:
             metadata={"anchor_msg_id": anchor_msg_id or "", "chat_id": chat_id},
         )
 
-        # 4. Spawn tool card actor
-        if self.feishu_adapter and chat_id:
-            tool_card_msg_id = await self.feishu_adapter.create_tool_card(chat_id, f"[{tag}] starting...")
-            if tool_card_msg_id:
-                self.runtime.spawn(
-                    f"tool_card:{user}.{session_name}", "tool_card", tag=tag,
-                    transport=Transport(type="feishu_chat", config={"chat_id": chat_id}),
-                    metadata={"card_msg_id": tool_card_msg_id},
-                )
-
-        # 5. Start CC process via tmux
+        # 4. Start CC process via tmux
         if self.spawn_cc_process(user, session_name, tag=tag, chat_id=chat_id):
             await ws.send(json.dumps({"action": "spawn_result", "ok": True, "text": f"Session '{session_name}' spawned", "session_name": session_name}))
         else:
             # Rollback actors
-            for addr in [cc_addr, f"tool_card:{user}.{session_name}", thread_addr]:
+            for addr in [cc_addr, thread_addr]:
                 if addr:
                     await self.runtime.stop(addr)
             await ws.send(json.dumps({"action": "spawn_result", "ok": False, "text": f"Session '{session_name}' failed: tmux error"}))

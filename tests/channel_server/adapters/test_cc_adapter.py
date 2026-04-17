@@ -7,7 +7,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
-from channel_server.core.actor import Actor, Message, Transport
+from channel_server.core.actor import Message
 from channel_server.core.runtime import ActorRuntime
 from channel_server.adapters.cc.adapter import CCAdapter, _read_tmux_session_name
 
@@ -241,42 +241,8 @@ def test_spawn_cc_process_returns_true_on_success():
 
 
 # ---------------------------------------------------------------------------
-# 11. _route_anonymous_tool_notify routes by chat_id
+# 11. _route_anonymous_tool_notify — removed (will be rewritten in Task 4)
 # ---------------------------------------------------------------------------
 
-def test_route_anonymous_tool_notify():
-    adapter, rt = make_adapter()
-
-    # Create a tool_card actor with matching chat_id
-    rt.spawn(
-        "tool_card:alice.root",
-        "tool_card",
-        tag="root",
-        transport=Transport(type="feishu_chat", config={"chat_id": "oc_test123"}),
-        metadata={"card_msg_id": "om_card_1"},
-    )
-
-    adapter._route_anonymous_tool_notify({
-        "action": "tool_notify",
-        "chat_id": "oc_test123",
-        "text": "Running tests...",
-    })
-
-    mailbox = rt.mailboxes.get("tool_card:alice.root")
-    assert mailbox is not None
-    assert not mailbox.empty()
-    msg = mailbox.get_nowait()
-    assert msg.payload["action"] == "tool_notify"
-    assert msg.payload["text"] == "Running tests..."
-    assert msg.sender == "hook:tool_notify"
-
-
-def test_route_anonymous_tool_notify_no_match():
-    adapter, rt = make_adapter()
-
-    # No tool_card actor for this chat_id — should not raise
-    adapter._route_anonymous_tool_notify({
-        "action": "tool_notify",
-        "chat_id": "oc_nonexistent",
-        "text": "Running tests...",
-    })
+# test_route_anonymous_tool_notify and test_route_anonymous_tool_notify_no_match
+# were removed as part of tool_card simplification; routing logic changes in Task 4.

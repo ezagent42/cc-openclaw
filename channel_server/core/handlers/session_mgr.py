@@ -212,23 +212,4 @@ class SessionMgrHandler:
 
     def _handle_init(self, actor: Actor, msg: Message, runtime: "ActorRuntime | None") -> list[Action]:
         """Handle init_session from _handle_register for root sessions."""
-        chat_id = msg.payload.get("chat_id", "")
-        user = msg.payload.get("user", "")
-        mode = msg.payload.get("mode", "")
-
-        if mode == "root":
-            return [
-                SpawnActor(
-                    address=f"tool_card:{user}.root",
-                    handler="tool_card",
-                    kwargs={
-                        "tag": "root",
-                        "metadata": {"chat_id": chat_id, "mode": "root"},
-                        "transport": Transport(
-                            type="feishu_chat",
-                            config={"chat_id": chat_id},
-                        ),
-                    },
-                ),
-            ]
         return []

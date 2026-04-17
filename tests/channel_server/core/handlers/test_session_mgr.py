@@ -3,7 +3,7 @@ from __future__ import annotations
 
 from unittest.mock import MagicMock
 
-from channel_server.core.actor import Actor, Message, Send, SpawnActor, StopActor
+from channel_server.core.actor import Actor, Message, Send, SpawnActor
 from channel_server.core.handlers.session_mgr import SessionMgrHandler
 from channel_server.core.handler import get_handler
 
@@ -116,55 +116,6 @@ def test_spawn_missing_name():
     replies = [a for a in actions if isinstance(a, Send)]
     assert len(replies) == 1
     assert "Usage" in replies[0].message.payload["text"]
-
-
-# ---------------------------------------------------------------------------
-# /kill tests
-# ---------------------------------------------------------------------------
-
-def test_kill_active_session():
-    actor = make_actor()
-    msg = make_msg("/kill dev")
-    thread_addr = "feishu:test_app:oc_test123:thread:dev"
-    existing = Actor(address="cc:testuser.dev", tag="dev", handler="cc_session",
-                     state="active", downstream=[thread_addr])
-    rt = make_runtime(actors={"cc:testuser.dev": existing})
-
-    actions = SessionMgrHandler().handle(actor, msg, runtime=rt)
-
-    stops = [a for a in actions if isinstance(a, StopActor)]
-    stop_addrs = {s.address for s in stops}
-    assert "cc:testuser.dev" in stop_addrs
-
-
-def test_kill_nonexistent():
-    actor = make_actor()
-    msg = make_msg("/kill ghost")
-    rt = make_runtime()
-
-    actions = SessionMgrHandler().handle(actor, msg, runtime=rt)
-
-    stops = [a for a in actions if isinstance(a, StopActor)]
-    assert len(stops) == 0
-
-    replies = [a for a in actions if isinstance(a, Send)]
-    assert len(replies) == 1
-    assert "not found" in replies[0].message.payload["text"]
-
-
-def test_kill_cannot_kill_root():
-    actor = make_actor()
-    msg = make_msg("/kill root")
-    rt = make_runtime()
-
-    actions = SessionMgrHandler().handle(actor, msg, runtime=rt)
-
-    stops = [a for a in actions if isinstance(a, StopActor)]
-    assert len(stops) == 0
-
-    replies = [a for a in actions if isinstance(a, Send)]
-    assert len(replies) == 1
-    assert "Cannot kill root" in replies[0].message.payload["text"]
 
 
 # ---------------------------------------------------------------------------

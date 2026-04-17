@@ -377,7 +377,7 @@ def test_admin_session_command_routes_to_session_mgr():
         handler="admin",
         downstream=["cc:user.root"],
     )
-    for cmd in ("/spawn research", "/kill research", "/sessions"):
+    for cmd in ("/spawn research",):
         msg = make_msg(sender="feishu_user:u1", payload={"text": cmd})
         actions = AdminHandler().handle(actor, msg)
         assert len(actions) == 1

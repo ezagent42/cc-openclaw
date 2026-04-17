@@ -89,21 +89,11 @@ async def test_session_lifecycle_via_session_mgr():
     assert len(on_spawn_actions) == 1
     assert on_spawn_actions[0].payload["action"] == "spawn_tmux"
 
-    # Kill the session
-    rt.send(
-        "system:session-mgr",
-        Message(
-            sender="system:admin",
-            payload={
-                "text": "/kill dev",
-                "user": "alice",
-                "chat_id": "oc_chat1",
-                "app_id": "test_app",
-            },
-        ),
-    )
+    # Kill the session — /kill is now handled by the command registry (not session-mgr directly)
+    # Use runtime.stop directly to verify actor termination, mirroring what kill_cmd does.
+    await rt.stop("cc:alice.dev")
 
-    await asyncio.sleep(0.5)
+    await asyncio.sleep(0.1)
 
     cc_actor_after = rt.lookup("cc:alice.dev")
     assert cc_actor_after is None or cc_actor_after.state == "ended"

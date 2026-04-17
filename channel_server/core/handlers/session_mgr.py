@@ -14,7 +14,6 @@ from channel_server.core.actor import (
     Message,
     Send,
     SpawnActor,
-    StopActor,
     Transport,
 )
 
@@ -35,11 +34,6 @@ def _parse_spawn_args(text: str) -> tuple[str, str]:
             tag = parts[idx + 1]
     return name, tag
 
-
-def _parse_kill_args(text: str) -> str:
-    """Parse '/kill name' → name."""
-    parts = text.split()
-    return parts[1] if len(parts) > 1 else ""
 
 
 def _reply(app_id: str, chat_id: str, text: str) -> Send:
@@ -66,9 +60,6 @@ class SessionMgrHandler:
             # Use command_text for parsing (has the actual /spawn command)
             msg = Message(sender=msg.sender, payload={**msg.payload, "text": command_text}, metadata=msg.metadata)
             return self._handle_spawn(actor, msg, runtime)
-        elif command_text.startswith("/kill"):
-            msg = Message(sender=msg.sender, payload={**msg.payload, "text": command_text}, metadata=msg.metadata)
-            return self._handle_kill(actor, msg, runtime)
 
         return []
 
@@ -149,38 +140,6 @@ class SessionMgrHandler:
             _reply(app_id, chat_id, f"Session '{session_name}' spawned"),
         ]
 
-        return actions
-
-    def _handle_kill(self, actor: Actor, msg: Message, runtime: "ActorRuntime | None") -> list[Action]:
-        user = msg.payload.get("user", "")
-        chat_id = msg.payload.get("chat_id", "")
-        app_id = msg.payload.get("app_id", "")
-        text = msg.payload.get("text", "")
-        session_name = _parse_kill_args(text)
-
-        if not session_name:
-            return [_reply(app_id, chat_id, "Usage: /kill <name>")]
-
-        if session_name == "root":
-            return [_reply(app_id, chat_id, "Cannot kill root session")]
-
-        if not runtime:
-            return [_reply(app_id, chat_id, "Internal error: no runtime")]
-
-        cc_addr = f"cc:{user}.{session_name}"
-        existing = runtime.lookup(cc_addr)
-
-        if not existing or existing.state == "ended":
-            return [_reply(app_id, chat_id, f"Session '{session_name}' not found")]
-
-        actions: list[Action] = [StopActor(address=cc_addr)]
-
-        # Also stop the feishu thread actor if it exists in downstream
-        for ds_addr in existing.downstream:
-            if ds_addr.startswith("feishu:") and ":thread:" in ds_addr:
-                actions.append(StopActor(address=ds_addr))
-
-        actions.append(_reply(app_id, chat_id, f"Session '{session_name}' killed"))
         return actions
 
     def _handle_init(self, actor: Actor, msg: Message, runtime: "ActorRuntime | None") -> list[Action]:

@@ -23,9 +23,6 @@ class FeishuInboundHandler:
             return self._handle_inbound(actor, msg)
         return self._handle_outbound(actor, msg)
 
-    # Session commands that should be intercepted at any feishu actor
-    _SESSION_COMMANDS = ("/spawn", "/kill", "/sessions")
-
     def _handle_inbound(self, actor: Actor, msg: Message) -> list[Action]:
         message_id = msg.payload.get("message_id", "")
         sent_ids = actor.metadata.get("sent_msg_ids", [])
@@ -46,15 +43,6 @@ class FeishuInboundHandler:
         if message_id:
             actions.append(UpdateActor(changes={"metadata": {"ack_msg_id": message_id}}))
             actions.append(TransportSend(payload={"action": "ack_react", "message_id": message_id}))
-
-        # Intercept session commands — route to admin (→ session-mgr)
-        # Works from both main chat and threads
-        # Strip quoted content ("> ...") prefix from reply messages
-        text = msg.payload.get("text", "").strip()
-        command_text = text.split("\n")[-1].strip() if "\n" in text else text
-        if command_text.startswith(self._SESSION_COMMANDS):
-            actions.append(Send(to="system:admin", message=msg))
-            return actions
 
         for addr in actor.downstream:
             actions.append(Send(to=addr, message=msg))

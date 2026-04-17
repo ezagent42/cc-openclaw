@@ -47,6 +47,7 @@ class FeishuAdapter:
         self.feishu_client = feishu_client
         self.app_id: str = ""  # Set by start_feishu_ws
         self._user_names: dict[str, str] = self._load_user_names()
+        self._user_ids: dict[str, str] = self._load_user_ids()  # open_id → username
 
         # Register transport handlers
         runtime.register_transport_handler("feishu_chat", self._handle_chat_transport)
@@ -69,6 +70,25 @@ class FeishuAdapter:
                 if oid and name:
                     names[oid] = name
             return names
+        except Exception:
+            return {}
+
+    @staticmethod
+    def _load_user_ids() -> dict[str, str]:
+        """Load open_id → username mapping from roles/roles.yaml."""
+        roles_file = PROJECT_ROOT / "roles" / "roles.yaml"
+        if not roles_file.exists():
+            return {}
+        try:
+            import yaml
+            with open(roles_file) as f:
+                data = yaml.safe_load(f) or {}
+            ids: dict[str, str] = {}
+            for username, user_info in (data.get("users") or {}).items():
+                oid = user_info.get("open_id", "")
+                if oid:
+                    ids[oid] = username
+            return ids
         except Exception:
             return {}
 
@@ -307,7 +327,8 @@ class FeishuAdapter:
 
         # Build and deliver — dedup by runtime
         sender_id = event.get("user_id", "") or "unknown"
-        user_name = event.get("user", "")
+        display_name = event.get("user", "")
+        username = self._user_ids.get(sender_id, "")  # open_id → username (e.g. "linyilun")
         msg = Message(
             sender=f"feishu_user:{sender_id}",
             payload={
@@ -316,7 +337,7 @@ class FeishuAdapter:
                 "chat_id": chat_id,
                 "app_id": self.app_id,
                 "user_id": sender_id,
-                "user": user_name,
+                "user": username or display_name,  # prefer username for session-mgr
                 "message_id": message_id,
                 "msg_type": event.get("msg_type", "text"),
             },

@@ -34,10 +34,10 @@ MAX=140
 if [ "$EVENT" = "PreToolUse" ]; then
   if [ "$TOOL" = "Bash" ]; then
     CMD=$(echo "$INPUT" | jq -r '.tool_input.command // empty')
-    MSG="⚙️ Running: ${CMD:0:$MAX}"
+    MSG="【ToolUse】⚙️ Running: ${CMD:0:$MAX}"
   elif [ "$TOOL" = "Agent" ]; then
     DESC=$(echo "$INPUT" | jq -r '.tool_input.description // empty')
-    MSG="🔍 Agent: ${DESC:0:$MAX}"
+    MSG="【ToolUse】🔍 Agent: ${DESC:0:$MAX}"
   fi
 elif [ "$EVENT" = "PostToolUse" ]; then
   if [ "$TOOL" = "Bash" ]; then
@@ -45,12 +45,12 @@ elif [ "$EVENT" = "PostToolUse" ]; then
     OUT=$(echo "$INPUT" | jq -r '.tool_response.stdout // .tool_response // empty' 2>/dev/null | head -c "$MAX")
     EXIT_CODE=$(echo "$INPUT" | jq -r '.tool_response.exitCode // .tool_response.exit_code // "?"' 2>/dev/null)
     if [ "$EXIT_CODE" = "0" ] || [ "$EXIT_CODE" = "?" ]; then
-      MSG="✅ Done (exit ${EXIT_CODE}): ${OUT}"
+      MSG="【ToolUse】✅ Done (exit ${EXIT_CODE}): ${OUT}"
     else
-      MSG="❌ Failed (exit ${EXIT_CODE}): ${OUT}"
+      MSG="【ToolUse】❌ Failed (exit ${EXIT_CODE}): ${OUT}"
     fi
   elif [ "$TOOL" = "Agent" ]; then
-    MSG="✅ Agent complete"
+    MSG="【ToolUse】✅ Agent complete"
   fi
 else
   exit 0

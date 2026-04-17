@@ -4,6 +4,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import shlex
 import subprocess
 from pathlib import Path
 
@@ -34,6 +35,35 @@ def _read_tmux_session_name() -> str:
 _TMUX_SESSION = os.environ.get("TMUX_SESSION") or _read_tmux_session_name()
 
 
+# Meta-operations on the actor system that route through the command registry.
+# Other WS actions (reply, react, send_file, send_summary, update_title, forward,
+# tool_notify, ...) continue to flow through the existing actor-message path.
+WS_ACTION_TO_COMMAND: dict[str, str] = {
+    "spawn_session": "spawn",
+    "kill_session":  "kill",
+    "list_sessions": "sessions",
+}
+
+
+def ws_args_to_text(cmd_name: str, payload: dict) -> str:
+    """Serialize a WS action payload into shell-tokenizable command text."""
+    if cmd_name == "spawn":
+        name = payload.get("session_name") or payload.get("name", "")
+        tag = payload.get("tag", "")
+        parts = []
+        if name:
+            parts.append(shlex.quote(name))
+        if tag:
+            parts.extend(["--tag", shlex.quote(tag)])
+        return " ".join(parts)
+    if cmd_name == "kill":
+        name = payload.get("session_name") or payload.get("name", "")
+        return shlex.quote(name) if name else ""
+    if cmd_name == "sessions":
+        return ""
+    return ""
+
+
 class CCAdapter:
     """Bridge between Claude Code WebSocket sessions and the actor runtime.
 
@@ -49,8 +79,49 @@ class CCAdapter:
         self._ws_to_address: dict[int, str] = {}  # id(ws) -> actor address
         self._address_to_ws: dict[str, object] = {}  # actor address -> ws
         self.feishu_adapter = None  # Set by app.py after both adapters created
+        self._dispatcher = None  # Set by app.py after construction
 
         runtime.register_transport_handler("websocket", self.push_to_cc)
+
+    # ------------------------------------------------------------------
+    # Dispatcher wiring
+    # ------------------------------------------------------------------
+
+    def set_dispatcher(self, dispatcher) -> None:
+        """Wire the CommandDispatcher in after construction."""
+        self._dispatcher = dispatcher
+
+    def _ws_to_actor(self, ws) -> str | None:
+        """Return the cc:* actor address bound to this WS connection, or None."""
+        return self._ws_to_address.get(id(ws))
+
+    def _ws_user(self, ws) -> str:
+        """Extract feishu_user:{username} from the WS-bound actor address."""
+        addr = self._ws_to_actor(ws)
+        if not addr or not addr.startswith("cc:"):
+            return ""
+        user_session = addr[3:]  # strip "cc:"
+        user = user_session.split(".")[0]
+        return f"feishu_user:{user}"
+
+    def _ws_chat(self, ws) -> str | None:
+        """Get chat_id from the actor's metadata."""
+        addr = self._ws_to_actor(ws)
+        if not addr:
+            return None
+        actor = self.runtime.lookup(addr)
+        if actor is None:
+            return None
+        return actor.metadata.get("chat_id")
+
+    async def reply(self, ctx, text: str) -> None:
+        """Replies for CC-MCP commands go to the Feishu chat the session is bound to."""
+        if self.feishu_adapter is not None:
+            await self.feishu_adapter.reply(ctx, text)
+
+    async def reply_error(self, ctx_partial, text: str) -> None:
+        if self.feishu_adapter is not None:
+            await self.feishu_adapter.reply_error(ctx_partial, text)
 
     # ------------------------------------------------------------------
     # Server lifecycle
@@ -108,25 +179,56 @@ class CCAdapter:
         # -- Control actions (adapter-level, not forwarded to actors) --
         if action == "register":
             await self._handle_register(ws, msg)
-        elif action == "spawn_session":
+            return
+
+        # -- Meta-action commands route through CommandDispatcher --
+        if action in WS_ACTION_TO_COMMAND and self._dispatcher is not None:
+            cmd_name = WS_ACTION_TO_COMMAND[action]
+            raw_text = f"/{cmd_name} {ws_args_to_text(cmd_name, msg)}".strip()
+            source_actor = self._ws_to_actor(ws)
+            ctx_partial = {
+                "source": "cc_mcp",
+                "user": self._ws_user(ws),
+                "chat_id": self._ws_chat(ws),
+                "app_id": self.feishu_adapter.app_id if self.feishu_adapter else "",
+                "current_actor": source_actor,
+                "parent_actor": None,
+                "thread_root_id": None,
+                "raw_msg": None,
+            }
+            handled = await self._dispatcher.dispatch_from_adapter(
+                adapter=self, raw_text=raw_text,
+                source_actor=source_actor, ctx_partial=ctx_partial,
+            )
+            if handled:
+                return
+            # Fall through to legacy if dispatcher returned False
+            # (fallback_on_unknown=True during Phase 2-3)
+
+        # -- Legacy session-cmd handling (still active during migration) --
+        if action == "spawn_session":
             await self._forward_session_cmd(ws, msg)
-        elif action == "kill_session":
+            return
+        if action == "kill_session":
             await self._forward_session_cmd(ws, msg)
-        elif action == "list_sessions":
+            return
+        if action == "list_sessions":
             await self._forward_session_cmd(ws, msg)
-        elif action == "pong":
-            pass  # ignore keepalive pongs
-        elif action == "tool_notify":
+            return
+
+        if action == "pong":
+            return  # ignore keepalive pongs
+
+        if action == "tool_notify":
             # tool_notify can come from anonymous hook connections (no register).
             if self._ws_to_address.get(id(ws)):
                 self._route_to_actor(ws, msg)
             else:
                 self._route_anonymous_tool_notify(msg)
-        else:
-            # -- Actor payload actions (forwarded to actor mailbox) --
-            # No action = default reply; named actions (react, send_file, etc.)
-            # are passed through as payload["action"].
-            self._route_to_actor(ws, msg)
+            return
+
+        # -- Actor payload actions (forwarded to actor mailbox) --
+        self._route_to_actor(ws, msg)
 
     # ------------------------------------------------------------------
     # Registration

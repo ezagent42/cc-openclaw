@@ -92,7 +92,7 @@ class ChannelServerApp:
                     fallback_on_unknown=True,
                 )
                 self.feishu_adapter.set_dispatcher(self._dispatcher)
-                # self.cc_adapter.set_dispatcher(self._dispatcher)  # T9 will add this
+                self.cc_adapter.set_dispatcher(self._dispatcher)
 
                 log.info("Feishu adapter initialized")
 

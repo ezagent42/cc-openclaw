@@ -118,3 +118,90 @@ async def test_kill_unknown_session_command_failed(fake_adapters, fake_runtime):
     )
     assert handled is True
     assert any("命令失败" in m for _, m in fake_adapters.errors)
+
+
+@pytest.mark.asyncio
+async def test_spawn_main_chat_full_io_sequence(fake_adapters, fake_runtime):
+    d = CommandDispatcher(fake_runtime, fake_adapters.feishu, fake_adapters.cc)
+    handled = await d.dispatch_from_adapter(
+        adapter=fake_adapters, raw_text="/spawn foo",
+        source_actor=None,
+        ctx_partial=_ctx_partial(user="feishu_user:alice", chat_id="oc_chat"),
+    )
+    assert handled is True
+
+    # I/O order: anchor created first, then pinned, then tmux started
+    assert fake_adapters.feishu.created_anchors == [("oc_chat", "foo")]
+    assert fake_adapters.feishu.pinned == ["anchor_foo"]
+    assert fake_adapters.cc.spawned == [("alice", "foo", "foo", "oc_chat")]
+
+    # Actor registration — matches legacy flow (suspended until WS connects)
+    cc_actor = fake_runtime.actors["cc:alice.foo"]
+    assert cc_actor.state == "suspended"
+    # Address scheme preserved from legacy
+    assert "feishu:fake_app:oc_chat:thread:foo" in fake_runtime.actors
+
+
+@pytest.mark.asyncio
+async def test_spawn_from_cc_session_sets_parent_actor(fake_adapters, fake_runtime):
+    # Seed an existing main session
+    fake_runtime.spawn(address="system:admin", handler="admin", parent=None)
+    fake_runtime.spawn(
+        address="cc:alice.main", handler="cc_session", tag="main",
+        parent="system:admin", state="active",
+    )
+
+    d = CommandDispatcher(fake_runtime, fake_adapters.feishu, fake_adapters.cc)
+    handled = await d.dispatch_from_adapter(
+        adapter=fake_adapters, raw_text="/spawn sub",
+        source_actor="cc:alice.main",
+        ctx_partial=_ctx_partial(user="feishu_user:alice", chat_id="oc_chat"),
+    )
+    assert handled is True
+
+    cc_actor = fake_runtime.actors["cc:alice.sub"]
+    assert cc_actor.parent == "cc:alice.main"
+
+
+@pytest.mark.asyncio
+async def test_spawn_with_quoted_prefix(fake_adapters, fake_runtime):
+    """Goal #3 regression: Feishu thread reply auto-prepends quoted content."""
+    d = CommandDispatcher(fake_runtime, fake_adapters.feishu, fake_adapters.cc)
+    handled = await d.dispatch_from_adapter(
+        adapter=fake_adapters,
+        raw_text="> @林懿伦 在上面说了些什么\n/spawn quotetest",
+        source_actor=None,
+        ctx_partial=_ctx_partial(user="feishu_user:alice", chat_id="oc_chat"),
+    )
+    assert handled is True
+    assert "cc:alice.quotetest" in fake_runtime.actors
+
+
+@pytest.mark.asyncio
+async def test_spawn_missing_name_bad_args(fake_adapters, fake_runtime):
+    d = CommandDispatcher(fake_runtime, fake_adapters.feishu, fake_adapters.cc)
+    handled = await d.dispatch_from_adapter(
+        adapter=fake_adapters, raw_text="/spawn",
+        source_actor=None,
+        ctx_partial=_ctx_partial(user="feishu_user:alice", chat_id="oc_chat"),
+    )
+    assert handled is True
+    # SpawnArgs.name has no default → bind_args raises BadArgs → dispatcher
+    # replies "参数错误"
+    assert any("参数错误" in msg for _, msg in fake_adapters.errors)
+
+
+@pytest.mark.asyncio
+async def test_spawn_tmux_failure_rolls_back(fake_adapters, fake_runtime):
+    """If spawn_cc_process returns False, both actors should be stopped."""
+    fake_adapters.cc.spawn_cc_process_ok = False
+    d = CommandDispatcher(fake_runtime, fake_adapters.feishu, fake_adapters.cc)
+    handled = await d.dispatch_from_adapter(
+        adapter=fake_adapters, raw_text="/spawn fail",
+        source_actor=None,
+        ctx_partial=_ctx_partial(user="feishu_user:alice", chat_id="oc_chat"),
+    )
+    assert handled is True
+    assert any("命令失败" in m for _, m in fake_adapters.errors)
+    # Both actors should have been stopped during rollback
+    assert "cc:alice.fail" in fake_runtime.stop_calls

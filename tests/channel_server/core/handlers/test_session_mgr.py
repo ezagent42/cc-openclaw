@@ -1,9 +1,14 @@
-"""Tests for SessionMgrHandler — /spawn, /kill, /sessions, init_session."""
+"""Tests for SessionMgrHandler — init_session.
+
+Note: /spawn, /kill, /sessions tests removed in Task 12 — these commands
+are now handled by the unified command registry (builtin commands).
+SessionMgrHandler now only handles init_session.
+"""
 from __future__ import annotations
 
 from unittest.mock import MagicMock
 
-from channel_server.core.actor import Actor, Message, Send, SpawnActor
+from channel_server.core.actor import Actor, Message
 from channel_server.core.handlers.session_mgr import SessionMgrHandler
 from channel_server.core.handler import get_handler
 
@@ -29,93 +34,6 @@ def make_runtime(actors=None):
     rt.lookup.side_effect = lambda addr: _actors.get(addr)
     rt.actors = _actors
     return rt
-
-
-# ---------------------------------------------------------------------------
-# /spawn tests
-# ---------------------------------------------------------------------------
-
-def test_spawn_new_session():
-    actor = make_actor()
-    msg = make_msg("/spawn dev")
-    rt = make_runtime()
-
-    actions = SessionMgrHandler().handle(actor, msg, runtime=rt)
-
-    spawns = [a for a in actions if isinstance(a, SpawnActor)]
-    assert len(spawns) == 2
-
-    addrs = {s.address for s in spawns}
-    assert "cc:testuser.dev" in addrs
-    assert any("feishu" in a and ":thread:" in a for a in addrs)
-
-    # Verify thread actor has cc in downstream
-    thread_spawn = next(s for s in spawns if ":thread:" in s.address)
-    assert "cc:testuser.dev" in thread_spawn.kwargs.get("downstream", [])
-
-    # Verify cc actor has thread in downstream
-    cc_spawn = next(s for s in spawns if s.address == "cc:testuser.dev")
-    assert thread_spawn.address in cc_spawn.kwargs.get("downstream", [])
-
-
-def test_spawn_with_tag():
-    actor = make_actor()
-    msg = make_msg("/spawn voice-widget --tag Voice")
-    rt = make_runtime()
-
-    actions = SessionMgrHandler().handle(actor, msg, runtime=rt)
-
-    cc_spawn = next(a for a in actions if isinstance(a, SpawnActor) and a.address.startswith("cc:"))
-    assert cc_spawn.kwargs["tag"] == "Voice"
-
-
-def test_spawn_already_active():
-    actor = make_actor()
-    msg = make_msg("/spawn dev")
-    existing = Actor(address="cc:testuser.dev", tag="dev", handler="cc_session", state="active")
-    rt = make_runtime(actors={"cc:testuser.dev": existing})
-
-    actions = SessionMgrHandler().handle(actor, msg, runtime=rt)
-
-    spawns = [a for a in actions if isinstance(a, SpawnActor)]
-    assert len(spawns) == 0
-
-    replies = [a for a in actions if isinstance(a, Send)]
-    assert len(replies) == 1
-    assert "already active" in replies[0].message.payload["text"]
-
-
-def test_spawn_resume_suspended():
-    actor = make_actor()
-    msg = make_msg("/spawn dev")
-    existing = Actor(address="cc:testuser.dev", tag="dev", handler="cc_session", state="suspended")
-    rt = make_runtime(actors={"cc:testuser.dev": existing})
-
-    actions = SessionMgrHandler().handle(actor, msg, runtime=rt)
-
-    spawns = [a for a in actions if isinstance(a, SpawnActor)]
-    assert len(spawns) == 0
-
-    sends = [a for a in actions if isinstance(a, Send)]
-    # One Send to the cc actor (resume), one reply to feishu
-    assert any(a.to == "cc:testuser.dev" for a in sends)
-    resume_send = next(a for a in sends if a.to == "cc:testuser.dev")
-    assert resume_send.message.payload["action"] == "resume"
-
-
-def test_spawn_missing_name():
-    actor = make_actor()
-    msg = make_msg("/spawn")
-    rt = make_runtime()
-
-    actions = SessionMgrHandler().handle(actor, msg, runtime=rt)
-
-    spawns = [a for a in actions if isinstance(a, SpawnActor)]
-    assert len(spawns) == 0
-
-    replies = [a for a in actions if isinstance(a, Send)]
-    assert len(replies) == 1
-    assert "Usage" in replies[0].message.payload["text"]
 
 
 # ---------------------------------------------------------------------------

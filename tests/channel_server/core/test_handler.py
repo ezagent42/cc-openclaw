@@ -368,23 +368,10 @@ def test_admin_unknown_command():
 
 
 # ---------------------------------------------------------------------------
-# 18. AdminHandler — session command passthrough
+# 18. AdminHandler — session commands no longer route to session-mgr
+# (removed in Task 12: SESSION_COMMANDS is now empty; all session commands
+# are handled by the unified command registry before reaching AdminHandler)
 # ---------------------------------------------------------------------------
-
-def test_admin_session_command_routes_to_session_mgr():
-    actor = make_actor(
-        address="system:admin",
-        handler="admin",
-        downstream=["cc:user.root"],
-    )
-    for cmd in ("/spawn research",):
-        msg = make_msg(sender="feishu_user:u1", payload={"text": cmd})
-        actions = AdminHandler().handle(actor, msg)
-        assert len(actions) == 1
-        assert isinstance(actions[0], Send)
-        assert actions[0].to == "system:session-mgr"
-        assert actions[0].message is msg
-
 
 # ---------------------------------------------------------------------------
 # 19. AdminHandler — system notification forward (msg_type in payload)

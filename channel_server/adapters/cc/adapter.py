@@ -423,10 +423,10 @@ class CCAdapter:
     # ------------------------------------------------------------------
 
     async def _forward_session_cmd(self, ws, msg: dict) -> None:
-        """Handle session commands (spawn/kill/list).
+        """Handle session commands (kill/list).
 
-        For spawn: creates feishu anchor + actors + tmux process (I/O in adapter).
-        For kill/list: forwards to session-mgr actor.
+        spawn_session is now handled by the unified command registry (spawn_cmd).
+        kill/list are forwarded to session-mgr actor.
         """
         address = self._ws_to_address.get(id(ws))
         if not address:
@@ -449,10 +449,20 @@ class CCAdapter:
 
         action = msg.get("action", "")
         session_name = msg.get("session_name", "")
-        tag = msg.get("tag", "") or session_name
 
         if action == "spawn_session":
-            await self._handle_spawn(ws, msg, user=user, chat_id=chat_id, app_id=app_id)
+            # spawn_session is handled by the unified command registry before
+            # reaching _forward_session_cmd in the live system. If we get here
+            # it is a routing error — log and respond with an error.
+            log.error(
+                "_forward_session_cmd: spawn_session reached legacy path for %s; "
+                "should have been intercepted by CommandDispatcher",
+                address,
+            )
+            await ws.send(json.dumps({
+                "action": "spawn_result", "ok": False,
+                "text": "Internal error: spawn reached legacy path",
+            }))
             return
 
         # kill/list → forward to session-mgr
@@ -477,73 +487,6 @@ class CCAdapter:
             "ok": True,
             "text": f"Command forwarded: {text}",
         }))
-
-    async def _handle_spawn(self, ws, msg: dict, *, user: str, chat_id: str, app_id: str) -> None:
-        """Spawn a child session: create anchor, actors, tmux process."""
-        session_name = msg.get("session_name", "") or msg.get("name", "")
-        tag = msg.get("tag", "") or session_name
-
-        if not session_name:
-            await ws.send(json.dumps({"action": "spawn_result", "ok": False, "text": "Missing session_name"}))
-            return
-
-        cc_addr = f"cc:{user}.{session_name}"
-        existing = self.runtime.lookup(cc_addr)
-
-        # Already active
-        if existing and existing.state == "active":
-            await ws.send(json.dumps({"action": "spawn_result", "ok": False, "text": f"Session '{session_name}' is already active"}))
-            return
-
-        # Resume suspended
-        if existing and existing.state == "suspended":
-            resume_chat_id = existing.metadata.get("chat_id", "") or chat_id
-            if self.spawn_cc_process(user, session_name, tag=tag, chat_id=resume_chat_id):
-                anchor_msg_id = existing.metadata.get("anchor_msg_id", "")
-                if anchor_msg_id and self.feishu_adapter:
-                    await self.feishu_adapter._update_anchor_card(
-                        anchor_msg_id, f"\U0001f7e2 [{tag}] resumed",
-                        body_text=f"Session [{tag}] has been resumed", template="green",
-                    )
-                await ws.send(json.dumps({"action": "spawn_result", "ok": True, "text": f"Session '{session_name}' resumed", "session_name": session_name}))
-            else:
-                await ws.send(json.dumps({"action": "spawn_result", "ok": False, "text": f"Session '{session_name}' resume failed"}))
-            return
-
-        # New session
-        # 1. Create feishu thread anchor
-        anchor_msg_id = None
-        if self.feishu_adapter and chat_id:
-            anchor_msg_id = await self.feishu_adapter.create_thread_anchor(chat_id, tag)
-            if anchor_msg_id:
-                await self.feishu_adapter.pin_message(anchor_msg_id)
-
-        # 2. Spawn feishu thread actor
-        thread_addr = f"feishu:{app_id}:{chat_id}:thread:{session_name}"
-        if anchor_msg_id and chat_id:
-            self.runtime.spawn(
-                thread_addr, "feishu_inbound", tag=tag,
-                transport=Transport(type="feishu_thread", config={"chat_id": chat_id, "root_id": anchor_msg_id}),
-                downstream=[cc_addr],
-            )
-
-        # 3. Spawn CC actor (suspended, waiting for WS transport)
-        downstream = [thread_addr] if anchor_msg_id else []
-        self.runtime.spawn(
-            cc_addr, "cc_session", tag=tag, state="suspended",
-            parent=f"cc:{user}.root", downstream=downstream,
-            metadata={"anchor_msg_id": anchor_msg_id or "", "chat_id": chat_id},
-        )
-
-        # 4. Start CC process via tmux
-        if self.spawn_cc_process(user, session_name, tag=tag, chat_id=chat_id):
-            await ws.send(json.dumps({"action": "spawn_result", "ok": True, "text": f"Session '{session_name}' spawned", "session_name": session_name}))
-        else:
-            # Rollback actors
-            for addr in [cc_addr, thread_addr]:
-                if addr:
-                    await self.runtime.stop(addr)
-            await ws.send(json.dumps({"action": "spawn_result", "ok": False, "text": f"Session '{session_name}' failed: tmux error"}))
 
     # ------------------------------------------------------------------
     # Process management

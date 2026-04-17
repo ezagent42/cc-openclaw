@@ -37,7 +37,13 @@ class CommandScope:
     async def dispatch(
         self, name: str, tokens: list[str], ctx_dict: dict
     ) -> Any:
-        merged = {**self._default_ctx, **ctx_dict}
+        # Scope's default_ctx (actor-context keys injected by resolve_scope)
+        # takes precedence over None values in ctx_dict so that current_actor
+        # and parent_actor are not silently erased by a caller passing None.
+        merged = {**ctx_dict}
+        for k, v in self._default_ctx.items():
+            if merged.get(k) is None and v is not None:
+                merged[k] = v
         if name in self._commands:
             entry = self._commands[name]
             bound = bind_args(entry.args_schema, tokens)

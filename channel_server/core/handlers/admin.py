@@ -18,17 +18,19 @@ class AdminHandler:
 
     def handle(self, actor: Actor, msg: Message, runtime=None) -> list[Action]:
         text = msg.payload.get("text", "").strip()
+        # Strip quoted content prefix ("> ...") for command matching
+        command_text = text.split("\n")[-1].strip() if "\n" in text else text
 
         # System notifications -> forward to downstream
         if msg.payload.get("msg_type") == "system":
             return [Send(to=addr, message=msg) for addr in actor.downstream]
 
         # Session commands -> route to session-mgr (bypasses LLM)
-        if text.startswith(self.SESSION_COMMANDS):
+        if command_text.startswith(self.SESSION_COMMANDS):
             return [Send(to="system:session-mgr", message=msg)]
 
         # Non-slash messages -> forward to downstream
-        if not text.startswith("/"):
+        if not command_text.startswith("/"):
             return [Send(to=addr, message=msg) for addr in actor.downstream]
 
         # Admin commands

@@ -55,16 +55,21 @@ class SessionMgrHandler:
 
     def handle(self, actor: Actor, msg: Message, runtime=None) -> list[Action]:
         text = msg.payload.get("text", "").strip()
+        # Strip quoted content prefix ("> ...") for command matching
+        command_text = text.split("\n")[-1].strip() if "\n" in text else text
         msg_type = msg.metadata.get("type", "")
 
         if msg_type == "init_session":
             return self._handle_init(actor, msg, runtime)
 
-        if text.startswith("/spawn"):
+        if command_text.startswith("/spawn"):
+            # Use command_text for parsing (has the actual /spawn command)
+            msg = Message(sender=msg.sender, payload={**msg.payload, "text": command_text}, metadata=msg.metadata)
             return self._handle_spawn(actor, msg, runtime)
-        elif text.startswith("/kill"):
+        elif command_text.startswith("/kill"):
+            msg = Message(sender=msg.sender, payload={**msg.payload, "text": command_text}, metadata=msg.metadata)
             return self._handle_kill(actor, msg, runtime)
-        elif text.startswith("/sessions"):
+        elif command_text.startswith("/sessions"):
             return self._handle_sessions(actor, msg, runtime)
 
         return []

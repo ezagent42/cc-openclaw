@@ -1,5 +1,6 @@
 .feishu-credentials.json
 .channel-server.pid
+.sidecar.pid
 .autoservice/
 __pycache__/
 *.pyc

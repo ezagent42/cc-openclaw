@@ -27,8 +27,15 @@ async def cors_middleware(request: web.Request, handler):
         resp = await handler(request)
 
     origin = request.headers.get("Origin", "")
-    if ALLOWED_ORIGINS and (origin in ALLOWED_ORIGINS or "*" in ALLOWED_ORIGINS):
-        resp.headers["Access-Control-Allow-Origin"] = origin or "*"
+    # Wildcard XOR allow-list: "*" means open gate (dev only), otherwise origin must
+    # be in the explicit list. Mixing both ("*" in a list with other origins) falls
+    # back to wildcard semantics — no per-origin echo for disallowed callers.
+    if "*" in ALLOWED_ORIGINS:
+        resp.headers["Access-Control-Allow-Origin"] = "*"
+        resp.headers["Access-Control-Allow-Methods"] = "GET, POST, OPTIONS"
+        resp.headers["Access-Control-Allow-Headers"] = "Content-Type"
+    elif origin and origin in ALLOWED_ORIGINS:
+        resp.headers["Access-Control-Allow-Origin"] = origin
         resp.headers["Access-Control-Allow-Methods"] = "GET, POST, OPTIONS"
         resp.headers["Access-Control-Allow-Headers"] = "Content-Type"
     return resp

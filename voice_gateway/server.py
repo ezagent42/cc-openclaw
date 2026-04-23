@@ -4,14 +4,34 @@ import logging
 import os
 
 import aiohttp.web
+from aiohttp import web
 
+from asr_route import asr_handler
+from config import ALLOWED_ORIGINS
 from session import Session
+from tts_route import tts_handler
 
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(name)s] %(levelname)s %(message)s",
 )
 log = logging.getLogger(__name__)
+
+
+@web.middleware
+async def cors_middleware(request: web.Request, handler):
+    # Handle CORS preflight
+    if request.method == "OPTIONS":
+        resp = web.Response()
+    else:
+        resp = await handler(request)
+
+    origin = request.headers.get("Origin", "")
+    if ALLOWED_ORIGINS and (origin in ALLOWED_ORIGINS or "*" in ALLOWED_ORIGINS):
+        resp.headers["Access-Control-Allow-Origin"] = origin or "*"
+        resp.headers["Access-Control-Allow-Methods"] = "GET, POST, OPTIONS"
+        resp.headers["Access-Control-Allow-Headers"] = "Content-Type"
+    return resp
 
 
 async def ws_handler(request: aiohttp.web.Request) -> aiohttp.web.WebSocketResponse:
@@ -48,8 +68,11 @@ def main():
                     os.environ.setdefault(key.strip(), value.strip())
 
     port = int(os.environ.get("GATEWAY_PORT", "8089"))
-    app = aiohttp.web.Application()
-    app.router.add_get("/ws", ws_handler)
+    middlewares = [cors_middleware] if ALLOWED_ORIGINS else []
+    app = aiohttp.web.Application(middlewares=middlewares)
+    app.router.add_get("/ws", ws_handler)      # legacy — cc-openclaw voice-web
+    app.router.add_get("/asr", asr_handler)    # new — stateless ASR
+    app.router.add_get("/tts", tts_handler)    # new — stateless TTS
 
     log.info(f"Starting voice gateway on :{port}")
     aiohttp.web.run_app(app, port=port, print=None)

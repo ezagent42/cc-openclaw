@@ -10,6 +10,21 @@ from tts_client import TTSClient
 log = logging.getLogger(__name__)
 
 
+async def _cancel_and_wait(task: asyncio.Task | None) -> None:
+    """Cancel a task and await its completion so its cleanup finishes before we proceed.
+
+    Prevents the previous speak's in-flight send_bytes from interleaving with the next
+    one's output on the same WebSocket, and swallows the expected CancelledError so it
+    doesn't surface in the asyncio log.
+    """
+    if task and not task.done():
+        task.cancel()
+        try:
+            await task
+        except (asyncio.CancelledError, Exception):
+            pass
+
+
 async def tts_handler(request: aiohttp.web.Request) -> aiohttp.web.WebSocketResponse:
     ws = aiohttp.web.WebSocketResponse()
     await ws.prepare(request)
@@ -32,12 +47,10 @@ async def tts_handler(request: aiohttp.web.Request) -> aiohttp.web.WebSocketResp
             action = data.get("type")
             if action == "speak":
                 text = data.get("text", "")
-                if current_task and not current_task.done():
-                    current_task.cancel()
+                await _cancel_and_wait(current_task)
                 current_task = asyncio.create_task(_do_speak(tts, ws, text))
             elif action == "abort":
-                if current_task and not current_task.done():
-                    current_task.cancel()
+                await _cancel_and_wait(current_task)
     except Exception as e:
         log.exception("[/tts] error")
         try:
@@ -45,8 +58,7 @@ async def tts_handler(request: aiohttp.web.Request) -> aiohttp.web.WebSocketResp
         except Exception:
             pass
     finally:
-        if current_task and not current_task.done():
-            current_task.cancel()
+        await _cancel_and_wait(current_task)
         try:
             await tts.close()
         except Exception:
@@ -66,4 +78,7 @@ async def _do_speak(tts: TTSClient, ws: aiohttp.web.WebSocketResponse, text: str
         raise
     except Exception as e:
         log.error(f"[/tts] speak error: {e}")
-        await ws.send_json({"type": "error", "message": str(e)})
+        try:
+            await ws.send_json({"type": "error", "message": str(e)})
+        except Exception:
+            pass

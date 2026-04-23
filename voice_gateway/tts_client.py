@@ -15,10 +15,10 @@ from protocol import (
     EVENT_CONNECTION_FAILED,
     EVENT_CONNECTION_STARTED,
     EVENT_SESSION_FAILED,
+    EVENT_SESSION_FINISHED,
     EVENT_SESSION_STARTED,
     EVENT_TTS_ENDED,
     EVENT_TTS_RESPONSE,
-    EVENT_TTS_SENTENCE_START,
 )
 
 log = logging.getLogger(__name__)
@@ -64,38 +64,72 @@ class TTSClient:
                 )
         raise RuntimeError("Doubao stream ended before event %d arrived" % target_event)
 
-    async def synthesize(self, text: str) -> AsyncGenerator[bytes, None]:
-        """Ask Doubao to speak `text` (direct TTS, not via LLM). Yield PCM chunks.
+    async def _reopen(self) -> None:
+        """Close the current Doubao connection and open a fresh one.
 
-        - First synthesis in a session: use `say_hello` (the session's primary
-          TTS trigger that Doubao reliably responds to).
-        - Subsequent syntheses: use `chat_tts_text` which injects mid-conversation.
-        Either way, we yield every TTS_RESPONSE audio frame until TTS_ENDED.
+        Doubao's `say_hello` event only triggers TTS once per WebSocket
+        connection; `chat_tts_text` requires conversational context that's
+        absent in our split-mode use case. Workaround: fully reconnect
+        between synthesize calls. Cost: ~300-500ms per call.
+        """
+        try:
+            await self._doubao.close()
+        except Exception:
+            pass
+        self.session_id = str(uuid.uuid4())
+        self._doubao = DoubaoClient(self.session_id)
+        await self._doubao.connect()
+        self._receiver = self._doubao.receive()
+        await self._doubao.send_start_connection()
+        await self._wait_for(
+            EVENT_CONNECTION_STARTED,
+            error_events=(EVENT_CONNECTION_FAILED,),
+        )
+        await self._doubao.send_start_session(START_SESSION_CONFIG)
+        await self._wait_for(
+            EVENT_SESSION_STARTED,
+            error_events=(EVENT_SESSION_FAILED,),
+        )
+        log.info("TTS re-opened (Doubao E2E, session=%s)", self.session_id[:8])
+
+    async def synthesize(self, text: str) -> AsyncGenerator[bytes, None]:
+        """Ask Doubao to speak `text`. Yield PCM chunks.
+
+        Uses `say_hello` (Doubao's reliable TTS trigger). For every synthesis
+        after the first, we first reconnect to Doubao — `say_hello` only
+        works once per WS connection.
         """
         if self._receiver is None:
             raise RuntimeError("TTSClient not connected")
 
-        if self._first_synthesis:
-            await self._doubao.send_say_hello(text)
-            self._first_synthesis = False
-        else:
-            await self._doubao.send_chat_tts_text(text, start=True, end=False)
-            await self._doubao.send_chat_tts_text("", start=False, end=True)
+        if not self._first_synthesis:
+            log.info("TTS reconnecting for re-use")
+            await self._reopen()
+        self._first_synthesis = False
 
+        log.info("TTS synthesize (say_hello): %r", text[:60])
+        await self._doubao.send_say_hello(text)
+
+        audio_bytes = 0
         async for frame in self._receiver:
             event = frame.get("event")
             payload = frame.get("payload_msg")
 
             if event == EVENT_TTS_RESPONSE and isinstance(payload, bytes):
+                audio_bytes += len(payload)
                 yield payload
 
             elif event == EVENT_TTS_ENDED:
+                log.info("TTS synthesize done (%d bytes)", audio_bytes)
                 break
 
             elif frame.get("message_type") == "SERVER_ERROR":
                 raise RuntimeError(
                     f"Doubao TTS server error {frame.get('code')}: {payload}"
                 )
+
+            else:
+                log.debug("TTS unexpected event %s: %s", event, str(payload)[:120])
 
     async def close(self) -> None:
         try:

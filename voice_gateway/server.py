@@ -15,6 +15,9 @@ logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(name)s] %(levelname)s %(message)s",
 )
+# Temporarily verbose for voice-client modules while diagnosing Doubao E2E flow.
+logging.getLogger("tts_client").setLevel(logging.DEBUG)
+logging.getLogger("asr_client").setLevel(logging.DEBUG)
 log = logging.getLogger(__name__)
 
 

@@ -67,7 +67,7 @@ def main():
     # Load .env.local from voice-web directory
     env_path = os.path.join(os.path.dirname(__file__), "..", "voice-web", ".env.local")
     if os.path.exists(env_path):
-        with open(env_path) as f:
+        with open(env_path, encoding="utf-8") as f:
             for line in f:
                 line = line.strip()
                 if line and not line.startswith("#") and "=" in line:

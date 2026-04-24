@@ -32,6 +32,15 @@ LOG_FILE = PROJECT_ROOT / ".openclaw" / "logs" / "channel.log"
 INSTRUCTIONS_PATH = Path(__file__).resolve().parent / "channel-instructions.md"
 IDENTITY_PATH = PROJECT_ROOT / ".openclaw" / "identity.yaml"
 
+# T12-comms-1: client-side heartbeat re-register interval. 30s strikes
+# a balance — fast enough to self-heal ghost-detach within the next
+# outbound message's tolerance window, slow enough not to flood the
+# server log. Overridable via OPENCLAW_CHANNEL_HEARTBEAT_SECS for
+# testing.
+_HEARTBEAT_INTERVAL_SECS = float(
+    os.environ.get("OPENCLAW_CHANNEL_HEARTBEAT_SECS", "30")
+)
+
 LOG_FILE.parent.mkdir(parents=True, exist_ok=True)
 logging.basicConfig(
     level=logging.DEBUG,
@@ -95,6 +104,15 @@ class ChannelClient:
 
         On each reconnect attempt, re-reads the PID file to pick up
         a new port if channel-server was restarted.
+
+        Runs a heartbeat alongside the message loop (T12-comms-1,
+        2026-04-24) that periodically re-sends the `register` action.
+        This self-heals the "ghost detach" case — WS TCP/PING still
+        alive but channel-server has suspended our actor. A fresh
+        register is idempotent server-side and re-attaches the
+        transport. Without this, the orphan-transport hazard
+        (docs: mcp-transport-orphan-session-hazard.md) silently drops
+        outbound messages for the rest of the client's lifetime.
         """
         while True:
             try:
@@ -102,11 +120,46 @@ class ChannelClient:
                 async with websockets.connect(url) as ws:
                     self.ws = ws
                     await self._register(ws)
-                    await self._message_loop(ws)
+                    # Run the message loop + heartbeat concurrently; when
+                    # _message_loop exits (WS closed), cancel the heartbeat
+                    # so we don't leak a background task into the next
+                    # connect iteration.
+                    heartbeat_task = asyncio.create_task(self._heartbeat(ws))
+                    try:
+                        await self._message_loop(ws)
+                    finally:
+                        heartbeat_task.cancel()
+                        try:
+                            await heartbeat_task
+                        except (asyncio.CancelledError, Exception):
+                            pass
             except Exception as e:
                 log.warning(f"channel-server disconnected ({type(e).__name__}: {e}), retrying in 3s...")
                 self.ws = None
                 await asyncio.sleep(3)
+
+    async def _heartbeat(self, ws):
+        """Periodically re-register to self-heal ghost detaches.
+
+        Channel-server's `handle_register` is idempotent — receiving a
+        duplicate register for an already-bound address just re-attaches
+        the transport and resumes the actor. If the transport was
+        detached but our WS is still healthy, this wakes things up
+        within one heartbeat interval.
+        """
+        while True:
+            try:
+                await asyncio.sleep(_HEARTBEAT_INTERVAL_SECS)
+                await self._register(ws)
+                log.debug("heartbeat: re-registered with channel-server")
+            except asyncio.CancelledError:
+                raise
+            except Exception as e:
+                # If heartbeat send fails the message loop is almost
+                # certainly about to die too; let the outer connect()
+                # loop handle reconnect.
+                log.debug("heartbeat failed: %s", e)
+                return
 
     async def _register(self, ws):
         payload = {

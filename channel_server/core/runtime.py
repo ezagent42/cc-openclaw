@@ -126,7 +126,15 @@ class ActorRuntime:
         return self.actors.get(address)
 
     def attach(self, address: str, transport: Transport) -> None:
-        """Attach a transport to an actor. Resumes a suspended actor."""
+        """Attach a transport to an actor. Resumes a suspended actor.
+
+        T12-comms-2 (2026-04-24): defensively call ``_maybe_start_loop``
+        even when ``actor.state == "active"`` to recover from the edge
+        case where the actor loop task died (handler crashed past its
+        error budget, unexpected exception, etc.) while the state was
+        still ``"active"``. ``_maybe_start_loop`` no-ops when the task
+        is alive, so this is idempotent in the common path.
+        """
         actor = self.actors.get(address)
         if actor is None:
             log.warning("attach: actor %s not found", address)
@@ -134,7 +142,9 @@ class ActorRuntime:
         actor.transport = transport
         if actor.state == "suspended":
             actor.state = "active"
-            self._maybe_start_loop(actor)
+        # Defensive: ensure the loop is running even if state was already active
+        # (protects against zombie actors whose task died unobserved).
+        self._maybe_start_loop(actor)
 
     def detach(self, address: str) -> None:
         """Detach transport from an actor. Suspends the actor."""

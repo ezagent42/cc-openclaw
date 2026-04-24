@@ -258,12 +258,27 @@ class CCAdapter:
             )
             log.info("Auto-spawned CC actor: %s", address)
         else:
-            # Attach transport (resumes if suspended)
+            # T12-comms-2: log the incoming state so heartbeat-driven
+            # re-registers on a suspended actor (orphan-transport
+            # recovery path) are visible in the log without grepping
+            # for the preceding "Detached transport" line.
+            prev_state = actor.state
             self.runtime.attach(
                 address,
                 Transport(type="websocket", config={"instance_id": instance_id}),
             )
-            log.info("Attached transport to existing CC actor: %s", address)
+            if prev_state == "suspended":
+                log.info(
+                    "Re-attached transport to existing CC actor (resumed from "
+                    "suspended — likely heartbeat recovery): %s",
+                    address,
+                )
+            else:
+                log.info(
+                    "Attached transport to existing CC actor (state=%s): %s",
+                    prev_state,
+                    address,
+                )
 
         # Wire topology for root sessions:
         # system:admin → cc:user.root → feishu:{app_id}:{chat_id}
@@ -322,7 +337,15 @@ class CCAdapter:
     # ------------------------------------------------------------------
 
     def handle_disconnect(self, ws) -> None:
-        """Detach transport from CC actor on WS disconnect."""
+        """Detach transport from CC actor on WS disconnect.
+
+        T12-comms-2 (2026-04-24): ``detach`` always suspends the actor;
+        the paired client-side heartbeat (`ChannelClient._heartbeat`)
+        will re-register within one interval and the server-side
+        ``attach`` resumes. No server→client push of a ``detached``
+        frame — the WS is already closed at this point so a send would
+        fail anyway; heartbeat is the resilience layer.
+        """
         address = self._ws_to_address.pop(id(ws), None)
         if address:
             self._address_to_ws.pop(address, None)

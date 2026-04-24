@@ -1,33 +1,21 @@
 {
-  "enableAllProjectMcpServers": true,
-  "channelsEnabled": true,
-  "enabledPlugins": {
-    "agent-setup@agent-setup": true
-  },
-  "hooks": {
-    "PreToolUse": [
-      {
-        "matcher": "Bash|Agent",
-        "hooks": [
-          {
-            "type": "command",
-            "command": "/Users/h2oslabs/cc-openclaw/.claude/hooks/notify-channel.sh",
-            "timeout": 3000
-          }
-        ]
-      }
-    ],
-    "PostToolUse": [
-      {
-        "matcher": "Bash|Agent",
-        "hooks": [
-          {
-            "type": "command",
-            "command": "/Users/h2oslabs/cc-openclaw/.claude/hooks/notify-channel.sh",
-            "timeout": 3000
-          }
-        ]
-      }
+  "permissions": {
+    "allow": [
+      "Bash(mix test *)",
+      "Bash(mix credo --strict)",
+      "Bash(mix compile --warnings-as-errors)",
+      "Bash(mix deps.get)",
+      "Bash(launchctl list *)",
+      "Bash(agent-browser open *)",
+      "Bash(agent-browser snapshot *)",
+      "Edit(/Users/h2oslabs/Workspace/esr/**)",
+      "Write(/Users/h2oslabs/Workspace/esr/**)"
     ]
-  }
+  },
+  "enableAllProjectMcpServers": true,
+  "enabledPlugins": {
+    "agent-setup@agent-setup": true,
+    "skill-creator@claude-plugins-official": true
+  },
+  "channelsEnabled": true
 }

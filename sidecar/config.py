@@ -34,7 +34,11 @@ class SidecarConfig:
     # OpenClaw
     gateway_url: str = "http://127.0.0.1:18789"
     auth_token: str = ""
-    default_model: str = "openrouter/google/gemini-3.1-flash-lite-preview"
+    # str: legacy single-model form (e.g. "openrouter/google/gemini-2.5-pro").
+    # dict: fallback chain {primary: str, fallbacks: list[str]} — passed
+    # through to openclaw's agents.list[].model field, which schema-validates
+    # as anyOf[string, {primary, fallbacks}]. See tests/sidecar/test_default_model_fallback.py.
+    default_model: str | dict[str, Any] = "openrouter/google/gemini-3.1-flash-lite-preview"
     account_id: str = "shared"
     # Sidecar
     api_port: int = 18791

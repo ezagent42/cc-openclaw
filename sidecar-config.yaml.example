@@ -7,6 +7,16 @@ feishu:
 openclaw:
   gateway_url: "http://127.0.0.1:18789"
   auth_token: "${OPENCLAW_AUTH_TOKEN}"
+  # default_model accepts two shapes:
+  #   1. string — single model, no fallback
+  #   2. {primary, fallbacks} — primary + ordered fallback chain; openclaw
+  #      retries the next model on primary failure / rate-limit.
+  # Example fallback form:
+  #   default_model:
+  #     primary: openrouter/google/gemini-2.5-pro
+  #     fallbacks:
+  #       - openrouter/anthropic/claude-sonnet-4.5
+  #       - openrouter/openai/gpt-4o
   default_model: "openrouter/google/gemini-3.1-flash-lite-preview"
   account_id: "shared"
 

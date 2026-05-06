@@ -1,69 +1,129 @@
-"""ASR client using Volcengine Realtime API (OpenAI-compatible)."""
-import asyncio
-import base64
-import json
+"""ASR client — Doubao E2E adapter.
+
+Uses the Doubao E2E realtime dialogue API (DOUBAO_APP_ID / DOUBAO_ACCESS_TOKEN),
+but only exposes the ASR events as a normalized stream. Doubao's LLM and TTS
+events emitted on the same connection are simply ignored — we're using the
+E2E protocol as a transport for ASR only.
+
+Event stream yielded by receive():
+  {"type": "conversation.item.input_audio_transcription.result", "transcript": str}  # interim
+  {"type": "conversation.item.input_audio_transcription.completed", "transcript": str}  # final
+  {"type": "input_audio_buffer.speech_started"}
+  {"type": "error", "error": {"message": str}}
+"""
 import logging
+import uuid
 from typing import AsyncGenerator
 
-import websockets
-
-from config import REALTIME_ASR_URL, get_realtime_headers
+from config import START_SESSION_CONFIG
+from doubao_client import DoubaoClient
+from protocol import (
+    EVENT_ASR_ENDED,
+    EVENT_ASR_INFO,
+    EVENT_ASR_RESPONSE,
+    EVENT_CONNECTION_FAILED,
+    EVENT_CONNECTION_STARTED,
+    EVENT_SESSION_FAILED,
+    EVENT_SESSION_STARTED,
+)
 
 log = logging.getLogger(__name__)
 
 
 class ASRClient:
     def __init__(self):
-        self.ws = None
+        self.session_id = str(uuid.uuid4())
+        self._doubao = DoubaoClient(self.session_id)
+        self._receiver = None  # async generator of parsed Doubao frames
+        self._last_transcript = ""
 
     async def connect(self) -> None:
-        headers = get_realtime_headers()
-        self.ws = await websockets.connect(
-            REALTIME_ASR_URL,
-            additional_headers=headers,
-            ping_interval=None,
-        )
-        session_msg = {
-            "type": "transcription_session.update",
-            "session": {
-                "input_audio_format": "pcm",
-                "input_audio_codec": "raw",
-                "input_audio_sample_rate": 16000,
-                "input_audio_bits": 16,
-                "input_audio_channel": 1,
-                "input_audio_transcription": {
-                    "model": "bigmodel",
-                },
-            },
-        }
-        await self.ws.send(json.dumps(session_msg))
+        await self._doubao.connect()
+        self._receiver = self._doubao.receive()
 
-        msg = await self.ws.recv()
-        event = json.loads(msg)
-        if event.get("type") != "transcription_session.updated":
-            raise ConnectionError(f"ASR session setup failed: {event}")
-        log.info("ASR connected and session configured")
+        await self._doubao.send_start_connection()
+        await self._wait_for(
+            EVENT_CONNECTION_STARTED,
+            error_events=(EVENT_CONNECTION_FAILED,),
+        )
+        await self._doubao.send_start_session(START_SESSION_CONFIG)
+        await self._wait_for(
+            EVENT_SESSION_STARTED,
+            error_events=(EVENT_SESSION_FAILED,),
+        )
+        log.info("ASR ready (Doubao E2E, session=%s)", self.session_id[:8])
+
+    async def _wait_for(self, target_event: int, error_events: tuple = ()) -> dict:
+        if self._receiver is None:
+            raise RuntimeError("ASRClient not connected")
+        async for frame in self._receiver:
+            ev = frame.get("event")
+            if ev == target_event:
+                return frame
+            if ev in error_events:
+                raise RuntimeError(
+                    f"Doubao rejected: event={ev} payload={frame.get('payload_msg')}"
+                )
+            if frame.get("message_type") == "SERVER_ERROR":
+                raise RuntimeError(
+                    f"Doubao server error {frame.get('code')}: {frame.get('payload_msg')}"
+                )
+        raise RuntimeError("Doubao stream ended before event %d arrived" % target_event)
 
     async def send_audio(self, pcm_bytes: bytes) -> None:
-        """Send raw PCM audio chunk (Base64-encoded for Realtime API)."""
-        b64 = base64.b64encode(pcm_bytes).decode("ascii")
-        await self.ws.send(json.dumps({
-            "type": "input_audio_buffer.append",
-            "audio": b64,
-        }))
+        await self._doubao.send_audio(pcm_bytes)
 
     async def commit(self) -> None:
-        """Signal end of audio input for current utterance."""
-        await self.ws.send(json.dumps({"type": "input_audio_buffer.commit"}))
+        # Doubao's E2E API uses server-side VAD — no explicit commit needed.
+        # Method kept to preserve the old Volcengine-AI-Gateway interface.
+        pass
 
     async def receive(self) -> AsyncGenerator[dict, None]:
-        """Yield ASR events."""
-        async for message in self.ws:
-            if isinstance(message, str):
-                event = json.loads(message)
-                yield event
+        """Yield normalized ASR events (not raw Doubao frames)."""
+        if self._receiver is None:
+            return
+        async for frame in self._receiver:
+            event = frame.get("event")
+            payload = frame.get("payload_msg")
+
+            if event == EVENT_ASR_RESPONSE and isinstance(payload, dict):
+                results = payload.get("results", [])
+                if results:
+                    last = results[-1]
+                    text = last.get("text", "")
+                    is_interim = bool(last.get("is_interim", True))
+                    if text:
+                        if is_interim:
+                            yield {
+                                "type": "conversation.item.input_audio_transcription.result",
+                                "transcript": text,
+                            }
+                        else:
+                            # Final transcript — cache for ASR_ENDED
+                            self._last_transcript = text
+
+            elif event == EVENT_ASR_INFO:
+                yield {"type": "input_audio_buffer.speech_started"}
+
+            elif event == EVENT_ASR_ENDED:
+                if self._last_transcript:
+                    yield {
+                        "type": "conversation.item.input_audio_transcription.completed",
+                        "transcript": self._last_transcript,
+                    }
+                    self._last_transcript = ""
+
+            elif frame.get("message_type") == "SERVER_ERROR":
+                msg = frame.get("payload_msg", f"code {frame.get('code')}")
+                yield {"type": "error", "error": {"message": str(msg)}}
 
     async def close(self) -> None:
-        if self.ws:
-            await self.ws.close()
-            log.info("ASR WS closed")
+        try:
+            await self._doubao.send_finish_session()
+        except Exception:
+            pass
+        try:
+            await self._doubao.send_finish_connection()
+        except Exception:
+            pass
+        await self._doubao.close()

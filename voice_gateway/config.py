@@ -67,3 +67,8 @@ def get_realtime_headers() -> dict:
 # Channel server connection (actor model bridge)
 CHANNEL_SERVER_WS_URL = os.environ.get("CHANNEL_SERVER_WS_URL", "ws://127.0.0.1:8765/ws/cc")
 VOICE_INSTANCE_PREFIX = "voice:user"
+
+# CORS allowlist (comma-separated origins) for /asr and /tts browser clients.
+# Empty string → disabled (reject all cross-origin). Use "*" only in dev.
+ALLOWED_ORIGINS = os.environ.get("ALLOWED_ORIGINS", "").split(",")
+ALLOWED_ORIGINS = [o.strip() for o in ALLOWED_ORIGINS if o.strip()]

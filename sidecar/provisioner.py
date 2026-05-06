@@ -7,6 +7,7 @@ import os
 import shutil
 from datetime import datetime, timezone
 from pathlib import Path
+from typing import Any
 
 from sidecar.config_patch import ConfigPatchClient
 from sidecar.db import Database
@@ -37,7 +38,7 @@ class Provisioner:
         archived_dir: str,
         templates_dir: str,
         account_id: str,
-        default_model: str,
+        default_model: str | dict[str, Any],
     ) -> None:
         self.db = db
         self.config_client = config_client

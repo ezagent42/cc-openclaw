@@ -10,31 +10,35 @@
  */
 
 import { readFileSync } from "node:fs";
-import { resolve, dirname } from "node:path";
+import { homedir } from "node:os";
+import { join } from "node:path";
 
+// MUST track sidecar/config.py:api_port default. The pidfile (written by
+// sidecar at boot) wins when present; this default is only consulted on
+// fresh installs before sidecar has booted. If you change this, change
+// the YAML default in lockstep — see specs/2026-05-07-sidecar-url-discovery-design.md.
 const SIDECAR_DEFAULT_URL = "http://127.0.0.1:18791";
 const DEFAULT_ACCOUNT_ID = "shared";
-const PIDFILE_NAME = ".sidecar.pid";
+
+// Absolute machine-level path; matches sidecar/main.py write_pidfile_atomic.
+const PIDFILE_PATH = join(homedir(), ".openclaw", "sidecar.pid");
 
 /**
- * Resolve sidecar URL by reading pidfile (written by sidecar on startup).
- * Falls back to config or default URL if pidfile is missing.
+ * Resolve sidecar URL by reading the pidfile sidecar writes on startup.
+ * Falls back to configUrl or SIDECAR_DEFAULT_URL when pidfile missing or
+ * malformed (e.g. fresh install pre-sidecar-boot).
+ *
+ * Exported for unit testing; called per plugin invocation (not cached) so
+ * sidecar restarts pick up the new port without bouncing the gateway.
  */
-function resolveSidecarUrl(configUrl) {
+export function resolveSidecarUrl(configUrl) {
   try {
-    // Look for pidfile in project root (same dir as sidecar-config.yaml)
-    const candidates = [
-      resolve(process.cwd(), PIDFILE_NAME),
-      resolve(process.cwd(), "..", PIDFILE_NAME),
-    ];
-    for (const pidfile of candidates) {
-      try {
-        const content = readFileSync(pidfile, "utf-8");
-        const { port } = JSON.parse(content);
-        if (port) return `http://127.0.0.1:${port}`;
-      } catch { /* try next */ }
-    }
-  } catch { /* fallback */ }
+    const content = readFileSync(PIDFILE_PATH, "utf-8");
+    const { port } = JSON.parse(content);
+    if (port) return `http://127.0.0.1:${port}`;
+  } catch {
+    /* pidfile missing or unparseable — fall through */
+  }
   return configUrl || SIDECAR_DEFAULT_URL;
 }
 

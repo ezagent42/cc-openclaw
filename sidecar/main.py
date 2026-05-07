@@ -139,11 +139,11 @@ async def main() -> None:
     await site.start()
     actual_port = site._server.sockets[0].getsockname()[1]
 
-    # Write pidfile for service discovery
-    pidfile_path = os.path.join(os.path.dirname(os.path.abspath(config_path)), ".sidecar.pid")
-    import json as _json
-    with open(pidfile_path, "w") as f:
-        f.write(_json.dumps({"pid": os.getpid(), "port": actual_port}))
+    # Write pidfile to ~/.openclaw/sidecar.pid (machine-level state alongside
+    # sidecar.sqlite). The plugin reads from this absolute path regardless
+    # of its own cwd. See docs/superpowers/specs/2026-05-07-sidecar-url-discovery-design.md.
+    pidfile_dir = os.path.expanduser("~/.openclaw")
+    pidfile_path = write_pidfile_atomic(pidfile_dir, pid=os.getpid(), port=actual_port)
     log.info("sidecar ready on http://127.0.0.1:%d (pidfile: %s)", actual_port, pidfile_path)
 
     if feishu_enabled:

@@ -7,6 +7,9 @@
   "openclaw": {
     "id": "openclaw-sidecar",
     "name": "Sidecar Routing",
-    "description": "Routes unmatched messages via Sidecar API"
+    "description": "Routes unmatched messages via Sidecar API",
+    "extensions": [
+      "./index.js"
+    ]
   }
 }

@@ -17,6 +17,34 @@ from sidecar.feishu_events import FeishuEventHandler
 from sidecar.provisioner import Provisioner
 from sidecar.reconciler import LarkFeishuGroupAPI, Reconciler
 
+
+def write_pidfile_atomic(pidfile_dir: str, pid: int, port: int) -> str:
+    """Atomically write {pid, port} JSON to <pidfile_dir>/sidecar.pid.
+
+    `dir=pidfile_dir` passed to tempfile.mkstemp is LOAD-BEARING, not
+    incidental: os.replace is only atomic when src and dst share a
+    filesystem. Default tempfile dir ($TMPDIR → /var/folders/.../T on
+    macOS) might be on a different volume; never use the default here.
+
+    Returns the absolute path of the pidfile written.
+    """
+    import json
+    import tempfile
+
+    os.makedirs(pidfile_dir, exist_ok=True)
+    pidfile_path = os.path.join(pidfile_dir, "sidecar.pid")
+    fd, tmp_path = tempfile.mkstemp(prefix=".sidecar.pid.", dir=pidfile_dir)
+    try:
+        with os.fdopen(fd, "w") as f:
+            f.write(json.dumps({"pid": pid, "port": port}))
+        os.replace(tmp_path, pidfile_path)
+    except Exception:
+        if os.path.exists(tmp_path):
+            os.unlink(tmp_path)
+        raise
+    return pidfile_path
+
+
 log = logging.getLogger("sidecar")
 
 

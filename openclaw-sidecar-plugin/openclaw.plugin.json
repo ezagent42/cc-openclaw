@@ -6,7 +6,7 @@
     "properties": {
       "sidecarUrl": {
         "type": "string",
-        "description": "Sidecar API base URL",
+        "description": "Emergency override. Pidfile at ~/.openclaw/sidecar.pid wins when present — this value is ONLY used when the pidfile is missing/malformed. Set only for non-standard topologies (e.g. remote testing). MUST track sidecar/config.py:api_port default if used.",
         "default": "http://127.0.0.1:18791"
       },
       "accountId": {

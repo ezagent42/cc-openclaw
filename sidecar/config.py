@@ -41,6 +41,10 @@ class SidecarConfig:
     default_model: str | dict[str, Any] = "openrouter/google/gemini-3.1-flash-lite-preview"
     account_id: str = "shared"
     # Sidecar
+    # MUST track openclaw-sidecar-plugin/openclaw.plugin.json:sidecarUrl default.
+    # The plugin uses sidecarUrl as a fresh-install fallback before sidecar's
+    # pidfile is written; if these two values drift, that fallback window
+    # silently breaks. See specs/2026-05-07-sidecar-url-discovery-design.md.
     api_port: int = 18791
     db_path: str = "~/.openclaw/sidecar.sqlite"
     reconcile_interval_minutes: int = 10

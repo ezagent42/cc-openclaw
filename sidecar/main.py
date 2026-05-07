@@ -17,6 +17,34 @@ from sidecar.feishu_events import FeishuEventHandler
 from sidecar.provisioner import Provisioner
 from sidecar.reconciler import LarkFeishuGroupAPI, Reconciler
 
+
+def write_pidfile_atomic(pidfile_dir: str, pid: int, port: int) -> str:
+    """Atomically write {pid, port} JSON to <pidfile_dir>/sidecar.pid.
+
+    `dir=pidfile_dir` passed to tempfile.mkstemp is LOAD-BEARING, not
+    incidental: os.replace is only atomic when src and dst share a
+    filesystem. Default tempfile dir ($TMPDIR → /var/folders/.../T on
+    macOS) might be on a different volume; never use the default here.
+
+    Returns the absolute path of the pidfile written.
+    """
+    import json
+    import tempfile
+
+    os.makedirs(pidfile_dir, exist_ok=True)
+    pidfile_path = os.path.join(pidfile_dir, "sidecar.pid")
+    fd, tmp_path = tempfile.mkstemp(prefix=".sidecar.pid.", dir=pidfile_dir)
+    try:
+        with os.fdopen(fd, "w") as f:
+            f.write(json.dumps({"pid": pid, "port": port}))
+        os.replace(tmp_path, pidfile_path)
+    except Exception:
+        if os.path.exists(tmp_path):
+            os.unlink(tmp_path)
+        raise
+    return pidfile_path
+
+
 log = logging.getLogger("sidecar")
 
 
@@ -102,20 +130,21 @@ async def main() -> None:
     )
     runner = web.AppRunner(app)
     await runner.setup()
-    # Honor api_port from config — required because the openclaw plugin's
-    # pidfile-discovery falls back to a hardcoded default URL when run from
-    # a cwd outside this project (e.g. launchd starts gateway from "/" and
-    # the relative `./.sidecar.pid` lookup misses). When api_port == 0 we
-    # let the OS pick (legacy "no conflicts" behaviour for dev side-by-side).
+    # Honor api_port from config — the plugin's emergency-fallback URL
+    # (openclaw-sidecar-plugin/openclaw.plugin.json sidecarUrl default) is
+    # keyed to this port for the fresh-install window before the pidfile
+    # is written, so they must agree. A fixed port also makes diagnosis
+    # trivial (`curl :18791/api/v1/agents`). When api_port == 0 we let the
+    # OS pick (legacy "no conflicts" behaviour for dev side-by-side).
     site = web.TCPSite(runner, "127.0.0.1", cfg.api_port)
     await site.start()
     actual_port = site._server.sockets[0].getsockname()[1]
 
-    # Write pidfile for service discovery
-    pidfile_path = os.path.join(os.path.dirname(os.path.abspath(config_path)), ".sidecar.pid")
-    import json as _json
-    with open(pidfile_path, "w") as f:
-        f.write(_json.dumps({"pid": os.getpid(), "port": actual_port}))
+    # Write pidfile to ~/.openclaw/sidecar.pid (machine-level state alongside
+    # sidecar.sqlite). The plugin reads from this absolute path regardless
+    # of its own cwd. See docs/superpowers/specs/2026-05-07-sidecar-url-discovery-design.md.
+    pidfile_dir = os.path.expanduser("~/.openclaw")
+    pidfile_path = write_pidfile_atomic(pidfile_dir, pid=os.getpid(), port=actual_port)
     log.info("sidecar ready on http://127.0.0.1:%d (pidfile: %s)", actual_port, pidfile_path)
 
     if feishu_enabled:

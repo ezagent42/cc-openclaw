@@ -1,4 +1,4 @@
-.PHONY: run-server run-channel setup run-sidecar install-sidecar uninstall-sidecar restart-sidecar sidecar-logs test
+.PHONY: run-server run-channel setup run-sidecar install-sidecar uninstall-sidecar restart-sidecar sidecar-logs test test-py test-js
 
 run-server:
 	uv run python3 feishu/channel_server.py
@@ -28,5 +28,10 @@ restart-sidecar:
 sidecar-logs:
 	tail -f ~/.openclaw/logs/sidecar.log
 
-test:
+test: test-py test-js
+
+test-py:
 	uv run pytest tests/ -v
+
+test-js:
+	node --test 'tests/plugin/*.test.mjs'

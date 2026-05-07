@@ -98,6 +98,41 @@ async def test_reconcile_revokes_stale_permission():
     db.cleanup_old_events.assert_awaited_once()
 
 
+# ── test_reconcile_skips_already_revoked ─────────────────────────────
+
+
+async def test_reconcile_skips_already_revoked():
+    """User in DB but already (is_user_member=False, is_admin=False) -> no-op.
+
+    Regression: previously the revoke branch always upserted + wrote audit
+    even when the row was already fully revoked. That caused 3000+ duplicate
+    reconciled_revoke audit entries for ghost users every 10 min.
+    """
+    r, db, provisioner, feishu_api = _make_reconciler()
+
+    feishu_api.get_group_members.return_value = []
+
+    # Ghost user — long since left both groups, already revoked in DB
+    db.list_all_permissions.return_value = [
+        {
+            "open_id": "ou_ghost",
+            "display_name": "Ghost",
+            "is_user_member": False,
+            "is_admin": False,
+        }
+    ]
+
+    await r.reconcile()
+
+    # No upsert, no audit, no suspend — completely silent
+    db.upsert_permission.assert_not_awaited()
+    provisioner.suspend_user.assert_not_awaited()
+
+    audit_calls = db.write_audit.call_args_list
+    revoke_calls = [c for c in audit_calls if c[0][0] == "reconciled_revoke"]
+    assert len(revoke_calls) == 0, f"unexpected revoke audit: {revoke_calls}"
+
+
 # ── test_reconcile_fixes_inconsistent_flags ──────────────────────────
 
 

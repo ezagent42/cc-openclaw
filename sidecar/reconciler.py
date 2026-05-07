@@ -178,10 +178,20 @@ class Reconciler:
                     desired["is_admin"],
                 )
 
-        # 4. Revoke stale: in DB but not in any Feishu group
+        # 4. Revoke stale: in DB but not in any Feishu group.
+        # Idempotency: skip rows already at (is_user_member=False, is_admin=False).
+        # The grant branch above has the same check via `needs_upsert`, but the
+        # original revoke branch didn't — every reconcile cycle would re-write
+        # the row + audit entry for already-revoked ghosts, polluting audit_log
+        # with thousands of duplicates and obscuring real activity.
         for oid, perm in db_by_id.items():
             if oid not in feishu_state:
                 was_user = bool(perm["is_user_member"])
+                was_admin = bool(perm["is_admin"])
+
+                if not was_user and not was_admin:
+                    # Already fully revoked — no state change, no audit, no log spam.
+                    continue
 
                 await self.db.upsert_permission(
                     oid,
@@ -193,7 +203,7 @@ class Reconciler:
                     "reconciled_revoke",
                     oid,
                     "reconciler",
-                    details=f"was_user_member={was_user}",
+                    details=f"was_user_member={was_user} was_admin={was_admin}",
                 )
 
                 if was_user:

@@ -102,8 +102,12 @@ async def main() -> None:
     )
     runner = web.AppRunner(app)
     await runner.setup()
-    # Port 0 = OS-assigned random port (avoids conflicts with other sidecar instances)
-    site = web.TCPSite(runner, "127.0.0.1", 0)
+    # Honor api_port from config — required because the openclaw plugin's
+    # pidfile-discovery falls back to a hardcoded default URL when run from
+    # a cwd outside this project (e.g. launchd starts gateway from "/" and
+    # the relative `./.sidecar.pid` lookup misses). When api_port == 0 we
+    # let the OS pick (legacy "no conflicts" behaviour for dev side-by-side).
+    site = web.TCPSite(runner, "127.0.0.1", cfg.api_port)
     await site.start()
     actual_port = site._server.sockets[0].getsockname()[1]
 

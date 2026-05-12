@@ -1,10 +1,10 @@
 .PHONY: run-server run-channel setup run-sidecar install-sidecar uninstall-sidecar restart-sidecar sidecar-logs test test-py test-js
 
 run-server:
-	uv run python3 feishu/channel_server.py
+	uv run python3 channel_server/app.py
 
 run-channel:
-	uv run python3 feishu/channel.py
+	uv run python3 channel_server/adapters/cc/channel.py
 
 setup:
 	uv sync

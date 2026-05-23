@@ -15,7 +15,20 @@
   "enableAllProjectMcpServers": true,
   "enabledPlugins": {
     "agent-setup@agent-setup": true,
-    "skill-creator@claude-plugins-official": true
+    "skill-creator@claude-plugins-official": true,
+    "codex@openai-codex": true
   },
-  "channelsEnabled": true
+  "channelsEnabled": true,
+  "hooks": {
+    "Stop": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "/Users/h2oslabs/cc-openclaw/.claude/hooks/feishu-progress-check.sh"
+          }
+        ]
+      }
+    ]
+  }
 }

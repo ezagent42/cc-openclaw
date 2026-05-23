@@ -18,7 +18,7 @@ LAST="${STATE_DIR}/last_feishu_progress.ts"
 LOG="${STATE_DIR}/progress.jsonl"
 CHAT_ID="oc_d9b47511b085e9d5b66c4595b3ef9bb9"
 THRESHOLD_SEC=600   # 10 min
-RECAP_N=10          # how many recent entries to include
+RECAP_N=3           # how many recent entries to include (Allen 2026-05-23: 3, reverse-chrono)
 
 mkdir -p "$STATE_DIR" 2>/dev/null || exit 0
 [ -f "$LAST" ] || echo 0 > "$LAST"
@@ -40,11 +40,14 @@ fi
 
 ELAPSED_MIN=$((SINCE / 60))
 
-# Build recap: last N lines of progress.jsonl, formatted as bullets.
-# Tolerant: lines may or may not be valid JSON; if jq fails on a line
-# we fall back to the raw line.
+# Build recap: last N lines of progress.jsonl IN REVERSE CHRONOLOGICAL
+# ORDER (newest first), formatted as bullets. Tolerant: lines may or
+# may not be valid JSON; if jq fails on a line we fall back to the raw
+# line. Allen 2026-05-23: 3 entries max, newest at top.
 if [ -s "$LOG" ]; then
-  RECAP=$(tail -n "$RECAP_N" "$LOG" | while IFS= read -r line; do
+  RECAP=$(tail -n "$RECAP_N" "$LOG" | tail -r 2>/dev/null || tail -n "$RECAP_N" "$LOG" | tac)
+  RECAP=$(echo "$RECAP" | while IFS= read -r line; do
+    [ -z "$line" ] && continue
     if echo "$line" | jq -e . >/dev/null 2>&1; then
       ts=$(echo "$line" | jq -r '.ts // empty')
       type=$(echo "$line" | jq -r '.type // "note"')

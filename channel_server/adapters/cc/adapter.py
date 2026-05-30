@@ -166,7 +166,7 @@ class CCAdapter:
         finally:
             self.handle_disconnect(ws)
 
-    async def handle_message(self, ws, msg: dict) -> None:
+    async def handle_message(self, ws, msg: object) -> None:
         """Route incoming WS messages by action.
 
         WS messages use `action` for all routing. The action field serves
@@ -174,6 +174,21 @@ class CCAdapter:
         handled by the adapter; actor payload actions (reply, react, etc.)
         are forwarded to the actor's mailbox as-is.
         """
+        # Boundary guard: WS input is untrusted and ``json.loads`` can yield a
+        # non-dict. A JSON array crashed this handler with an opaque
+        # ``'list' object has no attribute 'get'`` (then got swallowed by the
+        # caller's ``except Exception``). Treat a list as a batch of frames;
+        # log + skip any other non-dict so the unexpected sender is visible
+        # rather than silently dropped or crashing the loop.
+        if isinstance(msg, list):
+            for item in msg:
+                await self.handle_message(ws, item)
+            return
+        if not isinstance(msg, dict):
+            log.warning("Ignoring non-object WS message (type=%s): %.200r",
+                        type(msg).__name__, msg)
+            return
+
         action = msg.get("action", "")
 
         # -- Control actions (adapter-level, not forwarded to actors) --

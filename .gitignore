@@ -11,5 +11,6 @@ sidecar-config.yaml
 .workspace/
 .openclaw/
 .mcp.env
+.openrouter-cc.env
 .claude/worktrees/
 .claude/state/

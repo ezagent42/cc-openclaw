@@ -1,0 +1,733 @@
+#!/bin/bash
+
+# ============================================
+# Claude Code launcher
+#
+# All modes run inside tmux for:
+#   - SSH disconnect resilience (session keeps running)
+#   - Seamless reattach from any terminal (./autoservice.sh)
+#
+# Modes:
+#   [1] Interactive          — standard claude session
+#   [2] Interactive+Worktree — isolated git branch for feature work
+#   [3] Remote Control       — continue from phone/browser
+# ============================================
+
+# Source shell configuration for proper PATH setup
+if [ -f "$HOME/.zprofile" ]; then
+    source "$HOME/.zprofile" 2>/dev/null
+fi
+if [ -f "$HOME/.zshrc" ]; then
+    export ZDOTDIR_BACKUP="$ZDOTDIR"
+    source "$HOME/.zshrc" 2>/dev/null
+fi
+if [ -f "$HOME/.bash_profile" ]; then
+    source "$HOME/.bash_profile" 2>/dev/null
+fi
+if [ -f "$HOME/.bashrc" ]; then
+    source "$HOME/.bashrc" 2>/dev/null
+fi
+
+# Ensure common paths are included as fallback (Homebrew on Apple Silicon / Intel, npm global)
+export PATH="/opt/homebrew/bin:/usr/local/bin:$HOME/.npm-global/bin:$HOME/.local/bin:$PATH"
+
+# Get the directory where this script is located
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
+# Source user-local overrides (proxy, API keys, etc.)
+[ -f "$SCRIPT_DIR/cc-openclaw-glm.local.sh" ] && source "$SCRIPT_DIR/cc-openclaw-glm.local.sh"
+
+# Source MCP server secrets (API keys, tokens)
+[ -f "$SCRIPT_DIR/.mcp.env" ] && set -a && source "$SCRIPT_DIR/.mcp.env" && set +a
+
+# Feishu credentials for channel.py (loaded from .feishu-credentials.json)
+# No lark-cli needed — uses lark_oapi SDK directly
+
+# --- Role management helpers (requires uv + pyyaml) ---
+
+ROLES_FILE="$SCRIPT_DIR/roles/roles.yaml"
+
+parse_roles_yaml() {
+    local user="$1"
+    uv run python3 -c "
+import yaml, sys
+with open('$ROLES_FILE') as f:
+    data = yaml.safe_load(f)
+user = data.get('users', {}).get('$user')
+if not user:
+    sys.exit(1)
+print(f'ROLE={user[\"role\"]}')
+print(f'OPEN_ID={user[\"open_id\"]}')
+print(f'DISPLAY_NAME={user.get(\"display_name\", \"$user\")}')
+" 2>/dev/null
+}
+
+get_group_config() {
+    uv run python3 -c "
+import yaml
+with open('$ROLES_FILE') as f:
+    data = yaml.safe_load(f)
+group = data.get('group', {})
+print(f'GROUP_CHAT_ID={group.get(\"chat_id\", \"\")}')
+print(f'GROUP_DISPLAY_NAME={group.get(\"display_name\", \"\")}')
+print(f'GROUP_ROLE={group.get(\"role\", \"monitor\")}')
+" 2>/dev/null
+}
+
+get_superadmin_name() {
+    uv run python3 -c "
+import yaml
+with open('$ROLES_FILE') as f:
+    data = yaml.safe_load(f)
+for name, info in data.get('users', {}).items():
+    if info.get('role') == 'superadmin':
+        print(info.get('display_name', name))
+        break
+" 2>/dev/null
+}
+
+list_users() {
+    uv run python3 -c "
+import yaml
+with open('$ROLES_FILE') as f:
+    data = yaml.safe_load(f)
+for name, info in data.get('users', {}).items():
+    print(f'  {name:20s} role={info[\"role\"]:15s} {info.get(\"display_name\", \"\")}')
+" 2>/dev/null
+}
+
+get_chat_id_for_user() {
+    local open_id="$1"
+    uv run python3 -c "
+import json, sys
+try:
+    with open('$SCRIPT_DIR/.workspace/chat_id_map.json') as f:
+        m = json.load(f)
+    cid = m.get('$open_id', '')
+    if cid:
+        print(cid)
+    else:
+        sys.exit(1)
+except:
+    sys.exit(1)
+" 2>/dev/null
+}
+
+render_claude_md() {
+    local template="$1"
+    local output="$2"
+    local username="$3"
+    local display_name="$4"
+    local role="$5"
+    local session="${6:-root}"
+    local superadmin_name
+    superadmin_name=$(get_superadmin_name)
+    eval "$(get_group_config)"
+
+    sed -e "s|{{USERNAME}}|$username|g" \
+        -e "s|{{DISPLAY_NAME}}|$display_name|g" \
+        -e "s|{{ROLE}}|$role|g" \
+        -e "s|{{SESSION}}|$session|g" \
+        -e "s|{{INSTANCE_ID}}|${username}.${session}|g" \
+        -e "s|{{ROOT_INSTANCE}}|${username}.root|g" \
+        -e "s|{{WORKSPACE_DIR}}|$SCRIPT_DIR|g" \
+        -e "s|{{SUPERADMIN_DISPLAY_NAME}}|${superadmin_name:-总管理员}|g" \
+        -e "s|{{GROUP_DISPLAY_NAME}}|${GROUP_DISPLAY_NAME:-管理群}|g" \
+        -e "s|{{GROUP_CHAT_ID}}|${GROUP_CHAT_ID:-}|g" \
+        "$template" > "$output"
+}
+
+# --- CLI argument parsing ---
+CLI_ACTION=""
+CLI_TARGET=""
+CLI_SESSION="root"
+CLI_TAG=""
+
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --user)    CLI_ACTION="user";   CLI_TARGET="$2"; shift 2 ;;
+        --group)   CLI_ACTION="group";  shift ;;
+        --session) CLI_SESSION="$2";    shift 2 ;;
+        --tag)     CLI_TAG="$2";        shift 2 ;;
+        --list)    CLI_ACTION="list";   shift ;;
+        --status)  CLI_ACTION="status"; shift ;;
+        --stop)    CLI_ACTION="stop";   CLI_TARGET="$2"; shift 2 ;;
+        --help|-h) CLI_ACTION="help";   shift ;;
+        *) break ;;  # Unknown args pass through to existing logic
+    esac
+done
+
+SESSION_NAME="cc-openclaw"
+
+if [ "$CLI_ACTION" = "help" ]; then
+    cat <<'HELP'
+Usage: cc-openclaw.sh [OPTIONS]
+
+Multi-user CC session manager.
+
+Options:
+  --user <name>       Start a CC session for the specified user (from roles/roles.yaml)
+  --group             Start the admin group monitor session
+  --session <name>    Session name (default: root). Used with --user or --group.
+  --tag <name>        Custom display tag for session replies (optional)
+  --list              List all configured users and roles
+  --status            Show running CC sessions
+  --stop <name>       Stop a user's CC session (use user.session format)
+  --help              Show this help
+
+  (no arguments)      Interactive mode selection (existing behavior)
+
+Examples:
+  cc-openclaw.sh --user linyilun                        Start root session
+  cc-openclaw.sh --user linyilun --session dev          Start named session
+  cc-openclaw.sh --user linyilun --session dev --tag allenwoods  Custom tag
+  cc-openclaw.sh --group                                Start group monitor
+  cc-openclaw.sh --group --session ops                  Named group session
+  cc-openclaw.sh --list                                 List configured users
+  cc-openclaw.sh --status                               Show active sessions
+  cc-openclaw.sh --stop linyilun.dev                    Stop a session
+HELP
+    exit 0
+fi
+
+if [ "$CLI_ACTION" = "list" ]; then
+    echo "📋 Configured users (roles/roles.yaml):"
+    echo ""
+    list_users
+    echo ""
+    echo "Group monitor:"
+    eval "$(get_group_config)"
+    echo "  chat_id=$GROUP_CHAT_ID  display_name=$GROUP_DISPLAY_NAME  role=$GROUP_ROLE"
+    exit 0
+fi
+
+if [ "$CLI_ACTION" = "status" ]; then
+    if tmux has-session -t "$SESSION_NAME" 2>/dev/null; then
+        echo "📊 Running CC sessions (tmux: $SESSION_NAME):"
+        echo ""
+        tmux list-windows -t "$SESSION_NAME" -F "  #{window_name}"
+    else
+        echo "No active tmux session '$SESSION_NAME'"
+    fi
+    exit 0
+fi
+
+if [ "$CLI_ACTION" = "stop" ]; then
+    if [ -z "$CLI_TARGET" ]; then
+        echo "❌ Usage: cc-openclaw.sh --stop <username>"
+        exit 1
+    fi
+    if tmux has-session -t "$SESSION_NAME" 2>/dev/null; then
+        tmux kill-window -t "$SESSION_NAME:$CLI_TARGET" 2>/dev/null && \
+            echo "✓ Stopped session: $CLI_TARGET" || \
+            echo "❌ No active session: $CLI_TARGET"
+    else
+        echo "❌ No active tmux session"
+    fi
+    exit 0
+fi
+
+# --- Shared session launcher ---
+launch_session() {
+    # Expects: CLI_TARGET, ROLE, CHAT_ID, DISPLAY_NAME, CLI_SESSION, CLI_TAG
+    local WINDOW_NAME="${CLI_TARGET}.${CLI_SESSION}"
+
+    echo "🦞 Starting CC session: $DISPLAY_NAME ($WINDOW_NAME)"
+    echo "   Role: $ROLE"
+    echo "   Session: $CLI_SESSION"
+    echo "   Chat ID: $CHAT_ID"
+    [ -n "$CLI_TAG" ] && echo "   Tag: $CLI_TAG"
+
+    WORKSPACE_DIR="$SCRIPT_DIR/.workspace/$CLI_TARGET/$CLI_SESSION"
+    mkdir -p "$WORKSPACE_DIR"
+
+    # Render CLAUDE.md template with session identity
+    ROLE_DIR="$SCRIPT_DIR/roles/$ROLE"
+    if [ -f "$ROLE_DIR/CLAUDE.md" ]; then
+        render_claude_md "$ROLE_DIR/CLAUDE.md" "$WORKSPACE_DIR/CLAUDE.md" "$CLI_TARGET" "$DISPLAY_NAME" "$ROLE" "$CLI_SESSION"
+        echo "   CLAUDE.md: rendered from roles/$ROLE/CLAUDE.md"
+    fi
+
+    # Ensure tmux session
+    tmux has-session -t "$SESSION_NAME" 2>/dev/null || tmux new-session -d -s "$SESSION_NAME"
+
+    # Check if already running
+    if tmux list-windows -t "$SESSION_NAME" -F "#{window_name}" 2>/dev/null | grep -q "^${WINDOW_NAME}$"; then
+        echo "⚠️  Session '$WINDOW_NAME' already running. Attaching..."
+        tmux select-window -t "$SESSION_NAME:$WINDOW_NAME"
+        tmux attach-session -t "$SESSION_NAME"
+        exit 0
+    fi
+
+    # Check channel_server
+    PIDFILE="$SCRIPT_DIR/.channel-server.pid"
+    if [ ! -f "$PIDFILE" ]; then
+        echo "❌ channel-server not running!"
+        exit 1
+    fi
+
+    # Source local config
+    LOCAL_SH="$SCRIPT_DIR/cc-openclaw.local.sh"
+    [ -f "$LOCAL_SH" ] && source "$LOCAL_SH"
+
+    # Build claude command with env vars
+    SETTINGS_FILE="roles/$ROLE/settings.json"
+    CLAUDE_CMD="cd $SCRIPT_DIR && [ -f cc-openclaw.local.sh ] && source cc-openclaw.local.sh; [ -f cc-openclaw-glm.local.sh ] && source cc-openclaw-glm.local.sh;"
+    CLAUDE_CMD="$CLAUDE_CMD OC_CHAT_ID=$CHAT_ID OC_USER=$CLI_TARGET OC_ROLE=$ROLE OC_SESSION=$CLI_SESSION"
+    [ -n "$CLI_TAG" ] && CLAUDE_CMD="$CLAUDE_CMD OC_TAG=$CLI_TAG"
+    CLAUDE_CMD="$CLAUDE_CMD claude --permission-mode bypassPermissions"
+    CLAUDE_CMD="$CLAUDE_CMD --dangerously-load-development-channels server:openclaw-channel"
+    CLAUDE_CMD="$CLAUDE_CMD --mcp-config .mcp.json"
+    CLAUDE_CMD="$CLAUDE_CMD --add-dir $WORKSPACE_DIR"
+    [ -f "$SCRIPT_DIR/$SETTINGS_FILE" ] && CLAUDE_CMD="$CLAUDE_CMD --settings $SETTINGS_FILE"
+
+    tmux new-window -t "$SESSION_NAME" -n "$WINDOW_NAME" "$CLAUDE_CMD" \; \
+        run-shell "sleep 5" \; \
+        send-keys Enter
+
+    echo "✓ Session started: $WINDOW_NAME (tmux window)"
+    echo "   Attach: tmux attach -t $SESSION_NAME"
+    exit 0
+}
+
+if [ "$CLI_ACTION" = "user" ]; then
+    if [ -z "$CLI_TARGET" ]; then
+        echo "❌ Usage: cc-openclaw.sh --user <username>"
+        exit 1
+    fi
+
+    ROLE_INFO=$(parse_roles_yaml "$CLI_TARGET")
+    if [ $? -ne 0 ]; then
+        echo "❌ User '$CLI_TARGET' not found in roles/roles.yaml"
+        exit 1
+    fi
+    eval "$ROLE_INFO"
+
+    CHAT_ID=$(get_chat_id_for_user "$OPEN_ID")
+    if [ -z "$CHAT_ID" ]; then
+        echo "⚠️  No chat_id mapping found for $CLI_TARGET."
+        echo "   The user needs to DM the bot first to register their chat_id."
+        echo "   Then retry this command."
+        exit 1
+    fi
+
+    launch_session
+fi
+
+if [ "$CLI_ACTION" = "group" ]; then
+    eval "$(get_group_config)"
+    if [ -z "$GROUP_CHAT_ID" ]; then
+        echo "❌ No group.chat_id in roles/roles.yaml"
+        exit 1
+    fi
+
+    CLI_TARGET="monitor"
+    ROLE="$GROUP_ROLE"
+    CHAT_ID="$GROUP_CHAT_ID"
+    DISPLAY_NAME="$GROUP_DISPLAY_NAME"
+
+    launch_session
+fi
+
+# --- If no CLI_ACTION, fall through to existing interactive mode ---
+
+# Get project name from directory (sanitize for tmux session name)
+PROJECT_NAME=$(basename "$SCRIPT_DIR" | tr '[:upper:]' '[:lower:]' | sed 's/[^a-z0-9_-]/-/g')
+
+# Session prefix for this project
+SESSION_PREFIX="claude-${PROJECT_NAME}"
+
+# ============================================
+# Pre-flight checks
+# ============================================
+
+if ! command -v claude &> /dev/null; then
+    echo "❌ claude command not found!"
+    echo ""
+    echo "PATH: $PATH"
+    echo ""
+    echo "Please install Claude Code first:"
+    echo "  npm install -g @anthropic-ai/claude-code"
+    exit 1
+fi
+
+if ! command -v tmux &> /dev/null; then
+    echo "❌ tmux not found!"
+    echo ""
+    echo "Please install tmux first:"
+    echo "  brew install tmux"
+    exit 1
+fi
+
+# ============================================
+# Channel-server check
+# ============================================
+
+PIDFILE="$SCRIPT_DIR/.channel-server.pid"
+
+if [ ! -f "$PIDFILE" ]; then
+    echo "❌ channel-server not running!"
+    echo ""
+    echo "No .channel-server.pid found."
+    echo ""
+    echo "Start it first:"
+    echo "  cd $SCRIPT_DIR && make run-server"
+    exit 1
+fi
+
+CS_PID=$(cut -d: -f1 "$PIDFILE")
+CS_PORT=$(cut -d: -f2 "$PIDFILE")
+
+if ! kill -0 "$CS_PID" 2>/dev/null; then
+    echo "❌ channel-server not running!"
+    echo ""
+    echo "PID $CS_PID from .channel-server.pid is not alive."
+    echo "The pidfile may be stale."
+    echo ""
+    echo "Start it first:"
+    echo "  cd $SCRIPT_DIR && make run-server"
+    rm -f "$PIDFILE"
+    exit 1
+fi
+
+echo "✅ channel-server running (PID=$CS_PID, port=$CS_PORT)"
+export CHANNEL_SERVER_PORT="$CS_PORT"
+
+# ============================================
+# Agent Setup plugin bootstrap
+# ============================================
+
+AGENT_SETUP_MARKETPLACE="https://github.com/ezagent42/agent-setup"
+
+# Register marketplace if not already registered
+if ! grep -q '"agent-setup"' "$HOME/.claude/plugins/known_marketplaces.json" 2>/dev/null; then
+    echo "📦 Registering agent-setup marketplace..."
+    claude plugin marketplace add "$AGENT_SETUP_MARKETPLACE" 2>/dev/null || {
+        echo "⚠️  Could not register marketplace. Run manually:"
+        echo "  claude plugin marketplace add $AGENT_SETUP_MARKETPLACE"
+    }
+fi
+
+# Install plugin if not installed for this project
+PLUGIN_INSTALLED=false
+if [ -f "$HOME/.claude/plugins/installed_plugins.json" ]; then
+    PLUGIN_INSTALLED=$(python3 -c "
+import json, sys
+d = json.load(open('$HOME/.claude/plugins/installed_plugins.json'))
+entries = d.get('plugins', {}).get('agent-setup@agent-setup', [])
+print('true' if any(e.get('projectPath') == '$SCRIPT_DIR' for e in entries) else 'false')
+" 2>/dev/null || echo "false")
+fi
+
+if [ "$PLUGIN_INSTALLED" != "true" ]; then
+    echo "📦 Installing agent-setup plugin..."
+    claude plugin install agent-setup@agent-setup --scope project 2>/dev/null || {
+        echo "⚠️  Could not install agent-setup plugin. Run manually:"
+        echo "  claude plugin marketplace add $AGENT_SETUP_MARKETPLACE"
+        echo "  claude plugin install agent-setup@agent-setup --scope project"
+    }
+    echo ""
+fi
+
+# ============================================
+# Flags per mode
+#
+# Interactive: supports --permission-mode, --mcp-config, --worktree
+# Remote Control: only supports --verbose, --sandbox, --no-sandbox
+# Permission mode is also set in .claude/settings.json (defaultMode)
+# so remote-control sessions inherit it without needing a CLI flag.
+# ============================================
+
+INTERACTIVE_FLAGS="--permission-mode bypassPermissions"
+
+# Load Feishu channel as development channel (MCP server name from .mcp.json)
+INTERACTIVE_FLAGS="$INTERACTIVE_FLAGS --dangerously-load-development-channels server:openclaw-channel"
+
+if [ -f "$SCRIPT_DIR/.mcp.json" ]; then
+    INTERACTIVE_FLAGS="$INTERACTIVE_FLAGS --mcp-config .mcp.json"
+fi
+
+RC_FLAGS=""
+
+# ============================================
+# iTerm2 detection → tmux -CC (native integration)
+#
+# tmux -CC makes iTerm2 render tmux windows/panes as native
+# tabs and splits. Scrolling, copy/paste, resizing all work
+# natively. Over SSH, set SendEnv LC_TERMINAL in ~/.ssh/config
+# on the client, and AcceptEnv LC_* in sshd_config on the server.
+#
+# Override: CLAUDE_TMUX_CLASSIC=1 ./autoservice.sh  (force plain tmux)
+# ============================================
+
+TMUX_CC=""
+if [ "${CLAUDE_TMUX_CLASSIC:-}" != "1" ]; then
+    if [ "$TERM_PROGRAM" = "iTerm.app" ] || \
+       [ "$LC_TERMINAL" = "iTerm2" ] || \
+       [ -n "$ITERM_SESSION_ID" ]; then
+        TMUX_CC="-CC"
+    fi
+fi
+
+# ============================================
+# Shared: mode selection menu
+# ============================================
+
+show_mode_menu() {
+    echo "  [1] Interactive (Recommended)"
+    echo "  [2] Interactive + Worktree — isolated git branch"
+    echo "  [3] Remote Control — continue from phone/browser"
+}
+
+# ============================================
+# Outside tmux: session management + mode selection
+# ============================================
+
+if [ -z "$TMUX" ]; then
+
+    echo "📂 Project: $(basename "$SCRIPT_DIR")"
+    echo "📍 Directory: $SCRIPT_DIR"
+    if [ -n "$TMUX_CC" ]; then
+        echo "🍎 iTerm2 detected — using native tmux integration (tmux -CC)"
+    fi
+    echo ""
+
+    # --- Check for existing sessions first ---
+    EXISTING_SESSIONS=$(tmux list-sessions -F '#{session_name}' 2>/dev/null | grep -E "^${SESSION_PREFIX}" || true)
+
+    # Helper: attach to a session, detaching other clients by default
+    # so window size adapts to the current terminal (not the old one).
+    # tmux -CC (iTerm2) handles sizing independently, so skip -d.
+    tmux_attach() {
+        local target="$1"
+        if [ -n "$TMUX_CC" ]; then
+            exec tmux -CC attach -t "$target"
+        else
+            exec tmux attach -dt "$target"
+        fi
+    }
+
+    if [ -n "$EXISTING_SESSIONS" ]; then
+        SESSION_COUNT=$(echo "$EXISTING_SESSIONS" | wc -l | tr -d ' ')
+
+        if [ "$SESSION_COUNT" -eq 1 ]; then
+            INFO=$(tmux list-sessions -F '#{session_name}: #{session_windows} windows (created #{t:session_created})' 2>/dev/null | grep "^$EXISTING_SESSIONS:")
+            CLIENTS=$(tmux list-clients -t "$EXISTING_SESSIONS" -F '#{client_name}' 2>/dev/null | wc -l | tr -d ' ')
+
+            echo "📌 Found existing session: $INFO"
+            if [ "$CLIENTS" -gt 0 ]; then
+                echo "   ⚡ $CLIENTS client(s) currently attached (will be detached)"
+            fi
+            echo ""
+            read -p "Attach to this session? [Y/n] " -n 1 -r
+            echo ""
+
+            if [[ ! $REPLY =~ ^[Nn]$ ]]; then
+                tmux_attach "$EXISTING_SESSIONS"
+            fi
+            echo ""
+        else
+            echo "📌 Found multiple sessions for project '$PROJECT_NAME':"
+            echo ""
+            i=1
+            declare -a SESSION_ARRAY
+            while IFS= read -r session; do
+                INFO=$(tmux list-sessions -F '#{session_name}: #{session_windows} windows (created #{t:session_created})' 2>/dev/null | grep "^$session:")
+                CLIENTS=$(tmux list-clients -t "$session" -F '#{client_name}' 2>/dev/null | wc -l | tr -d ' ')
+                ATTACHED=""
+                if [ "$CLIENTS" -gt 0 ]; then
+                    ATTACHED=" ⚡${CLIENTS} attached"
+                fi
+                echo "  [$i] $INFO$ATTACHED"
+                SESSION_ARRAY[$i]="$session"
+                ((i++))
+            done <<< "$EXISTING_SESSIONS"
+            echo "  [n] Create new session"
+            echo ""
+            read -p "Select session [1]: " -r CHOICE
+
+            if [[ "$CHOICE" =~ ^[Nn]$ ]]; then
+                : # Fall through to create new session
+            elif [ -z "$CHOICE" ] || [ "$CHOICE" = "1" ]; then
+                tmux_attach "${SESSION_ARRAY[1]}"
+            elif [[ "$CHOICE" =~ ^[0-9]+$ ]] && [ "$CHOICE" -le "${#SESSION_ARRAY[@]}" ]; then
+                tmux_attach "${SESSION_ARRAY[$CHOICE]}"
+            else
+                echo "Invalid choice, attaching to first session"
+                tmux_attach "${SESSION_ARRAY[1]}"
+            fi
+            echo ""
+        fi
+    fi
+
+    # --- Mode selection ---
+    echo "Create new session:"
+    show_mode_menu
+    echo ""
+    read -p "Mode [1]: " -r MODE
+    MODE=${MODE:-1}
+
+    if [ "$MODE" != "1" ] && [ "$MODE" != "2" ] && [ "$MODE" != "3" ]; then
+        echo "❌ Invalid mode: $MODE"
+        exit 1
+    fi
+
+    # --- Prompt for session name ---
+    UUID_SHORT=$(uuidgen | cut -d'-' -f1 | tr '[:upper:]' '[:lower:]')
+    case "$MODE" in
+        1)
+            DEFAULT_NAME="${SESSION_PREFIX}-$(date +%m%d)-${UUID_SHORT}"
+            echo ""
+            echo "Enter a session name."
+            ;;
+        2)
+            DEFAULT_NAME="${SESSION_PREFIX}-$(date +%m%d)-${UUID_SHORT}"
+            echo ""
+            echo "Enter a session name (also used as worktree branch name)."
+            echo "Examples: ${SESSION_PREFIX}-feat-auth, ${SESSION_PREFIX}-bugfix-login"
+            ;;
+        3)
+            DEFAULT_NAME="${SESSION_PREFIX}-rc-$(date +%m%d)-${UUID_SHORT}"
+            echo ""
+            echo "Enter a session name for the remote control session."
+            ;;
+    esac
+    echo ""
+    read -p "Session name [$DEFAULT_NAME]: " -r SESSION_NAME
+    SESSION_NAME=${SESSION_NAME:-$DEFAULT_NAME}
+    echo ""
+
+    # --- Enable tmux passthrough for iTerm2 escape sequences ---
+    # Allows notifications (e.g., zchat notify_command) to reach
+    # the outer terminal (iTerm2) through tmux, even over SSH.
+    tmux set-option -g allow-passthrough on 2>/dev/null
+
+    # --- Create tmux session (all modes go through tmux) ---
+    echo "🚀 Creating tmux session: $SESSION_NAME"
+    exec tmux $TMUX_CC new-session -s "$SESSION_NAME" "cd '$SCRIPT_DIR' && '$0' --_internal '$MODE' '$SESSION_NAME'"
+fi
+
+# ============================================
+# Inside tmux: run Claude Code
+# ============================================
+
+cd "$SCRIPT_DIR"
+
+CURRENT_SESSION=$(tmux display-message -p '#S')
+echo "✅ Running in tmux session: $CURRENT_SESSION"
+echo "📂 Working directory: $(pwd)"
+echo ""
+
+# Parse chat_id argument (first non-internal, non-mode arg)
+# Usage: ./autoservice.sh oc_xxx  or  ./autoservice.sh  (defaults to wildcard)
+if [ "$1" != "--_internal" ] && [ -n "$1" ] && [[ "$1" != [123] ]]; then
+    export OC_CHAT_ID="$1"
+    shift
+else
+    export OC_CHAT_ID="${OC_CHAT_ID:-*}"
+fi
+
+# Parse internal arguments (passed from outer invocation)
+RUN_MODE=""
+SESSION_NAME=""
+if [ "$1" = "--_internal" ]; then
+    RUN_MODE="${2:-}"
+    SESSION_NAME="${3:-}"
+fi
+
+# If no internal args, user ran ./autoservice.sh from a new tmux window — ask interactively
+if [ -z "$RUN_MODE" ]; then
+    echo "New session in existing tmux:"
+    show_mode_menu
+    echo ""
+    read -p "Mode [1]: " -r RUN_MODE
+    RUN_MODE=${RUN_MODE:-1}
+
+    if [ "$RUN_MODE" != "1" ] && [ "$RUN_MODE" != "2" ] && [ "$RUN_MODE" != "3" ]; then
+        echo "❌ Invalid mode: $RUN_MODE"
+        exit 1
+    fi
+
+    UUID_SHORT=$(uuidgen | cut -d'-' -f1 | tr '[:upper:]' '[:lower:]')
+    case "$RUN_MODE" in
+        1)
+            # No extra name needed for simple interactive
+            SESSION_NAME=""
+            ;;
+        2)
+            DEFAULT_NAME="${SESSION_PREFIX}-$(date +%m%d)-${UUID_SHORT}"
+            echo ""
+            echo "Enter a worktree/branch name."
+            echo "Examples: feat-auth, bugfix-login, refactor-api"
+            echo ""
+            read -p "Name [$DEFAULT_NAME]: " -r SESSION_NAME
+            SESSION_NAME=${SESSION_NAME:-$DEFAULT_NAME}
+            ;;
+        3)
+            DEFAULT_NAME="rc-$(date +%m%d)-${UUID_SHORT}"
+            echo ""
+            echo "Enter a session label."
+            echo ""
+            read -p "Name [$DEFAULT_NAME]: " -r SESSION_NAME
+            SESSION_NAME=${SESSION_NAME:-$DEFAULT_NAME}
+            ;;
+    esac
+    echo ""
+fi
+
+echo "💡 Tips:"
+echo "   - Reattach after disconnect: ./autoservice.sh"
+if [ -n "$TMUX_CC" ]; then
+    echo "   (iTerm2 native integration active)"
+    echo "   - New tab:     Cmd+T"
+    echo "   - Split horiz: Cmd+Shift+D"
+    echo "   - Split vert:  Cmd+D"
+    echo "   - Switch pane: Cmd+[ / Cmd+]"
+    echo "   - Close pane:  Cmd+W"
+    echo "   - Scroll:      mouse/trackpad (native)"
+    echo "   - Copy/paste:  Cmd+C / Cmd+V"
+    echo "   - Detach:      close iTerm2 window (session keeps running)"
+else
+    echo "   - Detach (keep running): Ctrl+b, d"
+    echo "   - New window: Ctrl+b, c  →  ./autoservice.sh"
+    echo "   - Split pane: Ctrl+b, %  or  Ctrl+b, \""
+    echo "   - Switch pane/window: Ctrl+b, arrow / Ctrl+b, n/p"
+    echo "   - Zoom pane:  Ctrl+b, z"
+    echo "   - Scroll mode: Ctrl+b, [  (exit: q)"
+fi
+echo ""
+
+# --- Mode 1: Interactive (standard) ---
+if [ "$RUN_MODE" = "1" ]; then
+    echo "🔧 Mode: Interactive"
+    echo ""
+    claude $INTERACTIVE_FLAGS
+
+# --- Mode 2: Interactive + Worktree ---
+elif [ "$RUN_MODE" = "2" ]; then
+    echo "🔧 Mode: Interactive + Worktree"
+    echo ""
+    if [ -n "$SESSION_NAME" ]; then
+        claude --worktree "$SESSION_NAME" $INTERACTIVE_FLAGS
+    else
+        claude --worktree $INTERACTIVE_FLAGS
+    fi
+
+# --- Mode 3: Remote Control ---
+elif [ "$RUN_MODE" = "3" ]; then
+    echo "🌐 Mode: Remote Control"
+    echo "   Connect from: claude.ai/code or Claude mobile app"
+    echo "   Press spacebar to show QR code for mobile"
+    echo ""
+    claude remote-control $RC_FLAGS
+fi
+
+EXIT_CODE=$?
+
+if [ $EXIT_CODE -ne 0 ]; then
+    echo ""
+    echo "⚠️  Claude exited with code: $EXIT_CODE"
+fi
+echo ""
+echo "Session ended. Press any key to close, or Ctrl+b d to keep tmux session."
+read -n 1

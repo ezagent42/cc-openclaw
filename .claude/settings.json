@@ -25,6 +25,10 @@
         "hooks": [
           {
             "type": "command",
+            "command": "/Users/h2oslabs/cc-openclaw/.claude/hooks/channel-reply-check.sh"
+          },
+          {
+            "type": "command",
             "command": "/Users/h2oslabs/cc-openclaw/.claude/hooks/feishu-progress-check.sh"
           }
         ]

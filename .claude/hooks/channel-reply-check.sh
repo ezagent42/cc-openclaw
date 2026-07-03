@@ -13,17 +13,34 @@
 # injected user-role entries (task-notification, system-reminder,
 # local-command-stdout etc.) which should NOT reset the turn.
 #
+# v4 (2026-07-03): three guards after the frozen-transcript incident
+# (bridge-session mode stopped appending message entries to the local
+# jsonl at 06:34Z; the hook then re-judged the same stale turn on every
+# Stop and blocked forever, regardless of what the agent just said):
+#   1. stop_hook_active → exit 0 (max one nag per turn, no nag loops)
+#   2. staleness: newest user/assistant entry in window older than
+#      MAX_STALENESS_SECS → transcript no longer reflects the live
+#      conversation → fail open
+#   3. send_file / send_message count as "pushed to Feishu", not just
+#      reply (the 06:31Z turn HAD delivered via send_file — false pos)
+#
 # Companion to [[feedback_always_use_reply]] memory.
 
 set -uo pipefail
 
 MIN_SUBSTANTIVE_LEN=40
+MAX_STALENESS_SECS=300
 
 INPUT=$(cat)
 TRANSCRIPT=$(echo "$INPUT" | jq -r '.transcript_path // .transcript // empty' 2>/dev/null)
 
 [ -n "$TRANSCRIPT" ] && [ -f "$TRANSCRIPT" ] || exit 0
 command -v jq >/dev/null 2>&1 || exit 0
+
+# Guard 1: this Stop is a continuation after a previous Stop-hook block
+# in the same turn — the agent already got one nag; don't loop.
+STOP_ACTIVE=$(echo "$INPUT" | jq -r '.stop_hook_active // false' 2>/dev/null)
+[ "$STOP_ACTIVE" = "true" ] && exit 0
 
 # Reusable jq predicate: is this entry a real human/loop user input
 # (not a harness injection)?
@@ -69,6 +86,27 @@ LAST_USER_LINE=$(
 
 START_LINE="${LAST_USER_LINE:-1}"
 
+# Guard 2: staleness. If the newest user/assistant entry in the window
+# is older than MAX_STALENESS_SECS, the local jsonl is frozen (e.g.
+# bridge-session mode) and no longer reflects the live conversation —
+# any verdict based on it would be about a long-past turn. Fail open.
+NEWEST_TS=$(
+  tail -n +"$START_LINE" "$TRANSCRIPT" |
+  jq -Rrs '
+    [ split("\n")[] |
+      fromjson? // empty |
+      select(.type == "user" or .type == "assistant") |
+      .timestamp // empty |
+      sub("\\.[0-9]+Z$"; "Z") | fromdate? // empty
+    ] | max // 0
+  ' 2>/dev/null
+)
+NEWEST_TS=${NEWEST_TS:-0}
+NOW=$(date +%s)
+if [ "$NEWEST_TS" -eq 0 ] || [ $((NOW - NEWEST_TS)) -gt "$MAX_STALENESS_SECS" ]; then
+  exit 0
+fi
+
 # Count substantive text blocks from assistant entries in this turn.
 # Use --raw-input + fromjson?//empty so malformed lines don't kill jq.
 SUBSTANTIVE_TEXT_COUNT=$(
@@ -84,7 +122,9 @@ SUBSTANTIVE_TEXT_COUNT=$(
 )
 SUBSTANTIVE_TEXT_COUNT=${SUBSTANTIVE_TEXT_COUNT:-0}
 
-# Count mcp__openclaw-channel__reply tool calls in this turn.
+# Count channel PUSH tool calls in this turn (guard 3: reply, send_file
+# and send_message all deliver to Feishu — requiring literally `reply`
+# false-positived on turns that delivered via send_file).
 REPLY_COUNT=$(
   tail -n +"$START_LINE" "$TRANSCRIPT" |
   jq -Rrs '
@@ -92,7 +132,8 @@ REPLY_COUNT=$(
       fromjson? // empty |
       select(.type == "assistant" and .message and .message.content) |
       .message.content[]? |
-      select(.type == "tool_use" and .name == "mcp__openclaw-channel__reply")
+      select(.type == "tool_use" and
+             (.name | test("^mcp__openclaw-channel__(reply|send_file|send_message)$")))
     ] | length
   ' 2>/dev/null
 )

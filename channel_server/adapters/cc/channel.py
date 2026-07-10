@@ -117,7 +117,14 @@ class ChannelClient:
         while True:
             try:
                 url = self._resolve_server_url()
-                async with websockets.connect(url) as ws:
+                # proxy=None: the channel-server is always on localhost, so the
+                # connection must never traverse an HTTP proxy. websockets>=14
+                # honors https_proxy/ALL_PROXY env vars by default and only
+                # bypasses them when no_proxy lists localhost — sessions
+                # launched without no_proxy set would otherwise route ws://
+                # localhost through the proxy and fail the handshake with
+                # "InvalidMessage: did not receive a valid HTTP response".
+                async with websockets.connect(url, proxy=None) as ws:
                     self.ws = ws
                     await self._register(ws)
                     # Run the message loop + heartbeat concurrently; when

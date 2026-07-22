@@ -1,0 +1,42 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!-- Feishu progress heartbeat — fires .claude/hooks/feishu-progress-check.sh
+     every 30 min (StartInterval 1800). Periodic one-shot: NO KeepAlive (that
+     would respawn the script the instant it exits → hot loop), RunAtLoad false
+     (don't post the moment it's loaded). Activate: `make install-heartbeat`. -->
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>ai.openclaw.feishu-heartbeat</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>/bin/bash</string>
+        <string>/Users/h2oslabs/cc-openclaw/.claude/hooks/feishu-progress-check.sh</string>
+    </array>
+    <key>WorkingDirectory</key>
+    <string>/Users/h2oslabs/cc-openclaw</string>
+    <key>StartInterval</key>
+    <integer>1800</integer>
+    <key>RunAtLoad</key>
+    <false/>
+    <key>StandardOutPath</key>
+    <string>/Users/h2oslabs/.openclaw/logs/feishu-heartbeat.log</string>
+    <key>StandardErrorPath</key>
+    <string>/Users/h2oslabs/.openclaw/logs/feishu-heartbeat.log</string>
+    <key>EnvironmentVariables</key>
+    <dict>
+        <!-- launchd runs with a minimal env: no login PATH, no shell aliases.
+             uv/jq/python3 must be reachable via this PATH or the job no-ops. -->
+        <key>PATH</key>
+        <string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin</string>
+        <!-- Cold `uv run` may fetch httpx from PyPI → needs the local proxy.
+             Feishu (open.feishu.cn) stays direct via no_proxy. -->
+        <key>http_proxy</key>
+        <string>http://127.0.0.1:7897</string>
+        <key>https_proxy</key>
+        <string>http://127.0.0.1:7897</string>
+        <key>no_proxy</key>
+        <string>localhost,127.0.0.1,::1,.feishu.cn,.larksuite.com,open.feishu.cn</string>
+    </dict>
+</dict>
+</plist>

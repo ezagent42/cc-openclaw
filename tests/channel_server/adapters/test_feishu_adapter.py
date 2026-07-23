@@ -327,3 +327,194 @@ def test_ack_reaction_uses_onit():
     sig = inspect.signature(adapter._send_reaction)
     emoji_default = sig.parameters["emoji_type"].default
     assert emoji_default == "Typing"
+
+
+# ---------------------------------------------------------------------------
+# 13. Inbound attachment download — _resolve_inbound_attachment
+# ---------------------------------------------------------------------------
+
+def _mock_lark_message(msg_type: str, content: dict, message_id: str = "msg_att",
+                       chat_id: str = "oc_test", parent_id: str = "") -> MagicMock:
+    """Build a MagicMock lark message with the fields the adapter reads."""
+    m = MagicMock()
+    m.message_id = message_id
+    m.message_type = msg_type
+    m.chat_id = chat_id
+    m.root_id = ""
+    m.chat_type = "group"
+    m.parent_id = parent_id
+    m.content = json.dumps(content)
+    return m
+
+
+def _mock_resource_success(adapter, body: bytes = b"payload") -> None:
+    """Wire feishu_client so message_resource.get returns a successful download."""
+    resp = MagicMock()
+    resp.success.return_value = True
+    resp.file = io.BytesIO(body)
+    resp.raw = None
+    adapter.feishu_client.im.v1.message_resource.get.return_value = resp
+
+
+def test_resolve_inbound_attachment_file_success(tmp_path):
+    """A file message downloads and yields the documented [File received:] text."""
+    adapter, _ = make_adapter()
+    _mock_resource_success(adapter, b"hello")
+    msg = _mock_lark_message("file", {"file_key": "fk_1", "file_name": "doc.pdf"})
+
+    with patch("channel_server.adapters.feishu.adapter.PROJECT_ROOT", tmp_path):
+        text, file_path = adapter._resolve_inbound_attachment(
+            "msg_att", "file", msg, "[file: doc.pdf]"
+        )
+
+    assert file_path != ""
+    assert file_path.endswith("doc.pdf")
+    assert Path(file_path).exists()
+    assert text == f"[File received: {file_path}]"
+
+
+def test_download_file_sanitizes_traversal_filename(tmp_path):
+    """A crafted file_name ('../../') cannot escape the uploads dir."""
+    adapter, _ = make_adapter()
+    _mock_resource_success(adapter, b"x")
+    msg = _mock_lark_message("file", {"file_key": "fk_evil", "file_name": "../../../evil.sh"})
+
+    with patch("channel_server.adapters.feishu.adapter.PROJECT_ROOT", tmp_path):
+        result = adapter.download_file("msg_att", msg)
+
+    uploads_root = (tmp_path / ".openclaw" / "uploads").resolve()
+    assert result != ""
+    assert Path(result).resolve().is_relative_to(uploads_root)
+    assert Path(result).name == "evil.sh"
+    assert not (tmp_path / "evil.sh").exists()
+
+
+def test_resolve_inbound_attachment_download_failure():
+    """API failure yields a clear 下载失败 note and no path."""
+    adapter, _ = make_adapter()
+    resp = MagicMock()
+    resp.success.return_value = False
+    resp.code = 99991
+    resp.msg = "permission denied"
+    adapter.feishu_client.im.v1.message_resource.get.return_value = resp
+    msg = _mock_lark_message("file", {"file_key": "fk_bad", "file_name": "x.bin"})
+
+    text, file_path = adapter._resolve_inbound_attachment(
+        "msg_att", "file", msg, "[file: x.bin]"
+    )
+
+    assert file_path == ""
+    assert "下载失败" in text
+
+
+def test_resolve_inbound_attachment_non_downloadable_passthrough():
+    """Text / non-attachment types pass through unchanged, never download."""
+    adapter, _ = make_adapter()
+    msg = _mock_lark_message("text", {"text": "hi"})
+
+    text, file_path = adapter._resolve_inbound_attachment("msg_att", "text", msg, "hi")
+
+    assert (text, file_path) == ("hi", "")
+    adapter.feishu_client.im.v1.message_resource.get.assert_not_called()
+
+
+def test_resolve_inbound_attachment_no_client_passthrough():
+    """Without a Feishu client we cannot download — keep the parser label."""
+    adapter, _ = make_adapter()
+    adapter.feishu_client = None
+    msg = _mock_lark_message("image", {"image_key": "img_1"})
+
+    text, file_path = adapter._resolve_inbound_attachment(
+        "msg_att", "image", msg, "[image: img_1]"
+    )
+
+    assert (text, file_path) == ("[image: img_1]", "")
+
+
+# ---------------------------------------------------------------------------
+# 14. Inbound wiring — _build_inbound_event actually invokes the download
+# (guards against the regression where the download call site was deleted)
+# ---------------------------------------------------------------------------
+
+def test_build_inbound_event_downloads_file(tmp_path):
+    """A file message flows through _build_inbound_event with file_path populated
+    and the [File received:] text — proving the download is wired into inbound."""
+    adapter, _ = make_adapter()
+    _mock_resource_success(adapter, b"binary")
+    msg = _mock_lark_message("file", {"file_key": "fk_9", "file_name": "report.csv"})
+
+    with patch("channel_server.adapters.feishu.adapter.PROJECT_ROOT", tmp_path):
+        evt = adapter._build_inbound_event(msg, "ou_bob", "Bob")
+
+    assert evt["file_path"].endswith("report.csv")
+    assert Path(evt["file_path"]).exists()
+    assert evt["text"] == f"[File received: {evt['file_path']}]"
+    assert evt["file_key"] == "fk_9"
+    assert evt["msg_type"] == "file"
+    assert evt["user"] == "Bob"
+    adapter.feishu_client.im.v1.message_resource.get.assert_called_once()
+
+
+def test_build_inbound_event_image_downloads(tmp_path):
+    """An image message downloads via image_key and carries the local path."""
+    adapter, _ = make_adapter()
+    _mock_resource_success(adapter, b"\x89PNG")
+    msg = _mock_lark_message("image", {"image_key": "img_z"})
+
+    with patch("channel_server.adapters.feishu.adapter.PROJECT_ROOT", tmp_path):
+        evt = adapter._build_inbound_event(msg, "ou_bob", "Bob")
+
+    assert evt["file_path"].endswith("img_z.png")
+    assert Path(evt["file_path"]).exists()
+    assert evt["text"] == f"[File received: {evt['file_path']}]"
+
+
+def test_build_inbound_event_text_no_download():
+    """A plain text message never triggers a download and carries no file_path."""
+    adapter, _ = make_adapter()
+    msg = _mock_lark_message("text", {"text": "just text"})
+
+    evt = adapter._build_inbound_event(msg, "ou_bob", "Bob")
+
+    assert evt["file_path"] == ""
+    assert evt["text"] == "just text"
+    adapter.feishu_client.im.v1.message_resource.get.assert_not_called()
+
+
+def test_build_inbound_event_download_failure_notes_error(tmp_path):
+    """Download failure never crashes — event carries a clear note, empty path."""
+    adapter, _ = make_adapter()
+    resp = MagicMock()
+    resp.success.return_value = False
+    resp.code = 99991
+    resp.msg = "no permission"
+    adapter.feishu_client.im.v1.message_resource.get.return_value = resp
+    msg = _mock_lark_message("file", {"file_key": "fk_bad", "file_name": "y.bin"})
+
+    evt = adapter._build_inbound_event(msg, "ou_bob", "Bob")
+
+    assert evt["file_path"] == ""
+    assert "下载失败" in evt["text"]
+
+
+def test_inbound_event_file_path_propagates_to_downstream(tmp_path):
+    """End-to-end: an event carrying file_path lands in the downstream message
+    payload (so channel.py inject_message can surface meta.file_path)."""
+    adapter, rt = make_adapter()
+    captured: list = []
+    original_send = rt.send
+
+    def _capture(address, message, message_id=None):
+        captured.append((address, message))
+        return original_send(address, message, message_id=message_id)
+
+    rt.send = _capture
+
+    evt = feishu_event(msg_type="file", file_path="/abs/uploads/oc_abc123/doc.pdf",
+                       text="[File received: /abs/uploads/oc_abc123/doc.pdf]")
+    adapter.on_feishu_event(evt)
+
+    assert captured, "expected a downstream send"
+    _, msg = captured[0]
+    assert msg.payload.get("file_path") == "/abs/uploads/oc_abc123/doc.pdf"
+    assert msg.metadata.get("msg_type") == "file"

@@ -101,6 +101,90 @@ class FeishuAdapter:
         """Wire the CommandDispatcher in after construction."""
         self._dispatcher = dispatcher
 
+    def _resolve_inbound_attachment(self, msg_id: str, msg_type: str, message, text: str) -> tuple[str, str]:
+        """Download a standalone file/image/audio/media attachment to a local path.
+
+        Parsers stay side-effect-free (see commit 21b14fa); the adapter performs
+        the download here, where the raw lark message + feishu_client are both
+        available. Returns ``(text, file_path)``:
+
+        - success → text is set to the documented ``[File received: <path>]`` form
+          and file_path is the local path (see channel-instructions.md "File
+          Messages"); the agent reads the file from that path.
+        - failure → a clear ``下载失败`` note with an empty path.
+        - non-downloadable type / no client → original text unchanged, empty path.
+
+        Never raises — download_file already swallows its own errors, and the
+        try/except here guards any unexpected failure so inbound routing never
+        crashes on a bad attachment.
+        """
+        if msg_type not in ("image", "file", "audio", "media") or not self.feishu_client:
+            return text, ""
+        try:
+            path = self.download_file(msg_id, message)
+        except Exception as e:  # defensive — download_file is already guarded
+            log.warning("Inbound attachment download failed for %s: %s", msg_id, e)
+            path = ""
+        if path:
+            return f"[File received: {path}]", path
+        return f"[{msg_type} — 下载失败]", ""
+
+    def _build_inbound_event(self, message, sender_id: str, sender_name: str) -> dict:
+        """Parse a raw Feishu message into the internal event dict.
+
+        Runs the parser registry, downloads standalone attachments to a local
+        path (so the agent gets a file it can read), and enriches replies with
+        quoted-parent context. Pure w.r.t. actor state — only reads Feishu.
+        """
+        from channel_server.adapters.feishu.parsers import parse_message
+
+        msg_id = message.message_id or ""
+        msg_type = message.message_type or "text"
+        try:
+            content_json = json.loads(message.content or "{}")
+        except Exception:
+            content_json = {}
+
+        text, file_path = parse_message(msg_type, content_json, message, self)
+
+        # Download standalone attachments so the agent receives a local file path.
+        if not file_path:
+            text, file_path = self._resolve_inbound_attachment(msg_id, msg_type, message, text)
+
+        # Fetch quoted message content if this is a reply
+        parent_id = message.parent_id or ""
+        if parent_id and self.feishu_client:
+            try:
+                from lark_oapi.api.im.v1 import GetMessageRequest
+                req = GetMessageRequest.builder().message_id(parent_id).build()
+                resp = self.feishu_client.im.v1.message.get(req)
+                if resp.success() and resp.data and resp.data.items:
+                    parent_msg = resp.data.items[0]
+                    parent_type = parent_msg.msg_type or ""
+                    parent_raw = parent_msg.body.content if parent_msg.body and parent_msg.body.content else ""
+                    try:
+                        parent_content = json.loads(parent_raw) if parent_raw else {}
+                    except Exception:
+                        parent_content = {}
+                    parent_text, _ = parse_message(parent_type, parent_content, parent_msg, self)
+                    if parent_text:
+                        text = f"> {parent_text[:200]}\n{text}"
+            except Exception as e:
+                log.warning("Failed to fetch quoted message %s: %s", parent_id, e)
+
+        return {
+            "message_id": msg_id,
+            "chat_id": message.chat_id or "",
+            "root_id": message.root_id or "",
+            "msg_type": msg_type,
+            "text": text,
+            "file_path": file_path,
+            "file_key": content_json.get("file_key", "") or content_json.get("image_key", ""),
+            "user": sender_name,
+            "user_id": sender_id,
+            "chat_type": message.chat_type or "",
+        }
+
     def resolve_actor_address(self, chat_id: str, root_id: str | None) -> str:
         """Return the actor address for a Feishu chat or thread.
 
@@ -184,55 +268,10 @@ class FeishuAdapter:
                     log.info("Feishu WS skip: bot's own message %s", msg_id[:20])
                     return
 
-                # Parse content via parsers registry
-                from channel_server.adapters.feishu.parsers import parse_message
-                msg_type = message.message_type or "text"
-                try:
-                    content_json = json.loads(message.content or "{}")
-                except Exception:
-                    content_json = {}
-                text, file_path = parse_message(msg_type, content_json, message, self)
-
-                # Fetch quoted message content if this is a reply
-                parent_id = message.parent_id or ""
-                if parent_id and self.feishu_client:
-                    try:
-                        from lark_oapi.api.im.v1 import GetMessageRequest
-                        req = GetMessageRequest.builder().message_id(parent_id).build()
-                        resp = self.feishu_client.im.v1.message.get(req)
-                        if resp.success() and resp.data and resp.data.items:
-                            parent_msg = resp.data.items[0]
-                            parent_type = parent_msg.msg_type or ""
-                            parent_raw = parent_msg.body.content if parent_msg.body and parent_msg.body.content else ""
-                            try:
-                                parent_content = json.loads(parent_raw) if parent_raw else {}
-                            except Exception:
-                                parent_content = {}
-                            parent_text, _ = parse_message(parent_type, parent_content, parent_msg, self)
-                            if parent_text:
-                                text = f"> {parent_text[:200]}\n{text}"
-                    except Exception as e:
-                        log.warning("Failed to fetch quoted message %s: %s", parent_id, e)
-
-                chat_id = message.chat_id or ""
-                root_id = message.root_id or ""
-                chat_type = message.chat_type or ""
-
                 # Get sender display name from roles.yaml, fallback to open_id
                 sender_name = self._user_names.get(sender_id, sender_id)
 
-                evt = {
-                    "message_id": msg_id,
-                    "chat_id": chat_id,
-                    "root_id": root_id,
-                    "msg_type": msg_type,
-                    "text": text,
-                    "file_path": file_path,  # now always "" — parsers no longer download
-                    "file_key": content_json.get("file_key", "") or content_json.get("image_key", ""),
-                    "user": sender_name,
-                    "user_id": sender_id,
-                    "chat_type": chat_type,
-                }
+                evt = self._build_inbound_event(message, sender_id, sender_name)
 
                 # Route to on_feishu_event from the main asyncio loop
                 loop.call_soon_threadsafe(self.on_feishu_event, evt)
@@ -873,9 +912,16 @@ class FeishuAdapter:
                 log.warning("%s download failed: code=%s msg=%s", label, resp.code, resp.msg)
                 return ""
 
-            upload_dir = PROJECT_ROOT / ".openclaw" / "uploads" / chat_id
+            # chat_id and file_name (for file/media) originate from untrusted
+            # sender content — collapse each to a bare basename so a crafted
+            # "../../x" or absolute "/etc/x" name cannot escape the uploads dir.
+            safe_chat = os.path.basename(chat_id) or "unknown"
+            safe_name = os.path.basename(file_name)
+            if safe_name in ("", ".", ".."):
+                safe_name = file_key or "download.bin"
+            upload_dir = PROJECT_ROOT / ".openclaw" / "uploads" / safe_chat
             upload_dir.mkdir(parents=True, exist_ok=True)
-            dest = upload_dir / file_name
+            dest = upload_dir / safe_name
 
             # Typed API returns file content via resp.file
             if resp.file:

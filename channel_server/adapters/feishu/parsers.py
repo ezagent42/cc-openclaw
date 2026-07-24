@@ -83,7 +83,11 @@ def _parse_post(content: dict, message, server) -> tuple[str, str]:
 
 @register_parser("image", "file", "audio", "media")
 def _parse_downloadable(content: dict, message, server) -> tuple[str, str]:
-    msg_type = message.message_type or "file"
+    # WS receive messages expose ``message_type``; messages fetched via the
+    # GetMessage API (quoted parents, merge_forward sub-messages) expose
+    # ``msg_type`` and have no ``message_type``. Support both so quoted/
+    # forwarded attachments don't crash into the generic "解析失败" fallback.
+    msg_type = getattr(message, "message_type", None) or getattr(message, "msg_type", None) or "file"
     if msg_type == "image":
         file_key = content.get("image_key", "")
     else:

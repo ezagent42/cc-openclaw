@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import json
+import types
 from unittest.mock import MagicMock
 
 from channel_server.adapters.feishu.parsers import parse_message
@@ -210,3 +211,48 @@ def test_parse_interactive_markdown():
     msg = make_message("interactive", content)
     text, _ = parse_message("interactive", content, msg, make_server())
     assert "**bold** text" in text
+
+
+# ---------------------------------------------------------------------------
+# 8. Quoted / forwarded attachments (GetMessage API shape)
+#
+# Messages fetched via the GetMessage API — quoted parents (see
+# adapter._build_inbound_event) and merge_forward sub-messages — are lark
+# ``Message`` objects that expose ``msg_type`` and have NO ``message_type``
+# attribute (accessing it raises AttributeError). Regression: quoting a file
+# message rendered "[file 消息 — 解析失败]" because _parse_downloadable read
+# the wrong attribute, raised AttributeError, and hit the generic fallback.
+# ---------------------------------------------------------------------------
+
+def make_api_message(msg_type: str, content: dict, message_id: str = "msg_parent") -> types.SimpleNamespace:
+    """Build a message in the shape returned by the GetMessage API.
+
+    The lark ``Message`` model exposes ``msg_type`` and has NO ``message_type``
+    attribute. A MagicMock can't reproduce this (it auto-creates any attribute),
+    so we use a plain namespace carrying only the real fields — accessing a
+    missing attribute raises AttributeError, exactly like the real object.
+    """
+    return types.SimpleNamespace(
+        msg_type=msg_type,
+        message_id=message_id,
+        content=json.dumps(content),
+    )
+
+
+def test_parse_quoted_file_message_resolves_filename():
+    """A quoted (GetMessage-shape) file message renders its filename, not 解析失败."""
+    content = {"file_key": "fk_pem", "file_name": "ezagent-git-private-key.pem"}
+    parent = make_api_message("file", content)
+    text, file_path = parse_message("file", content, parent, make_server())
+    assert "解析失败" not in text
+    assert "ezagent-git-private-key.pem" in text
+    assert file_path == ""
+
+
+def test_parse_quoted_image_message_resolves_key():
+    """A quoted (GetMessage-shape) image message resolves via msg_type → image_key."""
+    content = {"image_key": "img_quoted"}
+    parent = make_api_message("image", content)
+    text, _ = parse_message("image", content, parent, make_server())
+    assert "解析失败" not in text
+    assert "img_quoted" in text
